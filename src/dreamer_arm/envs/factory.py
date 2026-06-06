@@ -27,6 +27,7 @@ def make_env(
     time_limit: int | None = None,
     size: tuple[int, int] = (64, 64),
     action_repeat: int = 1,
+    viewer: bool = False,
     **kwargs: Any,
 ) -> gym.Env:  # type: ignore[type-arg]
     """Construct a single Dreamer-shaped env from a name.
@@ -34,12 +35,14 @@ def make_env(
     ``action_repeat`` is forwarded to the underlying env (which sums reward
     across sub-steps); ``time_limit`` is applied *after* the env so it
     counts wrapper-level steps, not physics sub-steps.
+
+    ``viewer`` opens a passive MuJoCo window (YAM only; macOS + mjpython).
     """
     if name == "yam" or name.startswith("yam:"):
         from dreamer_arm.envs.yam import YAM
 
         task = name.split(":", 1)[1] if ":" in name else "reach"
-        env: gym.Env = YAM(task=task, size=size, action_repeat=action_repeat, seed=seed, **kwargs)  # type: ignore[type-arg,arg-type]
+        env: gym.Env = YAM(task=task, size=size, action_repeat=action_repeat, seed=seed, viewer=viewer, **kwargs)  # type: ignore[type-arg,arg-type]
     elif name.startswith("dmc:"):
         from dreamer_arm.envs.dmc import DeepMindControl
 
@@ -64,17 +67,20 @@ def make_vector_env(
     num_envs: int,
     *,
     seed: int = 0,
+    viewer: bool = False,
     **kwargs: Any,
 ) -> SyncVectorEnv:
     """Build a synchronous batch of ``num_envs`` envs with offset seeds.
 
     Async vectorisation is intentionally out of scope (see plan).
+
+    ``viewer=True`` opens a passive MuJoCo window on env 0 only.
     """
-    def _factory(s: int) -> Callable[[], gym.Env]:  # type: ignore[type-arg]
+    def _factory(s: int, env_idx: int) -> Callable[[], gym.Env]:  # type: ignore[type-arg]
         def _make() -> gym.Env:  # type: ignore[type-arg]
-            return make_env(name, seed=s, **kwargs)
+            return make_env(name, seed=s, viewer=(viewer and env_idx == 0), **kwargs)
 
         return _make
 
-    fns: list[Callable[[], gym.Env]] = [_factory(seed + i) for i in range(num_envs)]  # type: ignore[type-arg]
+    fns: list[Callable[[], gym.Env]] = [_factory(seed + i, i) for i in range(num_envs)]  # type: ignore[type-arg]
     return SyncVectorEnv(fns)

@@ -172,8 +172,10 @@ class SyncVectorEnv:
             obs, r, term, trunc, info = env.step(act)
             if term or trunc:
                 # Auto-reset to keep the replay-buffer-friendly stream contiguous.
+                terminal_info = info
                 next_obs, info = env.reset()
                 info["final_observation"] = obs
+                info["final_info"] = terminal_info
                 obs = next_obs
                 # is_first flag for the new episode is set in DreamerObsWrapper.reset.
             obs_list.append(obs)

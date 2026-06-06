@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import hydra
+import torch
 from omegaconf import DictConfig, OmegaConf
 
 from dreamer_arm.agent.dreamer import Dreamer
@@ -22,13 +23,26 @@ from dreamer_arm.utils.seed import set_seed_everywhere
 CONFIG_PATH = str(Path(__file__).resolve().parents[2] / "configs")
 
 
+def _auto_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda:0"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+OmegaConf.register_new_resolver("auto_device", _auto_device, replace=True)
+
+
 def run(cfg: DictConfig) -> None:
     """Build the full Dreamer stack from ``cfg`` and run the online loop."""
     set_seed_everywhere(int(cfg.seed))
 
     env_name = f"{cfg.env.name}:{cfg.env.task}"
 
-    def _make_envs() -> Any:
+    _viewer = bool(cfg.env.get("viewer", False))  # type: ignore[union-attr]
+
+    def _make_envs(*, viewer: bool = False) -> Any:
         return make_vector_env(
             env_name,
             num_envs=int(cfg.env.env_num),
@@ -36,14 +50,14 @@ def run(cfg: DictConfig) -> None:
             size=tuple(cfg.env.size),
             action_repeat=int(cfg.env.action_repeat),
             time_limit=int(cfg.env.time_limit),
+            success_threshold=float(cfg.env.success_threshold),
+            viewer=viewer,
         )
 
-    train_envs = _make_envs()
+    train_envs = _make_envs(viewer=_viewer)
     eval_envs = _make_envs() if int(cfg.env.eval_episode_num) > 0 else None
 
-    agent = Dreamer(cfg.model, train_envs.observation_space, train_envs.action_space).to(
-        cfg.device
-    )
+    agent = Dreamer(cfg.model, train_envs.observation_space, train_envs.action_space).to(cfg.device)
 
     buffer = ReplayBuffer(
         BufferConfig(

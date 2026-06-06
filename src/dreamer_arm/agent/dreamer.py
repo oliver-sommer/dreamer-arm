@@ -83,9 +83,7 @@ class Dreamer(nn.Module):
         actor_cfg.shape = (
             (act_space.n,) if hasattr(act_space, "n") else tuple(int(x) for x in act_space.shape)
         )
-        actor_cfg.dist = (
-            config.actor.dist.disc if self.act_discrete else config.actor.dist.cont
-        )
+        actor_cfg.dist = config.actor.dist.disc if self.act_discrete else config.actor.dist.cont
         self.actor = networks.MLPHead(actor_cfg, self.rssm.feat_size)
         self.value = networks.MLPHead(config.critic, self.rssm.feat_size)
         self.return_ema = ReturnEMA(device=self.device)
@@ -134,7 +132,8 @@ class Dreamer(nn.Module):
             betas=(float(config.beta1), float(config.beta2)),
             eps=float(config.eps),
         )
-        self._scaler = GradScaler()
+        self._amp_enabled = self.device.type == "cuda"
+        self._scaler = GradScaler(device=self.device.type, enabled=self._amp_enabled)
         self._agc_clip = float(config.agc)
         self._agc_pmin = float(config.pmin)
 
@@ -147,6 +146,9 @@ class Dreamer(nn.Module):
 
         self.train()
         self._clone_and_freeze()
+
+        if bool(config.compile):
+            self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")  # type: ignore[method-assign]
 
     # ------------------------------------------------------------------ utils
 
@@ -217,8 +219,11 @@ class Dreamer(nn.Module):
         )
 
     @torch.no_grad()
-    def act(self, obs: Mapping[str, torch.Tensor], state: TensorDict, eval_mode: bool = False) -> tuple[torch.Tensor, TensorDict]:
+    def act(
+        self, obs: Mapping[str, torch.Tensor], state: TensorDict, eval_mode: bool = False
+    ) -> tuple[torch.Tensor, TensorDict]:
         """Policy inference. Returns ``(action, next_state)``."""
+        torch.compiler.cudagraph_mark_step_begin()
         p_obs = self._preprocess(dict(obs))
         embed = self._frozen_encoder(p_obs)
         stoch, deter, _ = self._frozen_rssm.obs_step(
@@ -240,7 +245,7 @@ class Dreamer(nn.Module):
         p_data = self._preprocess(dict(data))
         self._update_slow_target()
 
-        with autocast(device_type=self.device.type, dtype=torch.float16):
+        with autocast(device_type=self.device.type, dtype=torch.float16, enabled=self._amp_enabled):
             (stoch, deter), mets = self._cal_grad(p_data, initial)
 
         self._scaler.unscale_(self._optimizer)
@@ -265,7 +270,7 @@ class Dreamer(nn.Module):
             mets["opt/param_rms"] = compute_rms([p.data for p in params])
             mets["opt/update_rms"] = compute_rms(updates)
 
-        replay_buffer.update(index, stoch.detach(), deter.detach())
+        replay_buffer.update_initial_state(index, stoch.detach(), deter.detach())
         return mets
 
     # ------------------------------------------------------------------ losses
@@ -306,7 +311,7 @@ class Dreamer(nn.Module):
 
         # --- reward / continue heads ---
         losses["rew"] = -self.reward(feat).log_prob(to_f32(data["reward"])).mean()
-        cont_target = 1.0 - to_f32(data["is_terminal"])
+        cont_target = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
         losses["con"] = -self.cont(feat).log_prob(cont_target).mean()
 
         metrics["dyn_entropy"] = self.rssm.get_dist(prior_logit).entropy().mean()
@@ -367,8 +372,8 @@ class Dreamer(nn.Module):
         metrics.update(tensorstats(imag_action, "action"))
 
         # --- replay-based value learning ---
-        rep_last = to_f32(data["is_last"])
-        rep_term = to_f32(data["is_terminal"])
+        rep_last = to_f32(data["is_last"]).unsqueeze(-1)
+        rep_term = to_f32(data["is_terminal"]).unsqueeze(-1)
         rep_reward = to_f32(data["reward"])
         rep_value = self._frozen_value(feat).mode()
         rep_slow = self._frozen_slow_value(feat).mode()
@@ -379,10 +384,9 @@ class Dreamer(nn.Module):
         value_dist = self.value(feat)
         losses["repval"] = (
             rep_weight[:, :-1]
-            * (
-                -value_dist.log_prob(rep_padded.detach())
-                - value_dist.log_prob(rep_slow.detach())
-            )[:, :-1].unsqueeze(-1)
+            * (-value_dist.log_prob(rep_padded.detach()) - value_dist.log_prob(rep_slow.detach()))[
+                :, :-1
+            ].unsqueeze(-1)
         ).mean()
         metrics.update(tensorstats(rep_ret, "ret_replay"))
         metrics.update(tensorstats(rep_value, "value_replay"))

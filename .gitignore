@@ -11,6 +11,9 @@ wandb/
 outputs/
 multirun/
 
+# Training run artefacts (checkpoints, videos, Hydra config dumps)
+logdir/
+
 # -------------- begin toptal --------------
 
 # Created by https://www.toptal.com/developers/gitignore/api/python,macos,linux,visualstudiocode,pycharm

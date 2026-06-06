@@ -47,6 +47,8 @@ scripts/train.py      Hydra @main entry point
 ## Development
 
 ```bash
+pixi run -e dev pre-commit install  # one-time setup
+
 pixi run -e dev lint
 pixi run -e dev fmt
 pixi run -e dev typecheck

@@ -24,9 +24,7 @@ import torch
 try:
     import wandb
 except ImportError as exc:  # pragma: no cover - import guard
-    raise ImportError(
-        "wandb is required for dreamer_arm.train.logger; install via pixi."
-    ) from exc
+    raise ImportError("wandb is required for dreamer_arm.train.logger; install via pixi.") from exc
 
 
 _Scalar = float | int
@@ -128,9 +126,11 @@ class WandbLogger:
     # ------------------------------------------------------------------- flush
 
     def write(self, step: int, fps: bool = False) -> None:
+        fps_value = self._compute_fps(step) if fps else None
+        print(self._console_line(step, fps_value), flush=True)
         payload: dict[str, Any] = dict(self._scalars)
-        if fps:
-            payload["fps/fps"] = self._compute_fps(step)
+        if fps_value is not None:
+            payload["fps/fps"] = fps_value
         for name, arr in self._videos.items():
             payload[name] = wandb.Video(arr, fps=self._video_fps, format="mp4")
         for name, arr in self._images.items():
@@ -150,6 +150,30 @@ class WandbLogger:
             self._run = None  # type: ignore[assignment]
 
     # --------------------------------------------------------------- internals
+
+    def _console_line(self, step: int, fps_value: float | None) -> str:
+        # --- header: step + optional fps / episode scores ---
+        parts = [f"step {step:>8}"]
+        if fps_value is not None:
+            parts.append(f"fps {fps_value:>6.1f}")
+        for key, label in (("episode/score", "score"), ("episode/eval_score", "eval")):
+            if key in self._scalars:
+                parts.append(f"{label} {self._scalars[key]:.2f}")
+        header = "  ".join(parts)
+
+        # --- loss sub-line: only present on train-burst flushes ---
+        loss_keys = [
+            ("train/dyn", "dyn"),
+            ("train/rep", "rep"),
+            ("train/rew", "rew"),
+            ("train/con", "con"),
+            ("train/policy", "policy"),
+            ("train/value", "value"),
+        ]
+        loss_parts = [
+            f"{label} {self._scalars[key]:.3f}" for key, label in loss_keys if key in self._scalars
+        ]
+        return header + ("\n  " + "  ".join(loss_parts) if loss_parts else "")
 
     def _compute_fps(self, step: int) -> float:
         now = time.time()

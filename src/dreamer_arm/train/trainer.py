@@ -139,7 +139,7 @@ class OnlineTrainer:
             act, agent_state = agent.act(obs_t, agent_state, eval_mode=False)
             act_np = act.detach().cpu().numpy()
 
-            next_obs_np, reward_np, terminated_np, truncated_np, _ = envs.step(act_np)
+            next_obs_np, reward_np, terminated_np, truncated_np, infos = envs.step(act_np)
             done_np = terminated_np | truncated_np
 
             # ---- record + push to buffer ----
@@ -173,6 +173,8 @@ class OnlineTrainer:
                     video_cache = []
                 self.logger.scalar("episode/score", float(returns[i]))
                 self.logger.scalar("episode/length", float(lengths[i]))
+                fin = infos[i].get("final_info", {})
+                self.logger.scalar("episode/success", float(bool(fin.get("success", False))))
                 self.logger.write(step + i)
                 returns[i] = 0.0
                 lengths[i] = 0
@@ -183,9 +185,7 @@ class OnlineTrainer:
             min_buffer = (self.config.batch_length + 1) * n
             if len(self.replay_buffer) > min_buffer:
                 update_num = (
-                    self.config.pretrain
-                    if self._should_pretrain()
-                    else self._updates_needed(step)
+                    self.config.pretrain if self._should_pretrain() else self._updates_needed(step)
                 )
                 # Average metrics across the burst so a single log entry
                 # represents the whole window rather than just the last update.
@@ -223,13 +223,14 @@ class OnlineTrainer:
         agent_state = agent.get_initial_state(n)
         returns = np.zeros(n, dtype=np.float32)
         steps = np.zeros(n, dtype=np.int32)
+        successes = np.zeros(n, dtype=bool)
         done_once = np.zeros(n, dtype=bool)
         video: list[np.ndarray] = []
 
         while not done_once.all():
             obs_t = self._obs_to_tensor(obs_np, device)
             act, agent_state = agent.act(obs_t, agent_state, eval_mode=True)
-            obs_np, reward_np, terminated_np, truncated_np, _ = envs.step(
+            obs_np, reward_np, terminated_np, truncated_np, eval_infos = envs.step(
                 act.detach().cpu().numpy()
             )
             done_np = terminated_np | truncated_np
@@ -238,10 +239,15 @@ class OnlineTrainer:
             steps += active.astype(np.int32)
             if "image" in obs_np:
                 video.append(obs_np["image"][0])
+            for i, d in enumerate(done_np):
+                if d and not done_once[i]:
+                    fin = eval_infos[i].get("final_info", {})
+                    successes[i] = bool(fin.get("success", False))
             done_once |= done_np
 
         self.logger.scalar("episode/eval_score", float(returns.mean()))
         self.logger.scalar("episode/eval_length", float(steps.mean()))
+        self.logger.scalar("episode/eval_success", float(successes.mean()))
         if video:
             self.logger.video("eval/video", np.stack(video, axis=0)[None])
         self.logger.write(train_step)
