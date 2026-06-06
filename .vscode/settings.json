@@ -1,0 +1,39 @@
+{
+  "files.exclude": {
+    "**/.vscode": true,
+    "**/.pixi": true,
+    "**/.ruff_cache": true,
+    "**/.mypy_cache": true,
+    "**/.pytest_cache": true,
+    "**/__pycache__": true,
+    "**/*.egg-info": true,
+    "**/build": true,
+    "**/dist": true,
+    "**/wandb": true,
+    "**/outputs": true,
+    "**/multirun": true,
+    "**/.coverage": true,
+    "**/htmlcov": true,
+    "**/.DS_Store": true
+  },
+  "search.exclude": {
+    "**/.pixi": true,
+    "**/.ruff_cache": true,
+    "**/.mypy_cache": true,
+    "**/.pytest_cache": true,
+    "**/__pycache__": true,
+    "**/wandb": true,
+    "**/outputs": true,
+    "**/multirun": true,
+    "pixi.lock": true
+  },
+  "files.watcherExclude": {
+    "**/.pixi/**": true,
+    "**/.mypy_cache/**": true,
+    "**/.ruff_cache/**": true,
+    "**/.pytest_cache/**": true,
+    "**/wandb/**": true,
+    "**/outputs/**": true,
+    "**/multirun/**": true
+  }
+}

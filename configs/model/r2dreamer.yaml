@@ -1,0 +1,23 @@
+# R2-Dreamer (Morihira et al., ICLR 2026): decoder-free world model with a
+# Barlow-Twins redundancy-reduction loss between a projector(latent) and the
+# encoder embedding.
+
+defaults:
+  - _base
+  - _self_
+
+rep_loss: "r2dreamer"
+
+r2dreamer:
+  lambd: 5e-4  # Barlow-Twins off-diagonal weight
+
+# Add the Barlow-Twins term weight on top of _base's loss scales.
+loss_scales:
+  rew: 1.0
+  con: 1.0
+  dyn: 1.0
+  rep: 0.1
+  policy: 1.0
+  value: 1.0
+  repval: 0.3
+  barlow: 0.05

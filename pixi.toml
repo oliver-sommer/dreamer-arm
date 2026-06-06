@@ -1,0 +1,53 @@
+[workspace]
+authors = ["Oliver SOMMER <63651102+oliver-sommer@users.noreply.github.com>"]
+channels = ["conda-forge", "pytorch"]
+name = "dreamer-arm"
+platforms = ["osx-arm64", "linux-64"]
+version = "0.1.0"
+
+# Apple-Silicon wheels for tensordict / torchrl ≥0.12 are tagged
+# macosx_14_0_arm64; raise the deployment target so pixi picks them.
+[system-requirements]
+macos = "14.0"
+
+[dependencies]
+python = "3.13.*"
+pytorch = ">=2.10"
+numpy = ">=2.4"
+# dm-control 1.0.41 still references MjModel.flex_bandwidth, which mujoco 3.9
+# removed; pin mujoco below 3.9 until dm-control catches up.
+mujoco = ">=3.2,<3.9"
+dm-control = ">=1.0.41"
+einops = ">=0.8.2"
+hydra-core = ">=1.3.2"
+"ruamel.yaml" = ">=0.19"
+pyyaml = ">=6.0.3"
+pillow = ">=12"
+imageio = ">=2.37"
+imageio-ffmpeg = ">=0.6"
+wandb = ">=0.26"
+
+[pypi-dependencies]
+dreamer-arm = { path = ".", editable = true }
+torchrl = ">=0.12"
+tensordict = ">=0.12"
+gymnasium = ">=1.3"
+
+[feature.dev.dependencies]
+pytest = ">=9"
+pytest-cov = ">=7"
+ruff = ">=0.15"
+mypy = ">=2.1"
+pre-commit = ">=4.6"
+
+[environments]
+default = { features = [], solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+[tasks]
+lint = "ruff check src tests"
+fmt = "ruff format src tests"
+typecheck = "mypy src"
+test = "pytest"
+train = "python -m dreamer_arm"
+train-dmc = "python -m dreamer_arm env=dmc_vision"

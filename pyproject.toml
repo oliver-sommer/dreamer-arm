@@ -1,0 +1,107 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dreamer-arm"
+version = "0.1.0"
+description = "Dreamer (R2-Dreamer / DreamerV3) implementation for the i2rt YAM robotic arm in MuJoCo."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "Oliver Sommer" }]
+classifiers = [
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Runtime dependencies are managed through pixi.toml. We list a minimal set
+# here so the wheel is still installable directly from PyPI / pip.
+dependencies = [
+    "torch>=2.10",
+    "numpy>=2.4",
+    "einops>=0.8.2",
+    "hydra-core>=1.3.2",
+    "gymnasium>=1.3",
+    "tensordict>=0.12",
+    "torchrl>=0.12",
+    "wandb>=0.26",
+    "pyyaml>=6.0.3",
+    "mujoco>=3.2,<3.9",
+    "dm-control>=1.0.41",
+]
+
+[project.scripts]
+dreamer-arm = "dreamer_arm.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dreamer_arm"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = [
+    "E501",   # let ruff format own line length
+    "B008",   # function call in default arg (common for torch defaults)
+    "N812",   # allow `import torch.nn.functional as F`
+    "N806",   # allow ML-style local variable names
+    "N803",   # allow ML-style argument names
+    "SIM108", # ternary readability is judgement call
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "N802"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unused_ignores = true
+# torch ops are heavily typed as Any in stubs; strict warn_return_any creates
+# noise without catching real bugs in tensor-manipulation code.
+warn_return_any = false
+disallow_untyped_defs = true
+files = ["src/dreamer_arm"]
+plugins = []
+
+[[tool.mypy.overrides]]
+module = [
+    "torchrl.*",
+    "tensordict.*",
+    "dm_control.*",
+    "mujoco.*",
+    "wandb.*",
+    "einops.*",
+    "gymnasium.*",
+    "hydra.*",
+    "omegaconf.*",
+    "imageio.*",
+]
+ignore_missing_imports = true
+
+# nn.Module attribute access is typed as `Tensor | Module` by torch, which
+# breaks calls and attribute lookups on submodules. We disable the affected
+# error codes for our torch-heavy modules rather than scattering ignores.
+[[tool.mypy.overrides]]
+module = [
+    "dreamer_arm.agent.*",
+    "dreamer_arm.architecture.*",
+    "dreamer_arm.optim.*",
+]
+disable_error_code = ["operator", "union-attr", "index", "no-untyped-call", "arg-type"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "-m", "not slow"]
+markers = [
+    "slow: long-running tests skipped by default",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
