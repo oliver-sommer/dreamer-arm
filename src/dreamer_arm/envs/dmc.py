@@ -59,9 +59,7 @@ class DeepMindControl(gym.Env):  # type: ignore[type-arg]
         self._env = suite.load(self._domain, self._task, task_kwargs={"random": seed})
         self._action_repeat = int(action_repeat)
         self._size = size
-        self._camera = (
-            camera if camera is not None else self._DEFAULT_CAMERAS.get(self._domain, 0)
-        )
+        self._camera = camera if camera is not None else self._DEFAULT_CAMERAS.get(self._domain, 0)
 
         obs_spaces: dict[str, gym.Space] = {}  # type: ignore[type-arg]
         for key, value in self._env.observation_spec().items():
@@ -88,9 +86,7 @@ class DeepMindControl(gym.Env):  # type: ignore[type-arg]
             # the suite task with a fresh seed if the trainer asks for one.
             from dm_control import suite
 
-            self._env = suite.load(
-                self._domain, self._task, task_kwargs={"random": seed}
-            )
+            self._env = suite.load(self._domain, self._task, task_kwargs={"random": seed})
         time_step = self._env.reset()
         return self._obs(time_step), {"discount": np.float32(time_step.discount or 1.0)}
 

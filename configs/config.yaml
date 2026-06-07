@@ -1,10 +1,16 @@
 # Hydra root config for dreamer-arm.
 #
-# Resolution order (Hydra `defaults` list): task first, model second, then this
-# file's own keys. Override from the CLI with e.g.
+# Resolution order: arm first, task second, model third, then this file.
+#
+# Override from the CLI:
+#   pixi run train                                    # YAM + pick_place (defaults)
+#   pixi run train arm=sawyer                         # Sawyer + pick_place
+#   pixi run train task.task=reach                    # YAM + reach
+#   pixi run train arm=sawyer task.task=reach         # Sawyer + reach
 #   pixi run train task=dmc_vision task.task=cartpole_swingup model=dreamerv3
 defaults:
-  - task: yam
+  - arm: yam
+  - task: manip
   - model: r2dreamer
   - override hydra/job_logging: disabled
   - _self_
@@ -20,7 +26,7 @@ wandb:
   entity: null
   mode: online
   tags: []
-  name: ${task.task}-${model.rep_loss}-${seed}
+  name: null
 
 batch_size: 16
 batch_length: 64
@@ -35,14 +41,13 @@ buffer:
 trainer:
   steps: ${task.steps}
   pretrain: 0
-  eval_every: 10000
+  eval_every: 5000
   eval_episode_num: ${task.eval_episode_num}
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   train_ratio: ${task.train_ratio}
-  video_pred_log: false
-  params_hist_log: false
-  update_log_every: 5000
+
+  update_log_every: 1000
   action_repeat: ${task.action_repeat}
 
 hydra:

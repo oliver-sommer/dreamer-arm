@@ -67,9 +67,7 @@ class Deter(nn.Module):
         in_ch = (3 * hidden + deter // self.blocks) * self.blocks
         for i in range(self.dynlayers):
             self._dyn_hid.add_module(f"dyn_hid_{i}", BlockLinear(in_ch, deter, self.blocks))
-            self._dyn_hid.add_module(
-                f"norm_{i}", nn.RMSNorm(deter, eps=1e-4, dtype=torch.float32)
-            )
+            self._dyn_hid.add_module(f"norm_{i}", nn.RMSNorm(deter, eps=1e-4, dtype=torch.float32))
             self._dyn_hid.add_module(f"act_{i}", act_cls())
             in_ch = deter
         self._dyn_gru = BlockLinear(in_ch, 3 * deter, self.blocks)
@@ -137,7 +135,10 @@ class RSSM(nn.Module):
         )
 
         self._obs_net = self._build_stoch_head(
-            input_dim=self._deter + embed_size, num_layers=self._obs_layers, prefix="obs", act_cls=act_cls
+            input_dim=self._deter + embed_size,
+            num_layers=self._obs_layers,
+            prefix="obs",
+            act_cls=act_cls,
         )
         self._img_net = self._build_stoch_head(
             input_dim=self._deter, num_layers=self._img_layers, prefix="img", act_cls=act_cls
@@ -190,7 +191,9 @@ class RSSM(nn.Module):
         deters: list[torch.Tensor] = []
         logits: list[torch.Tensor] = []
         for i in range(t):
-            stoch, deter, logit = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i])
+            stoch, deter, logit = self.obs_step(
+                stoch, deter, action[:, i], embed[:, i], reset[:, i]
+            )
             stochs.append(stoch)
             deters.append(deter)
             logits.append(logit)

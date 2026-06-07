@@ -344,7 +344,9 @@ class MLP(nn.Module):
         self._symlog_inputs = bool(getattr(config, "symlog_inputs", False))
         self.layers = nn.Sequential()
         for i in range(int(config.layers)):
-            self.layers.add_module(f"{config.name}_linear{i}", nn.Linear(inp_dim, int(config.units)))
+            self.layers.add_module(
+                f"{config.name}_linear{i}", nn.Linear(inp_dim, int(config.units))
+            )
             self.layers.add_module(
                 f"{config.name}_norm{i}",
                 nn.RMSNorm(int(config.units), eps=1e-4, dtype=torch.float32),

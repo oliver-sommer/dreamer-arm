@@ -47,9 +47,6 @@ class TrainerConfig:
     eval_episode_num: int
     update_log_every: int
 
-    video_pred_log: bool = True
-    params_hist_log: bool = False
-
 
 class _AgentProto(Protocol):
     """Minimal interface the trainer needs from :class:`Dreamer`."""
@@ -120,6 +117,8 @@ class OnlineTrainer:
         lengths = np.zeros(n, dtype=np.int32)
         video_cache: list[np.ndarray] = []
         train_metrics: dict[str, torch.Tensor] = {}
+        metric_sums: dict[str, float] = {}
+        window_updates: int = 0
 
         # Episode IDs are kept constant across resets so SliceSampler can group
         # multi-episode windows; the RSSM resets internally on is_first.
@@ -187,9 +186,6 @@ class OnlineTrainer:
                 update_num = (
                     self.config.pretrain if self._should_pretrain() else self._updates_needed(step)
                 )
-                # Average metrics across the burst so a single log entry
-                # represents the whole window rather than just the last update.
-                metric_sums: dict[str, float] = {}
                 for _ in range(update_num):
                     train_metrics = agent.update(self.replay_buffer)
                     for name, value in train_metrics.items():
@@ -200,12 +196,15 @@ class OnlineTrainer:
                         )
                         metric_sums[name] = metric_sums.get(name, 0.0) + v
                 update_count += update_num
+                window_updates += update_num
 
-                if self._should_log(step) and update_num > 0:
+                if self._should_log(step) and window_updates > 0:
                     for name, total in metric_sums.items():
-                        self.logger.scalar(f"train/{name}", total / update_num)
+                        self.logger.scalar(f"train/{name}", total / window_updates)
                     self.logger.scalar("train/opt/updates", float(update_count))
                     self.logger.write(step, fps=True)
+                    metric_sums.clear()
+                    window_updates = 0
 
     # -------------------------------------------------------------------- eval
 
@@ -228,6 +227,11 @@ class OnlineTrainer:
         video: list[np.ndarray] = []
 
         while not done_once.all():
+            # Record env 0's frame before stepping so we capture the current
+            # observation rather than the post-auto-reset one. Stop once env 0
+            # has finished so the video is exactly one clean episode.
+            if not done_once[0] and "image" in obs_np:
+                video.append(obs_np["image"][0])
             obs_t = self._obs_to_tensor(obs_np, device)
             act, agent_state = agent.act(obs_t, agent_state, eval_mode=True)
             obs_np, reward_np, terminated_np, truncated_np, eval_infos = envs.step(
@@ -237,8 +241,6 @@ class OnlineTrainer:
             active = ~done_once
             returns += reward_np * active
             steps += active.astype(np.int32)
-            if "image" in obs_np:
-                video.append(obs_np["image"][0])
             for i, d in enumerate(done_np):
                 if d and not done_once[i]:
                     fin = eval_infos[i].get("final_info", {})

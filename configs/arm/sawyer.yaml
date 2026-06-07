@@ -1,0 +1,11 @@
+# Rethink Robotics Sawyer arm configuration.
+# Assets must be vendored first — run: pixi run vendor-sawyer
+# Override IK tuning per-arm here; body/joint names live in envs/arms/sawyer.py.
+
+name: "sawyer"
+
+# End-effector controller tuning.
+# Sawyer has 7 DOF (more redundancy than YAM's 6), so a slightly higher
+# damping can help near singularities.
+# ee_step_m: 0.02
+# ik_damping: 8e-3

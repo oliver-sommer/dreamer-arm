@@ -52,6 +52,8 @@ fmt = "ruff format src tests"
 typecheck = "mypy src"
 test = "pytest"
 train = { cmd = "python -m dreamer_arm", env = { MUJOCO_GL = "egl" } }
+train-yam = { cmd = "python -m dreamer_arm arm=yam", env = { MUJOCO_GL = "egl" } }
+train-sawyer = { cmd = "python -m dreamer_arm arm=sawyer", env = { MUJOCO_GL = "egl" } }
 train-dmc = { cmd = "python -m dreamer_arm task=dmc_vision", env = { MUJOCO_GL = "egl" } }
 # Live MuJoCo viewer window (macOS + mjpython only).
 train-view = "mjpython -m dreamer_arm task.viewer=true task.env_num=1 wandb.mode=disabled"

@@ -2,8 +2,9 @@
 
 Naming convention:
 
-* ``"yam"`` or ``"yam:<task>"`` → :class:`dreamer_arm.envs.yam.YAM`.
-* ``"dmc:<domain>_<task>"``    → :class:`dreamer_arm.envs.dmc.DeepMindControl`.
+* ``"manip"`` or ``"manip:<task>"``  → :class:`dreamer_arm.envs.manip.Manipulation`.
+  The arm is supplied via the ``arm=`` kwarg (default ``"yam"``).
+* ``"dmc:<domain>_<task>"``          → :class:`dreamer_arm.envs.dmc.DeepMindControl`.
 
 All envs are wrapped with :class:`DreamerObsWrapper` so the obs dict gets
 ``is_first``/``is_last``/``is_terminal`` flags, and (optionally) with
@@ -36,16 +37,27 @@ def make_env(
     across sub-steps); ``time_limit`` is applied *after* the env so it
     counts wrapper-level steps, not physics sub-steps.
 
-    ``viewer`` opens a passive MuJoCo window (YAM only; macOS + mjpython).
+    ``viewer`` opens a passive MuJoCo window (manip envs only; macOS + mjpython).
+    ``arm`` selects which arm to use for ``manip`` envs (default ``"yam"``).
     """
-    if name == "yam" or name.startswith("yam:"):
-        from dreamer_arm.envs.yam import YAM
+    if name == "manip" or name.startswith("manip:"):
+        from dreamer_arm.envs.manip import Manipulation
 
-        task = name.split(":", 1)[1] if ":" in name else "reach"
-        env: gym.Env = YAM(task=task, size=size, action_repeat=action_repeat, seed=seed, viewer=viewer, **kwargs)  # type: ignore[type-arg,arg-type]
+        task = name.split(":", 1)[1] if ":" in name else "pick_place"
+        arm = kwargs.pop("arm", "yam")
+        env: gym.Env = Manipulation(  # type: ignore[type-arg]
+            arm=arm,
+            task=task,
+            size=size,
+            action_repeat=action_repeat,
+            seed=seed,
+            viewer=viewer,
+            **kwargs,
+        )
     elif name.startswith("dmc:"):
         from dreamer_arm.envs.dmc import DeepMindControl
 
+        kwargs.pop("arm", None)  # arm is manip-only; discard for dmc
         env = DeepMindControl(
             name=name.split(":", 1)[1],
             action_repeat=action_repeat,
@@ -72,10 +84,11 @@ def make_vector_env(
 ) -> SyncVectorEnv:
     """Build a synchronous batch of ``num_envs`` envs with offset seeds.
 
-    Async vectorisation is intentionally out of scope (see plan).
+    Async vectorisation is intentionally out of scope.
 
     ``viewer=True`` opens a passive MuJoCo window on env 0 only.
     """
+
     def _factory(s: int, env_idx: int) -> Callable[[], gym.Env]:  # type: ignore[type-arg]
         def _make() -> gym.Env:  # type: ignore[type-arg]
             return make_env(name, seed=s, viewer=(viewer and env_idx == 0), **kwargs)

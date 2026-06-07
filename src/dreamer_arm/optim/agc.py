@@ -27,6 +27,10 @@ def adaptive_grad_clip(
         g = p.grad
         pnorm = torch.norm(p.detach(), p=2)
         gnorm = torch.norm(g, p=2)
-        upper = clip * torch.maximum(torch.tensor(pmin, device=pnorm.device, dtype=pnorm.dtype), pnorm)
-        scale = 1.0 / torch.maximum(torch.tensor(1.0, device=gnorm.device, dtype=gnorm.dtype), gnorm / upper)
+        upper = clip * torch.maximum(
+            torch.tensor(pmin, device=pnorm.device, dtype=pnorm.dtype), pnorm
+        )
+        scale = 1.0 / torch.maximum(
+            torch.tensor(1.0, device=gnorm.device, dtype=gnorm.dtype), gnorm / upper
+        )
         g.detach().mul_(scale)

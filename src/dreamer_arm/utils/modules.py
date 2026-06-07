@@ -96,9 +96,7 @@ def recursively_collect_optim_state_dict(
     return state_dicts
 
 
-def recursively_load_optim_state_dict(
-    obj: Any, state_dicts: dict[str, dict[str, Any]]
-) -> None:
+def recursively_load_optim_state_dict(obj: Any, state_dicts: dict[str, dict[str, Any]]) -> None:
     for path, state in state_dicts.items():
         target = obj
         for key in path.split("."):
@@ -132,8 +130,7 @@ def print_module_tree(info: dict[str, Any], parent_path: str = "", indent: int =
 
     print(" " * indent + f"{info['total']:11,d} {full_path}")
     param_nodes = [
-        {"name": pn, "params": {}, "children": {}, "total": n}
-        for pn, n in info["params"].items()
+        {"name": pn, "params": {}, "children": {}, "total": n} for pn, n in info["params"].items()
     ]
     combined = param_nodes + list(info["children"].values())
     combined.sort(key=lambda x: x["total"], reverse=True)

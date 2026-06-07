@@ -43,6 +43,17 @@ def run(cfg: DictConfig) -> None:
     _viewer = bool(cfg.task.get("viewer", False))  # type: ignore[union-attr]
 
     def _make_envs(*, viewer: bool = False) -> Any:
+        # Forward only the optional kwargs defined by the active task config.
+        # This keeps dmc_vision (no success_threshold) and manip (no camera)
+        # from crashing on each other's keys.
+        extra: dict[str, Any] = {}
+        if "success_threshold" in cfg.task:
+            extra["success_threshold"] = float(cfg.task.success_threshold)
+        if "camera" in cfg.task:
+            extra["camera"] = str(cfg.task.camera)
+        # Forward the arm name for manip envs; ignored by dmc.
+        if hasattr(cfg, "arm") and cfg.arm is not None:
+            extra["arm"] = str(cfg.arm.name)
         return make_vector_env(
             env_name,
             num_envs=int(cfg.task.env_num),
@@ -50,8 +61,8 @@ def run(cfg: DictConfig) -> None:
             size=tuple(cfg.task.size),
             action_repeat=int(cfg.task.action_repeat),
             time_limit=int(cfg.task.time_limit),
-            success_threshold=float(cfg.task.success_threshold),
             viewer=viewer,
+            **extra,
         )
 
     train_envs = _make_envs(viewer=_viewer)
@@ -73,7 +84,7 @@ def run(cfg: DictConfig) -> None:
     logger = WandbLogger(
         project=str(cfg.wandb.project),
         config=wandb_cfg if isinstance(wandb_cfg, dict) else None,  # type: ignore[arg-type]
-        name=str(cfg.wandb.name),
+        name=str(cfg.wandb.name) if cfg.wandb.name is not None else None,
         entity=cfg.wandb.entity,
         tags=list(cfg.wandb.tags) if cfg.wandb.tags else None,
         mode=cfg.wandb.mode,
@@ -90,8 +101,6 @@ def run(cfg: DictConfig) -> None:
         eval_every=int(cfg.trainer.eval_every),
         eval_episode_num=int(cfg.trainer.eval_episode_num),
         update_log_every=int(cfg.trainer.update_log_every),
-        video_pred_log=bool(cfg.trainer.video_pred_log),
-        params_hist_log=bool(cfg.trainer.params_hist_log),
     )
 
     try:

@@ -58,7 +58,9 @@ class OneHotDist(torchd.OneHotCategorical):
 class MultiOneHotDist:
     """Product of independent :class:`OneHotDist`s with shape ``(..., sum(shape))``."""
 
-    def __init__(self, logits: torch.Tensor, shape: tuple[int, ...], unimix_ratio: float = 0.0) -> None:
+    def __init__(
+        self, logits: torch.Tensor, shape: tuple[int, ...], unimix_ratio: float = 0.0
+    ) -> None:
         self.shape = shape
         splits = torch.split(logits, list(shape), dim=-1)
         self.onehots: list[OneHotDist] = [OneHotDist(s, unimix_ratio=unimix_ratio) for s in splits]
@@ -75,7 +77,10 @@ class MultiOneHotDist:
 
     def log_prob(self, value: torch.Tensor) -> torch.Tensor:
         splits = torch.split(value, list(self.shape), dim=-1)
-        return sum((d.log_prob(s) for d, s in zip(self.onehots, splits, strict=True)), start=torch.tensor(0.0))
+        return sum(
+            (d.log_prob(s) for d, s in zip(self.onehots, splits, strict=True)),
+            start=torch.tensor(0.0),
+        )
 
     def entropy(self) -> torch.Tensor:
         return sum((d.entropy() for d in self.onehots), start=torch.tensor(0.0))
@@ -252,7 +257,9 @@ def binary(logits: torch.Tensor, **_: Any) -> DistLike:
 def symexp_twohot(logits: torch.Tensor, bin_num: int, **_: Any) -> TwoHot:
     """Two-hot over symexp-spaced bins from -symexp(20) to +symexp(20)."""
     if bin_num % 2 == 1:
-        half = torch.linspace(-20, 0, (bin_num - 1) // 2 + 1, dtype=torch.float32, device=logits.device)
+        half = torch.linspace(
+            -20, 0, (bin_num - 1) // 2 + 1, dtype=torch.float32, device=logits.device
+        )
         half = symexp(half)
         bins = torch.cat([half, -half[:-1].flip(dims=(0,))], dim=0)
     else:

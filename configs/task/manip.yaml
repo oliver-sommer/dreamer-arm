@@ -1,0 +1,37 @@
+# Arm-agnostic manipulation task config.
+# The arm is selected via the separate `arm` config group (default: yam).
+#
+# Examples:
+#   pixi run train                                  # YAM + pick_place (defaults)
+#   pixi run train arm=sawyer                       # Sawyer + pick_place
+#   pixi run train task.task=reach                  # YAM + reach
+#   pixi run train arm=sawyer task.task=reach       # Sawyer + reach
+
+name: "manip"
+task: "pick_place"   # "reach" or "pick_place"
+
+steps: 1000000
+env_num: 4
+eval_episode_num: 5
+action_repeat: 2
+train_ratio: 512
+time_limit: 200
+success_threshold: 0.06   # metres; reach can use 0.05
+
+seed: ${seed}
+device: ${device}
+size: [64, 64]
+
+# Open an interactive MuJoCo window on env 0 while training.
+# Requires mjpython (in the pixi env): pixi run train-view
+# macOS only; keep false for headless / CI.
+viewer: false
+
+encoder:
+  # State + task-specific obs keys (target | object | goal).  Regex is
+  # start-anchored; keys absent from the active task are silently skipped.
+  mlp_keys: "state|target|object|goal"
+  cnn_keys: "image"
+decoder:
+  mlp_keys: "state|target|object|goal"
+  cnn_keys: "image"

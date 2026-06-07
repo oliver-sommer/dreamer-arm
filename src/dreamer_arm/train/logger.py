@@ -62,7 +62,7 @@ class WandbLogger:
 
     Usage::
 
-        logger = WandbLogger(project="dreamer-arm", config=cfg, name="yam-r2dreamer-0")
+        logger = WandbLogger(project="dreamer-arm", config=cfg)
         logger.scalar("loss/world_model", 1.23)
         logger.video("rollout/pred", frames)  # (B, T, H, W, C)
         logger.write(step=1000, fps=True)
@@ -100,6 +100,7 @@ class WandbLogger:
         self._histograms: dict[str, np.ndarray] = {}
         self._last_step: int | None = None
         self._last_time: float | None = None
+        self._max_logged_step: int | None = None
 
     # --------------------------------------------------------------- buffering
 
@@ -124,6 +125,12 @@ class WandbLogger:
     # ------------------------------------------------------------------- flush
 
     def write(self, step: int, fps: bool = False) -> None:
+        # wandb silently drops any log whose step <= the previous committed step.
+        # Nudge by 1 on collision so eval payloads (including video) always land.
+        if self._max_logged_step is not None and step <= self._max_logged_step:
+            step = self._max_logged_step + 1
+        self._max_logged_step = step
+
         fps_value = self._compute_fps(step) if fps else None
         print(self._console_line(step, fps_value), flush=True)
         payload: dict[str, Any] = dict(self._scalars)

@@ -1,0 +1,10 @@
+# i2rt YAM arm configuration.
+# Override IK tuning per-arm here; body/joint names live in envs/arms/yam.py.
+
+name: "yam"
+
+# End-effector controller tuning.
+# These are passed through to the Arm descriptor at construction time if
+# overriding is needed.  The defaults in arms/yam.py are usually fine.
+# ee_step_m: 0.02
+# ik_damping: 5e-3
