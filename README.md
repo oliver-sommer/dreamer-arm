@@ -17,7 +17,8 @@ actor–critic with λ-returns, LaProp + adaptive gradient clipping) is shared.
 ## Quick start
 
 ```bash
-# install
+# install (init submodule first; TODO opt-A: drop this line once metaworld is a git URL dep)
+git submodule update --init --recursive
 pixi install
 
 # train R2-Dreamer on the YAM reach task (default)
