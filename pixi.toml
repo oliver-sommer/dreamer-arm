@@ -71,7 +71,7 @@ test = "pytest"
 #   pixi run train envs=metaworld    envs.task=door-open arm=yam   # single task
 # TORCHINDUCTOR_CACHE_DIR persists torch.compile kernels across runs so only
 # the very first run pays the compilation cost (~30s); subsequent runs start fast.
-train = { cmd = "python -m dreamer_arm", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache" } }
+train = { cmd = "python -m dreamer_arm", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE" } }
 # Live MuJoCo viewer window (macOS + mjpython only); use a single-task env, e.g.
 #   pixi run train-view envs=metaworld envs.task=door-open
-train-view = { cmd = "mjpython -m dreamer_arm envs.viewer=true envs.env_num=1 wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache" } }
+train-view = { cmd = "mjpython -m dreamer_arm envs.viewer=true envs.env_num=1 wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE" } }
