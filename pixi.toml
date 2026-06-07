@@ -26,10 +26,14 @@ imageio = ">=2.37"
 imageio-ffmpeg = ">=0.6"
 wandb = ">=0.26"
 
-# CUDA 12.6 wheels for Linux; macOS pip falls through to the standard PyPI index.
+# cu126 is the primary index so Linux gets CUDA torch; macOS gets a 404 from
+# cu126 (no arm64 wheels) and falls back to PyPI for the MPS build.
+# first-index avoids querying cu126 for every package in parallel, which caused
+# EADDRNOTAVAIL connection errors on macOS with unsafe-best-match.
 [pypi-options]
-extra-index-urls = ["https://download.pytorch.org/whl/cu126"]
-index-strategy = "unsafe-best-match"
+index-url = "https://download.pytorch.org/whl/cu126"
+extra-index-urls = ["https://pypi.org/simple/"]
+index-strategy = "first-index"
 
 [pypi-dependencies]
 dreamer-arm = { path = ".", editable = true }
