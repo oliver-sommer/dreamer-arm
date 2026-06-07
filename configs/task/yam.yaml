@@ -1,0 +1,29 @@
+# i2rt YAM in MuJoCo. Default task is "pick_place".
+# Override with: pixi run train task.task=reach
+
+name: "yam"
+task: "pick_place"
+
+steps: 1000000
+env_num: 4
+eval_episode_num: 5
+action_repeat: 2
+train_ratio: 512
+time_limit: 200
+success_threshold: 0.06  # pick_place; reach uses 0.05 (override with task.success_threshold=0.05)
+
+seed: ${seed}
+device: ${device}
+size: [64, 64]
+
+# Open an interactive MuJoCo window on env 0 while training.
+# Requires mjpython (already in the pixi env): pixi run train-view
+# macOS only; keep false for headless / CI runs.
+viewer: false
+
+encoder:
+  mlp_keys: "state|target|object|goal"
+  cnn_keys: "image"
+decoder:
+  mlp_keys: "state|target|object|goal"
+  cnn_keys: "image"

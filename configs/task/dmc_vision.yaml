@@ -1,0 +1,23 @@
+# dm_control Suite (vision). Default task: cartpole-swingup — fastest signal
+# for sanity checks against published numbers.
+
+name: "dmc"
+task: "cartpole_swingup"  # dm_control suite name as <domain>_<task>
+
+steps: 1010000
+env_num: 4
+eval_episode_num: 10
+action_repeat: 2
+train_ratio: 512
+time_limit: 1000
+
+seed: ${seed}
+device: ${device}
+size: [64, 64]
+
+encoder:
+  mlp_keys: "$^"  # regex that matches nothing -> CNN only
+  cnn_keys: "image"
+decoder:
+  mlp_keys: "$^"
+  cnn_keys: "image"

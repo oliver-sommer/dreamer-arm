@@ -59,8 +59,8 @@ rssm:
 
 # Multi-modal encoder.
 encoder:
-  mlp_keys: ${env.encoder.mlp_keys}
-  cnn_keys: ${env.encoder.cnn_keys}
+  mlp_keys: ${task.encoder.mlp_keys}
+  cnn_keys: ${task.encoder.cnn_keys}
   mlp:
     shape: null
     layers: 3
