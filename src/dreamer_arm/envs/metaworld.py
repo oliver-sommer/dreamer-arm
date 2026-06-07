@@ -298,6 +298,7 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
 
         env._external_actuation = _apply_action
         env._external_reset_hand = _reset_hand
+        env._yam_controller = controller  # expose for tuning / testing
 
     # ---------------------------------------------------------------- gym API
 
