@@ -18,7 +18,7 @@ classifiers = [
 # Runtime dependencies are managed through pixi.toml. We list a minimal set
 # here so the wheel is still installable directly from PyPI / pip.
 dependencies = [
-    "torch>=2.10",
+    "torch>=2.6",
     "numpy>=2.4",
     "einops>=0.8.2",
     "hydra-core>=1.3.2",

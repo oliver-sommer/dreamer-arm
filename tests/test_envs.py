@@ -21,10 +21,10 @@ def test_metaworld_single_task_obs_action_spaces() -> None:
 
     env = make_env("metaworld:door-open", seed=0, time_limit=10)
     obs, info = env.reset()
-    assert set(obs.keys()) >= {"image", "state", "is_first", "is_last", "is_terminal"}
+    assert set(obs.keys()) >= {"scene", "state", "is_first", "is_last", "is_terminal"}
     assert "task_id" not in obs  # single-task: no one-hot
-    assert obs["image"].dtype == np.uint8
-    assert obs["image"].shape == (64, 64, 3)
+    assert obs["scene"].dtype == np.uint8
+    assert obs["scene"].shape == (64, 64, 3)
     assert obs["state"].shape == (39,)  # Meta-World's fixed-size obs
     assert obs["is_first"]
     assert info.get("task") == "door-open"
@@ -150,4 +150,52 @@ def test_action_rate_penalty_alternating_action_incurs_cost() -> None:
     expected_cost = 1.0 * float(np.sum((neg - pos) ** 2))
     assert info["action_rate_cost"] == pytest.approx(expected_cost)
     assert reward == pytest.approx(info["task_reward"] - expected_cost)
+    env.close()
+
+
+# ---------------------------------------------------------------------------
+# YAM self-collision gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_yam_self_collision_gate_home_pose_safe() -> None:
+    """EEController._self_collides returns False for the YAM home pose."""
+    from dreamer_arm.envs.metaworld import MetaWorld
+
+    env = MetaWorld("reach", arm="yam")
+    controller = env._env._yam_controller
+    env.reset()
+
+    # After reset the arm is at home pose; qpos[arm_qpos_adrs] = home config.
+    q_home = np.array([env._env.data.qpos[a] for a in controller._arm_qpos_adrs])
+    assert not controller._self_collides(q_home), (
+        "YAM home pose must not register as arm self-collision"
+    )
+    env.close()
+
+
+@pytest.mark.slow
+def test_yam_self_collision_gate_rollout_invariant() -> None:
+    """After each step the arm qpos never triggers self-collision (gate invariant).
+
+    The self-collision gate inside ``EEController.apply`` must ensure that the
+    committed joint target is always collision-free.  We verify this by running
+    50 random-action steps and calling ``_self_collides`` on the resulting arm
+    qpos after each step.
+    """
+    from dreamer_arm.envs.metaworld import MetaWorld
+
+    rng = np.random.default_rng(42)
+    env = MetaWorld("reach", arm="yam")
+    controller = env._env._yam_controller
+
+    env.reset()
+    for step in range(50):
+        action = rng.uniform(-1.0, 1.0, size=(4,)).astype(np.float32)
+        env.step(action)
+        q_arm = np.array([env._env.data.qpos[a] for a in controller._arm_qpos_adrs])
+        assert not controller._self_collides(q_arm), (
+            f"arm link self-penetration detected at step {step}: q={q_arm}"
+        )
     env.close()

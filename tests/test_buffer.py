@@ -32,7 +32,7 @@ def test_buffer_sample_shape() -> None:
     for t in range(16):
         td = TensorDict(
             {
-                "image": torch.zeros(n_envs, 8, 8, 3, dtype=torch.uint8),
+                "scene": torch.zeros(n_envs, 8, 8, 3, dtype=torch.uint8),
                 "action": torch.zeros(n_envs, 3),
                 "reward": torch.zeros(n_envs, 1),
                 "is_first": torch.tensor([t == 0] * n_envs),
@@ -64,7 +64,7 @@ def test_buffer_update_initial_state_writes_back() -> None:
         buf.add_transition(
             TensorDict(
                 {
-                    "image": torch.zeros(n_envs, 8, 8, 3, dtype=torch.uint8),
+                    "scene": torch.zeros(n_envs, 8, 8, 3, dtype=torch.uint8),
                     "action": torch.zeros(n_envs, 3),
                     "reward": torch.zeros(n_envs, 1),
                     "is_first": torch.tensor([t == 0] * n_envs),

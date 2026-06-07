@@ -19,9 +19,13 @@ Given action ``a ∈ [-1, 1]^4``:
    ``mujoco.mj_jacSite``, restricted to the arm's DOFs.
 4. Damped-least-squares (DLS) solution on the stacked 6-D error:
    ``dq = J^T (J J^T + λ²I₆)^{-1} [Δp; e_ori]``
-5. Update position-actuator ctrl:
-   ``ctrl[arm] = clip(q_arm + dq, ctrl_low, ctrl_high)``
-6. Map gripper ``a[3] ∈ [-1, 1]`` → ``[gripper_closed, gripper_open]`` ctrl.
+5. Compute the candidate joint target:
+   ``q_cand = clip(q_arm + dq, ctrl_low, ctrl_high)``
+6. Self-collision gate: if ``q_cand`` puts any arm link into self-penetration,
+   back off by halving ``dq`` (alpha = 0.5, 0.25) before falling back to holding
+   the current pose.  Finger/gripper bodies are excluded from the check so
+   normal gripper closing is never blocked.
+7. Map gripper ``a[3] ∈ [-1, 1]`` → ``[gripper_closed, gripper_open]`` ctrl.
 
 The orientation is **not** commanded by the policy; it is regulated to the
 target pose defined by the home keyframe (typically gripper-down).
@@ -40,6 +44,32 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("mujoco is required for the EEController") from exc
 
 from dreamer_arm.envs.arms import Arm
+
+# ---------------------------------------------------------------------------
+# Self-collision gate
+# ---------------------------------------------------------------------------
+
+# Signed-distance threshold: contact.dist < this → treat as penetration.
+# MuJoCo reports dist < 0 when surfaces overlap; 0.0 is the strict boundary.
+_SELF_COLLISION_DIST: float = 0.0
+
+# Back-off scale factors tried in order.  alpha=1.0 is the full IK step; alpha=0.0
+# holds the current pose.  The first collision-free candidate wins.
+_BACKOFF_ALPHAS: tuple[float, ...] = (1.0, 0.5, 0.25, 0.0)
+
+# Bodies whose geoms participate in the self-collision check.  Finger/gripper
+# bodies (leftclaw, rightclaw, lf_rot, lf_down, rf_rot, rf_down, leftpad,
+# rightpad, hand) are intentionally omitted so that normal gripper closing and
+# the fingers being near link_6 are never flagged as self-collision.
+_ARM_LINK_BODY_NAMES: tuple[str, ...] = (
+    "arm",
+    "link_1",
+    "link_2",
+    "link_3",
+    "link_4",
+    "link_5",
+    "link_6",
+)
 
 
 class EEController:
@@ -120,6 +150,24 @@ class EEController:
         self._g_lo = float(arm.gripper_closed)
         self._g_hi = float(arm.gripper_open)
 
+        # ---- Self-collision gate ----
+        # Scratch MjData used for collision queries (never stepped; only used
+        # with mj_forward to probe whether a candidate q causes arm link
+        # self-penetration).
+        self._model_ref = model
+        self._scratch_col = mujoco.MjData(model)
+
+        # Geom IDs whose body is one of the arm link bodies.  Built once from
+        # the model; finger/hand bodies are excluded (see _ARM_LINK_BODY_NAMES).
+        arm_link_geoms: set[int] = set()
+        for bname in _ARM_LINK_BODY_NAMES:
+            bid = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, bname))
+            if bid >= 0:
+                for gid in range(model.ngeom):
+                    if int(model.geom_bodyid[gid]) == bid:
+                        arm_link_geoms.add(gid)
+        self._arm_link_geoms: frozenset[int] = frozenset(arm_link_geoms)
+
     # ------------------------------------------------------------------ API
 
     def apply(
@@ -160,11 +208,22 @@ class EEController:
         dq = J.T @ np.linalg.solve(JJT, e)  # (n_arm,)
 
         q_cur = np.asarray(data.qpos)[self._arm_qpos_adrs]
-        q_new = np.clip(
-            q_cur + dq,
-            self._ctrl_low[self._arm_act_ids],
-            self._ctrl_high[self._arm_act_ids],
-        )
+
+        # ---- Self-collision gate with back-off ----
+        # Try alpha*dq for decreasing alpha.  The first collision-free candidate wins.
+        # alpha=0.0 holds the current (known collision-free) pose and always wins,
+        # so q_new is guaranteed to be set.
+        q_new = q_cur  # initialise to current pose as the final fallback
+        for alpha in _BACKOFF_ALPHAS:
+            q_cand = np.clip(
+                q_cur + alpha * dq,
+                self._ctrl_low[self._arm_act_ids],
+                self._ctrl_high[self._arm_act_ids],
+            )
+            if not self._self_collides(q_cand):
+                q_new = q_cand
+                break
+
         for i, aid in enumerate(self._arm_act_ids):
             data.ctrl[aid] = q_new[i]
 
@@ -184,3 +243,34 @@ class EEController:
         if span == 0.0:
             return 0.0
         return float(np.clip((g_ctrl - self._g_lo) / span, 0.0, 1.0))
+
+    # ---------------------------------------------------------------- internals
+
+    def _self_collides(self, q_candidate: np.ndarray) -> bool:
+        """Return True if ``q_candidate`` causes any arm link self-penetration.
+
+        Writes the 6 arm joint positions into a scratch :class:`mujoco.MjData`,
+        runs a forward pass to compute collision geometry, then checks whether
+        any contact pair has both geoms belonging to arm link bodies and a
+        signed distance below :data:`_SELF_COLLISION_DIST`.
+
+        Finger and hand geoms are excluded from the check (see
+        :data:`_ARM_LINK_BODY_NAMES`), so gripper closing does not count as
+        self-collision.
+
+        Parameters
+        ----------
+        q_candidate:
+            Array of 6 arm joint position targets (same order as
+            ``arm.arm_joint_names``).
+        """
+        scratch = self._scratch_col
+        for qpos_adr, q in zip(self._arm_qpos_adrs, q_candidate, strict=False):
+            scratch.qpos[qpos_adr] = q
+        mujoco.mj_forward(self._model_ref, scratch)
+        geoms = self._arm_link_geoms
+        for i in range(scratch.ncon):
+            c = scratch.contact[i]
+            if int(c.geom1) in geoms and int(c.geom2) in geoms and c.dist < _SELF_COLLISION_DIST:
+                return True
+        return False

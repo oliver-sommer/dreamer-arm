@@ -105,6 +105,8 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         action_repeat: int = 1,
         size: tuple[int, int] = (64, 64),
         camera: str = "corner2",
+        wrist_camera: str | None = None,
+        camera_jitter: float = 0.0,
         seed: int = 0,
         viewer: bool = False,
         task_idx: int | None = None,
@@ -118,6 +120,9 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._action_repeat = int(action_repeat)
         self._size = size
         self._camera = camera
+        self._wrist_camera = wrist_camera
+        self._camera_jitter = float(camera_jitter)
+        self._rng = np.random.default_rng(seed)
 
         # One-hot task conditioning (multi-task runs only).  Constant per env
         # because the factory pins a single task class to each env instance.
@@ -164,11 +169,25 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._renderer: mujoco.Renderer = _mj.Renderer(env.model, height=size[0], width=size[1])
         cam_id = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_CAMERA, camera)
         self._camera_id: int = int(cam_id) if cam_id >= 0 else 0
+        # Snapshot the (possibly overridden) base position for per-episode jitter.
+        self._cam_base_pos: np.ndarray = np.array(env.model.cam_pos[self._camera_id], copy=True)
+
+        self._wrist_camera_id: int | None = None
+        if wrist_camera is not None:
+            wc_id = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_CAMERA, wrist_camera)
+            if wc_id < 0:
+                raise RuntimeError(
+                    f"Wrist camera {wrist_camera!r} not found in model. "
+                    "Check that yam_xyz_base.xml defines it."
+                )
+            self._wrist_camera_id = int(wc_id)
 
         obs_spaces: dict[str, gym.spaces.Space] = {  # type: ignore[type-arg]
-            "image": gym.spaces.Box(0, 255, (*size, 3), dtype=np.uint8),
+            "scene": gym.spaces.Box(0, 255, (*size, 3), dtype=np.uint8),
             "state": env.observation_space,
         }
+        if self._wrist_camera_id is not None:
+            obs_spaces["wrist_image"] = gym.spaces.Box(0, 255, (*size, 3), dtype=np.uint8)
         if self._task_onehot is not None:
             obs_spaces["task_id"] = gym.spaces.Box(
                 0.0, 1.0, (self._task_onehot.shape[0],), dtype=np.float32
@@ -302,12 +321,19 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
 
     # ---------------------------------------------------------------- gym API
 
+    def _render_camera(self, cam_id: int, flip: bool) -> np.ndarray:
+        self._renderer.update_scene(self._env.data, camera=cam_id)
+        frame: np.ndarray = self._renderer.render()
+        return np.flip(frame, axis=0) if flip else frame
+
     def _make_obs(self, state: np.ndarray) -> ObsDict:
         """Build the Dreamer obs dict, adding the one-hot ``task_id`` if present."""
         obs: ObsDict = {
-            "image": self.render(),
+            "scene": self.render(),
             "state": np.asarray(state, dtype=np.float32),
         }
+        if self._wrist_camera_id is not None:
+            obs["wrist_image"] = self._render_camera(self._wrist_camera_id, flip=True)
         if self._task_onehot is not None:
             obs["task_id"] = self._task_onehot
         return obs
@@ -330,6 +356,11 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             self._env.set_task(mt1.train_tasks[0])
 
         self._success = False
+        if self._camera_jitter > 0.0:
+            j = self._camera_jitter
+            self._env.model.cam_pos[self._camera_id] = self._cam_base_pos + self._rng.uniform(
+                -j, j, 3
+            )
         state, _ = self._env.reset()
         if self._viewer_requested:
             import mujoco.viewer as _mv
@@ -362,11 +393,7 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         )
 
     def render(self) -> np.ndarray:
-        self._renderer.update_scene(self._env.data, camera=self._camera_id)
-        frame: np.ndarray = self._renderer.render()
-        if self._camera == "corner2":
-            return np.flip(frame, axis=0)
-        return frame
+        return self._render_camera(self._camera_id, flip=self._camera == "corner2")
 
     def _sync_viewer(self) -> None:
         if self._passive_viewer is not None and self._passive_viewer.is_running():

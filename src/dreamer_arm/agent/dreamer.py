@@ -427,8 +427,9 @@ class Dreamer(nn.Module):
 
     @torch.no_grad()
     def _preprocess(self, data: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        if "image" in data:
-            data["image"] = to_f32(data["image"]) / 255.0
+        for k in list(data.keys()):
+            if isinstance(data[k], torch.Tensor) and data[k].dtype == torch.uint8:
+                data[k] = to_f32(data[k]) / 255.0
         return data
 
 

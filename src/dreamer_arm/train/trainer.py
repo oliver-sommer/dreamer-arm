@@ -154,8 +154,8 @@ class OnlineTrainer:
                 },
                 batch_size=(n,),
             )
-            if "image" in obs_np:
-                video_cache.append(obs_np["image"][0])
+            if "scene" in obs_np:
+                video_cache.append(obs_np["scene"][0])
             self.replay_buffer.add_transition(transition.detach())
 
             # ---- bookkeeping ----
@@ -233,13 +233,17 @@ class OnlineTrainer:
         done_once = np.zeros(n, dtype=bool)
         eval_tasks: list[str | None] = [None] * n
         video: list[np.ndarray] = []
+        wrist_video: list[np.ndarray] = []
 
         while not done_once.all():
             # Record env 0's frame before stepping so we capture the current
             # observation rather than the post-auto-reset one. Stop once env 0
             # has finished so the video is exactly one clean episode.
-            if not done_once[0] and "image" in obs_np:
-                video.append(obs_np["image"][0])
+            if not done_once[0]:
+                if "scene" in obs_np:
+                    video.append(obs_np["scene"][0])
+                if "wrist_image" in obs_np:
+                    wrist_video.append(obs_np["wrist_image"][0])
             obs_t = self._obs_to_tensor(obs_np, device)
             act, agent_state = agent.act(obs_t, agent_state, eval_mode=True)
             obs_np, reward_np, terminated_np, truncated_np, eval_infos = envs.step(
@@ -265,6 +269,8 @@ class OnlineTrainer:
             self.logger.scalar(f"episode/eval_success/{task}", float(successes[mask].mean()))
         if video:
             self.logger.video("eval/video", np.stack(video, axis=0)[None])
+        if wrist_video:
+            self.logger.video("eval/wrist_video", np.stack(wrist_video, axis=0)[None])
         self.logger.write(train_step)
         agent.train()
 

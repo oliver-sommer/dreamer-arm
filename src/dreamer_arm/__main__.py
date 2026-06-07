@@ -62,6 +62,10 @@ def run(cfg: DictConfig) -> None:
             extra["success_threshold"] = float(cfg.envs.success_threshold)
         if "camera" in cfg.envs:
             extra["camera"] = str(cfg.envs.camera)
+        if "wrist_camera" in cfg.envs and cfg.envs.wrist_camera is not None:
+            extra["wrist_camera"] = str(cfg.envs.wrist_camera)
+        if "camera_jitter" in cfg.envs:
+            extra["camera_jitter"] = float(cfg.envs.camera_jitter)
         if hasattr(cfg, "arm") and cfg.arm is not None:
             extra["arm"] = str(cfg.arm.name)
         if "action_rate_cost" in cfg.envs:

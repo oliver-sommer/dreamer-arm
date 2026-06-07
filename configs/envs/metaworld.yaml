@@ -27,11 +27,13 @@ action_rate_cost: 0.02
 
 # Camera name passed to the Meta-World MuJoCo renderer.
 camera: corner2
+wrist_camera: wrist     # second image stream; null to disable
+camera_jitter: 0.05     # per-episode scene-camera position jitter (m); 0 disables
 viewer: false
 
 encoder:
   mlp_keys: "$^"  # vision-only; no proprioceptive MLP stream
-  cnn_keys: "image"
+  cnn_keys: "scene|wrist_image"
 decoder:
   mlp_keys: "$^"
-  cnn_keys: "image"
+  cnn_keys: "scene|wrist_image"

@@ -54,7 +54,7 @@ def tiny_encoder_cfg() -> Any:
     return _ns(
         {
             "mlp_keys": "state",
-            "cnn_keys": "image",
+            "cnn_keys": "scene",
             "mlp": {
                 "shape": None,
                 "layers": 1,
