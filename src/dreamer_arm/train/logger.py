@@ -159,7 +159,7 @@ class WandbLogger:
 
     # --------------------------------------------------------------- internals
 
-    def _encode_video(self, arr: np.ndarray) -> "wandb.Video":
+    def _encode_video(self, arr: np.ndarray) -> wandb.Video:
         """Encode (T, C, H, W) uint8 video via imageio-ffmpeg, then hand wandb a path.
 
         wandb.Video(numpy_array) calls ffmpeg as a subprocess in a way that can

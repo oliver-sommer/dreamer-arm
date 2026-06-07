@@ -1,15 +1,16 @@
 # Hydra root config for dreamer-arm.
 #
-# Resolution order: arm first, task second, model third, then this file.
+# Resolution order: arm first, envs second, model third, then this file.
 #
-# Override from the CLI:
-#   pixi run train                                    # YAM + pick_place (defaults)
-#   pixi run train arm=sawyer                         # Sawyer + pick_place
-#   pixi run train task.task=reach                    # YAM + reach
-#   pixi run train arm=sawyer task.task=reach         # Sawyer + reach
+# The specific task is MANDATORY (envs.task=???), so a bare `pixi run train`
+# errors. Override from the CLI:
+#   pixi run train envs=metaworld-mt envs.task=MT10           # generalist (default group)
+#   pixi run train envs=metaworld-mt envs.task=MT50 envs.env_num=50
+#   pixi run train envs=metaworld    envs.task=door-open          # single task
+#   pixi run train envs=metaworld    envs.task=door-open arm=yam  # single task, YAM arm
 defaults:
   - arm: yam
-  - task: manip
+  - envs: metaworld-mt
   - model: r2dreamer
   - override hydra/job_logging: disabled
   - _self_
@@ -38,16 +39,16 @@ buffer:
   storage_device: ${device}
 
 trainer:
-  steps: ${task.steps}
+  steps: ${envs.steps}
   pretrain: 0
   eval_every: 5000
-  eval_episode_num: ${task.eval_episode_num}
+  eval_episode_num: ${envs.eval_episode_num}
   batch_size: ${batch_size}
   batch_length: ${batch_length}
-  train_ratio: ${task.train_ratio}
+  train_ratio: ${envs.train_ratio}
 
   update_log_every: 1000
-  action_repeat: ${task.action_repeat}
+  action_repeat: ${envs.action_repeat}
 
 hydra:
   run:

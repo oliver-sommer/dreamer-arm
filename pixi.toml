@@ -59,13 +59,13 @@ lint = "ruff check src tests"
 fmt = "ruff format src tests"
 typecheck = "mypy src"
 test = "pytest"
+# Training. The env group + task are specified via Hydra overrides, e.g.:
+#   pixi run train envs=metaworld-mt envs.task=MT10            # generalist (default group)
+#   pixi run train envs=metaworld-mt envs.task=MT50 envs.env_num=50
+#   pixi run train envs=metaworld    envs.task=door-open arm=yam   # single task
 # TORCHINDUCTOR_CACHE_DIR persists torch.compile kernels across runs so only
 # the very first run pays the compilation cost (~30s); subsequent runs start fast.
 train = { cmd = "python -m dreamer_arm", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache" } }
-train-yam = { cmd = "python -m dreamer_arm arm=yam", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache" } }
-train-metaworld = { cmd = "python -m dreamer_arm task=metaworld", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache" } }
-# Live MuJoCo viewer window (macOS + mjpython only).
-train-view = "mjpython -m dreamer_arm task.viewer=true task.env_num=1 wandb.mode=disabled"
-train-metaworld-view = "mjpython -m dreamer_arm task=metaworld task.viewer=true task.env_num=1 wandb.mode=disabled"
-train-metaworld-yam = "python -m dreamer_arm task=metaworld arm=yam wandb.mode=disabled"
-train-metaworld-yam-view = "mjpython -m dreamer_arm task=metaworld arm=yam task.viewer=true task.env_num=1 wandb.mode=disabled"
+# Live MuJoCo viewer window (macOS + mjpython only); use a single-task env, e.g.
+#   pixi run train-view envs=metaworld envs.task=door-open
+train-view = { cmd = "mjpython -m dreamer_arm envs.viewer=true envs.env_num=1 wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache" } }

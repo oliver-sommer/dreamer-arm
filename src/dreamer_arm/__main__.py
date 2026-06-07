@@ -51,32 +51,32 @@ def run(cfg: DictConfig) -> None:
     """Build the full Dreamer stack from ``cfg`` and run the online loop."""
     set_seed_everywhere(int(cfg.seed))
 
-    env_name = f"{cfg.task.name}:{cfg.task.task}"
+    env_name = f"{cfg.envs.name}:{cfg.envs.task}"
 
-    _viewer = bool(cfg.task.get("viewer", False))  # type: ignore[union-attr]
+    _viewer = bool(cfg.envs.get("viewer", False))
 
     def _make_envs(*, viewer: bool = False) -> Any:
-        # Forward only the optional kwargs defined by the active task config.
+        # Forward only the optional kwargs defined by the active env config.
         extra: dict[str, Any] = {}
-        if "success_threshold" in cfg.task:
-            extra["success_threshold"] = float(cfg.task.success_threshold)
-        if "camera" in cfg.task:
-            extra["camera"] = str(cfg.task.camera)
+        if "success_threshold" in cfg.envs:
+            extra["success_threshold"] = float(cfg.envs.success_threshold)
+        if "camera" in cfg.envs:
+            extra["camera"] = str(cfg.envs.camera)
         if hasattr(cfg, "arm") and cfg.arm is not None:
             extra["arm"] = str(cfg.arm.name)
         return make_vector_env(
             env_name,
-            num_envs=int(cfg.task.env_num),
-            seed=int(cfg.task.seed),
-            size=tuple(cfg.task.size),
-            action_repeat=int(cfg.task.action_repeat),
-            time_limit=int(cfg.task.time_limit),
+            num_envs=int(cfg.envs.env_num),
+            seed=int(cfg.envs.seed),
+            size=tuple(cfg.envs.size),
+            action_repeat=int(cfg.envs.action_repeat),
+            time_limit=int(cfg.envs.time_limit),
             viewer=viewer,
             **extra,
         )
 
     train_envs = _make_envs(viewer=_viewer)
-    eval_envs = _make_envs() if int(cfg.task.eval_episode_num) > 0 else None
+    eval_envs = _make_envs() if int(cfg.envs.eval_episode_num) > 0 else None
 
     agent = Dreamer(cfg.model, train_envs.observation_space, train_envs.action_space).to(cfg.device)
 

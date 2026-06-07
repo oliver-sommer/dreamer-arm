@@ -76,6 +76,7 @@ module = [
     "tensordict.*",
     "dm_control.*",
     "mujoco.*",
+    "metaworld.*",
     "wandb.*",
     "einops.*",
     "gymnasium.*",

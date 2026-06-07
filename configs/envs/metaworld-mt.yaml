@@ -1,0 +1,39 @@
+# Meta-World multi-task (generalist) config.
+#
+# Trains one policy across all tasks of an MT benchmark, conditioned on a
+# one-hot ``task_id``.  The factory pins one env per task (env i → task i), so
+# ``env_num`` must be a multiple of the task count (== task count recommended):
+#   MT10 → 10 tasks, MT25 → 25, MT50 → 50.
+#
+# ``envs.task`` is MANDATORY: MT10 | MT25 | MT50.
+#
+# Examples:
+#   pixi run train envs=metaworld-mt envs.task=MT10
+#   pixi run train envs=metaworld-mt envs.task=MT50 envs.env_num=50
+
+name: "metaworld"   # factory routing → env_name = metaworld:<task>
+task: ???           # MT10 | MT25 | MT50 (mandatory)
+
+steps: 5050000
+env_num: 10         # MT10 default; set envs.env_num=25 / 50 for MT25 / MT50
+eval_episode_num: 10
+action_repeat: 2
+train_ratio: 512
+time_limit: 500
+
+seed: ${seed}
+device: ${device}
+size: [64, 64]
+
+# Camera name passed to the Meta-World MuJoCo renderer.
+camera: corner2
+viewer: false
+
+encoder:
+  # Vision + one-hot task conditioning only.  The 39-dim proprioceptive `state`
+  # is intentionally excluded (it bundles privileged object/goal coords).
+  mlp_keys: "task_id"
+  cnn_keys: "image"
+decoder:
+  mlp_keys: "task_id"
+  cnn_keys: "image"

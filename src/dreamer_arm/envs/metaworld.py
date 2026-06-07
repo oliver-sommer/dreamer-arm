@@ -7,7 +7,7 @@ adds the ``is_first``/``is_last``/``is_terminal`` flags on top, so this class
 must not emit them.
 
 Task names use the raw Meta-World convention without the ``-v3`` suffix
-(e.g. ``"reach"``, ``"pick-place"``, ``"door-open"``).  The factory prepends
+(e.g. ``"door-open"``, ``"drawer-close"``).  The factory prepends
 the ``metaworld:`` suite prefix, which is stripped before passing to this class.
 
 Arm selection
@@ -73,7 +73,7 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
     Parameters
     ----------
     name:
-        MT1 task name without the ``-v3`` suffix, e.g. ``"reach"``.
+        MT1 task name without the ``-v3`` suffix, e.g. ``"door-open"``.
     arm:
         Arm identifier.  ``"sawyer"`` (default) uses the upstream Sawyer mocap
         control; ``"yam"`` drives the YAM arm via ``EEController`` IK.
@@ -87,6 +87,13 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         Used to seed the MT1 benchmark for reproducible task sampling.
     viewer:
         Open a passive MuJoCo viewer window (macOS + ``mjpython`` only).
+    task_idx, num_tasks:
+        Multi-task conditioning.  When ``num_tasks`` is set, the obs dict gains a
+        ``task_id`` key holding a one-hot of length ``num_tasks`` with a 1 at
+        ``task_idx``.  This is how a generalist policy is told which task it is
+        in; the factory pins one task per env (see ``_make_metaworld_mt``).  Left
+        ``None`` for ordinary single-task runs, in which case no ``task_id`` key
+        is emitted.
     """
 
     metadata: ClassVar[dict[str, list[str]]] = {"render_modes": ["rgb_array"]}  # type: ignore[misc]
@@ -100,6 +107,8 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         camera: str = "corner2",
         seed: int = 0,
         viewer: bool = False,
+        task_idx: int | None = None,
+        num_tasks: int | None = None,
     ) -> None:
         import metaworld
         import mujoco as _mj
@@ -109,6 +118,16 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._action_repeat = int(action_repeat)
         self._size = size
         self._camera = camera
+
+        # One-hot task conditioning (multi-task runs only).  Constant per env
+        # because the factory pins a single task class to each env instance.
+        self._task_onehot: np.ndarray | None = None
+        if num_tasks is not None:
+            if task_idx is None or not 0 <= task_idx < num_tasks:
+                raise ValueError(
+                    f"task_idx must be in [0, {num_tasks}) when num_tasks is set; got {task_idx}"
+                )
+            self._task_onehot = np.eye(num_tasks, dtype=np.float32)[task_idx]
 
         # Route asset paths for the YAM arm before building any env class.
         if arm == "yam":
@@ -146,13 +165,16 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         cam_id = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_CAMERA, camera)
         self._camera_id: int = int(cam_id) if cam_id >= 0 else 0
 
-        self.observation_space: gym.spaces.Dict = gym.spaces.Dict(  # type: ignore[assignment]
-            {
-                "image": gym.spaces.Box(0, 255, (*size, 3), dtype=np.uint8),
-                "state": env.observation_space,
-            }
-        )
-        self.action_space: gym.spaces.Box = gym.spaces.Box(  # type: ignore[assignment]
+        obs_spaces: dict[str, gym.spaces.Space] = {  # type: ignore[type-arg]
+            "image": gym.spaces.Box(0, 255, (*size, 3), dtype=np.uint8),
+            "state": env.observation_space,
+        }
+        if self._task_onehot is not None:
+            obs_spaces["task_id"] = gym.spaces.Box(
+                0.0, 1.0, (self._task_onehot.shape[0],), dtype=np.float32
+            )
+        self.observation_space: gym.spaces.Dict = gym.spaces.Dict(obs_spaces)
+        self.action_space: gym.spaces.Box = gym.spaces.Box(
             env.action_space.low,
             env.action_space.high,
             dtype=np.float32,
@@ -195,7 +217,12 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         #   - ee_step_m: scaled to match MW's action_scale/frame_skip
         yam_arm_mw = dataclasses.replace(
             YAM_ARM,
-            tcp_target_quat=tuple(quat_down),
+            tcp_target_quat=(
+                float(quat_down[0]),
+                float(quat_down[1]),
+                float(quat_down[2]),
+                float(quat_down[3]),
+            ),
             ee_step_m=_YAM_MW_EE_STEP_M,
         )
         controller = EEController(yam_arm_mw, env.model)
@@ -274,6 +301,20 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
 
     # ---------------------------------------------------------------- gym API
 
+    def _make_obs(self, state: np.ndarray) -> ObsDict:
+        """Build the Dreamer obs dict, adding the one-hot ``task_id`` if present."""
+        obs: ObsDict = {
+            "image": self.render(),
+            "state": np.asarray(state, dtype=np.float32),
+        }
+        if self._task_onehot is not None:
+            obs["task_id"] = self._task_onehot
+        return obs
+
+    def _info(self, **extra: Any) -> dict[str, Any]:
+        """Step/reset info, tagged with the task name for per-task logging."""
+        return {"task": self._name, **extra}
+
     def reset(
         self,
         *,
@@ -295,7 +336,7 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             self._passive_viewer = _mv.launch_passive(self._env.model, self._env.data)
             self._viewer_requested = False
         self._sync_viewer()
-        return {"image": self.render(), "state": np.asarray(state, dtype=np.float32)}, {}
+        return self._make_obs(state), self._info()
 
     def step(self, action: np.ndarray) -> tuple[ObsDict, float, bool, bool, dict[str, Any]]:
         total_reward = 0.0
@@ -311,13 +352,15 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
 
         assert state is not None
         self._sync_viewer()
-        obs: ObsDict = {
-            "image": self.render(),
-            "state": np.asarray(state, dtype=np.float32),
-        }
-        return obs, total_reward, terminated, truncated, {"success": self._success}
+        return (
+            self._make_obs(state),
+            total_reward,
+            terminated,
+            truncated,
+            self._info(success=self._success),
+        )
 
-    def render(self) -> np.ndarray:  # type: ignore[override]
+    def render(self) -> np.ndarray:
         self._renderer.update_scene(self._env.data, camera=self._camera_id)
         frame: np.ndarray = self._renderer.render()
         if self._camera == "corner2":

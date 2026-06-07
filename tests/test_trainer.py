@@ -25,8 +25,10 @@ def test_trainer_runs_one_step() -> None:
             config_name="config",
             overrides=[
                 "device=cpu",
-                "task.env_num=1",
-                "task.eval_episode_num=0",
+                "envs=metaworld",
+                "envs.task=door-open",
+                "envs.env_num=1",
+                "envs.eval_episode_num=0",
                 "trainer.steps=4",
                 "trainer.update_log_every=1",
                 "batch_size=2",
@@ -36,5 +38,6 @@ def test_trainer_runs_one_step() -> None:
         )
     # Don't actually run — just confirm the config composes.
     assert cfg.model.rep_loss == "r2dreamer"
-    assert cfg.task.name == "manip"
+    assert cfg.envs.name == "metaworld"
+    assert cfg.envs.task == "door-open"
     assert cfg.arm.name == "yam"

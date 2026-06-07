@@ -173,7 +173,14 @@ class OnlineTrainer:
                 self.logger.scalar("episode/score", float(returns[i]))
                 self.logger.scalar("episode/length", float(lengths[i]))
                 fin = infos[i].get("final_info", {})
-                self.logger.scalar("episode/success", float(bool(fin.get("success", False))))
+                success = float(bool(fin.get("success", False)))
+                self.logger.scalar("episode/success", success)
+                # Per-task breakdown for multi-task (MT*) runs; the env tags
+                # each episode with its task name via info["task"].
+                task = fin.get("task")
+                if task is not None:
+                    self.logger.scalar(f"episode/success/{task}", success)
+                    self.logger.scalar(f"episode/score/{task}", float(returns[i]))
                 self.logger.write(step + i)
                 returns[i] = 0.0
                 lengths[i] = 0
@@ -224,6 +231,7 @@ class OnlineTrainer:
         steps = np.zeros(n, dtype=np.int32)
         successes = np.zeros(n, dtype=bool)
         done_once = np.zeros(n, dtype=bool)
+        eval_tasks: list[str | None] = [None] * n
         video: list[np.ndarray] = []
 
         while not done_once.all():
@@ -245,11 +253,16 @@ class OnlineTrainer:
                 if d and not done_once[i]:
                     fin = eval_infos[i].get("final_info", {})
                     successes[i] = bool(fin.get("success", False))
+                    eval_tasks[i] = fin.get("task")
             done_once |= done_np
 
         self.logger.scalar("episode/eval_score", float(returns.mean()))
         self.logger.scalar("episode/eval_length", float(steps.mean()))
         self.logger.scalar("episode/eval_success", float(successes.mean()))
+        # Per-task eval success for multi-task (MT*) runs.
+        for task in {t for t in eval_tasks if t is not None}:
+            mask = np.array([t == task for t in eval_tasks], dtype=bool)
+            self.logger.scalar(f"episode/eval_success/{task}", float(successes[mask].mean()))
         if video:
             self.logger.video("eval/video", np.stack(video, axis=0)[None])
         self.logger.write(train_step)
