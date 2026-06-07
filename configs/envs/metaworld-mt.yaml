@@ -25,6 +25,10 @@ seed: ${seed}
 device: ${device}
 size: [64, 64]
 
+# Jerk penalty subtracted from reward each step — discourages bang-bang control
+# and encourages smooth, hardware-friendly motion for sim-to-real on YAM.
+action_rate_cost: 0.02
+
 # Camera name passed to the Meta-World MuJoCo renderer.
 camera: corner2
 viewer: false

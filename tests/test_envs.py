@@ -69,3 +69,85 @@ def test_metaworld_mt_env_num_guard() -> None:
 
     with pytest.raises(ValueError, match="multiple"):
         make_vector_env("metaworld:MT10", num_envs=7)
+
+
+# ---------------------------------------------------------------------------
+# ActionRatePenalty wrapper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_action_rate_penalty_zero_cost_is_noop() -> None:
+    """rate_cost=0 produces identical rewards to the unwrapped env."""
+    from dreamer_arm.envs.factory import make_env
+
+    rng = np.random.default_rng(0)
+    actions = [rng.uniform(-1, 1, size=(4,)).astype(np.float32) for _ in range(5)]
+
+    env_base = make_env("metaworld:reach", seed=0, time_limit=10)
+    env_pen = make_env("metaworld:reach", seed=0, time_limit=10, action_rate_cost=0.0)
+    env_base.reset(seed=0)
+    env_pen.reset(seed=0)
+
+    for act in actions:
+        _, r_base, term_b, trunc_b, _ = env_base.step(act)
+        _, r_pen, _, _, _ = env_pen.step(act)
+        assert r_base == pytest.approx(r_pen), "zero cost must produce identical rewards"
+        if term_b or trunc_b:
+            break
+
+    env_base.close()
+    env_pen.close()
+
+
+@pytest.mark.slow
+def test_action_rate_penalty_no_penalty_on_first_step() -> None:
+    """No jerk penalty is applied on the very first step of an episode."""
+    from dreamer_arm.envs.factory import make_env
+
+    env = make_env("metaworld:reach", seed=0, time_limit=10, action_rate_cost=1.0)
+    env.reset(seed=0)
+    act = np.ones(4, dtype=np.float32)
+    _, reward, _, _, info = env.step(act)
+
+    assert info["action_rate_cost"] == pytest.approx(0.0), "first step must incur no rate penalty"
+    assert reward == pytest.approx(info["task_reward"])
+    env.close()
+
+
+@pytest.mark.slow
+def test_action_rate_penalty_constant_action_zero_rate_cost() -> None:
+    """Repeating the same action incurs no rate penalty after the first step."""
+    from dreamer_arm.envs.factory import make_env
+
+    env = make_env("metaworld:reach", seed=0, time_limit=10, action_rate_cost=1.0)
+    env.reset(seed=0)
+    act = np.full(4, 0.5, dtype=np.float32)
+
+    env.step(act)  # first step: no prev action, skip
+    _, reward, _, _, info = env.step(act)  # same action again → Δa = 0
+
+    assert info["action_rate_cost"] == pytest.approx(0.0), (
+        "constant action must have zero rate cost"
+    )
+    assert reward == pytest.approx(info["task_reward"])
+    env.close()
+
+
+@pytest.mark.slow
+def test_action_rate_penalty_alternating_action_incurs_cost() -> None:
+    """Alternating between opposite actions produces a positive jerk penalty."""
+    from dreamer_arm.envs.factory import make_env
+
+    env = make_env("metaworld:reach", seed=0, time_limit=10, action_rate_cost=1.0)
+    env.reset(seed=0)
+    pos = np.ones(4, dtype=np.float32)
+    neg = -np.ones(4, dtype=np.float32)
+
+    env.step(pos)  # first step: baseline prev_action = pos
+    _, reward, _, _, info = env.step(neg)  # Δa = neg - pos = -2 each → sum((Δa)²) = 4*4 = 16
+
+    expected_cost = 1.0 * float(np.sum((neg - pos) ** 2))
+    assert info["action_rate_cost"] == pytest.approx(expected_cost)
+    assert reward == pytest.approx(info["task_reward"] - expected_cost)
+    env.close()

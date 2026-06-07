@@ -64,6 +64,10 @@ def run(cfg: DictConfig) -> None:
             extra["camera"] = str(cfg.envs.camera)
         if hasattr(cfg, "arm") and cfg.arm is not None:
             extra["arm"] = str(cfg.arm.name)
+        if "action_rate_cost" in cfg.envs:
+            extra["action_rate_cost"] = float(cfg.envs.action_rate_cost)
+        if "action_mag_cost" in cfg.envs:
+            extra["action_mag_cost"] = float(cfg.envs.action_mag_cost)
         return make_vector_env(
             env_name,
             num_envs=int(cfg.envs.env_num),

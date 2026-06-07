@@ -2,6 +2,7 @@
 
 from dreamer_arm.envs.factory import make_env, make_vector_env
 from dreamer_arm.envs.wrappers import (
+    ActionRatePenalty,
     ActionRepeat,
     DreamerObsWrapper,
     SyncVectorEnv,
@@ -9,6 +10,7 @@ from dreamer_arm.envs.wrappers import (
 )
 
 __all__ = [
+    "ActionRatePenalty",
     "ActionRepeat",
     "DreamerObsWrapper",
     "SyncVectorEnv",

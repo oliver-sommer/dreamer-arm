@@ -21,7 +21,7 @@ from typing import Any
 
 import gymnasium as gym
 
-from dreamer_arm.envs.wrappers import DreamerObsWrapper, SyncVectorEnv, TimeLimit
+from dreamer_arm.envs.wrappers import ActionRatePenalty, DreamerObsWrapper, SyncVectorEnv, TimeLimit
 
 # Meta-World multi-task benchmarks → their ordered task-name lists.  The
 # ``env_dict`` keys carry the ``-v3`` suffix; strip it to the bare task name
@@ -50,6 +50,8 @@ def make_env(
     size: tuple[int, int] = (64, 64),
     action_repeat: int = 1,
     viewer: bool = False,
+    action_rate_cost: float = 0.0,
+    action_mag_cost: float = 0.0,
     **kwargs: Any,
 ) -> gym.Env:  # type: ignore[type-arg]
     """Construct a single Dreamer-shaped env from a name.
@@ -61,6 +63,9 @@ def make_env(
     ``viewer`` opens a passive MuJoCo window (macOS + mjpython).
     ``arm`` selects which arm a Meta-World env uses (``"sawyer"`` or ``"yam"``).
     ``task_idx``/``num_tasks`` add a one-hot ``task_id`` obs key (multi-task).
+    ``action_rate_cost`` / ``action_mag_cost`` add a smoothness/jerk penalty
+    subtracted from the reward — recommended for YAM sim-to-real (~0.02).
+    Both default to 0.0 (disabled) so benchmark runs are unaffected.
     """
     if name.startswith("metaworld:"):
         from dreamer_arm.envs.metaworld import MetaWorld
@@ -80,6 +85,8 @@ def make_env(
     else:
         raise ValueError(f"unknown env name: {name!r}")
 
+    if action_rate_cost or action_mag_cost:
+        env = ActionRatePenalty(env, rate_cost=action_rate_cost, mag_cost=action_mag_cost)
     env = DreamerObsWrapper(env)
     if time_limit is not None:
         env = TimeLimit(env, max_steps=time_limit)

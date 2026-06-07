@@ -123,6 +123,63 @@ class TimeLimit(gym.Wrapper):  # type: ignore[type-arg]
         return obs, float(reward), bool(terminated), bool(truncated), info
 
 
+# ------------------------------------------------------- action-rate penalty
+
+
+class ActionRatePenalty(gym.Wrapper):  # type: ignore[type-arg]
+    """Subtract a jerk/smoothness penalty from the reward at each step.
+
+    Penalises large changes between consecutive actions (action-rate cost) and,
+    optionally, large action magnitudes.  Both are standard sim-to-real tricks
+    that encourage the policy to produce smooth, hardware-friendly trajectories
+    instead of bang-bang control.
+
+    Penalty applied to the reward::
+
+        penalty = rate_cost * ||a_t - a_{t-1}||^2 + mag_cost * ||a_t||^2
+
+    No penalty is applied on the very first step of an episode (``is_first``).
+    When both costs are zero the wrapper is a strict no-op and adds no overhead.
+
+    **Scaling guidance (Meta-World):** task rewards are 0-10 per inner step,
+    action-repeat=2 -> 0-20 per wrapped step.  Per-dim ``(da)^2 <= 4`` over the
+    4-D action -> ``sum((da)^2) <= 16``.  So ``rate_cost ~= 0.02`` yields at most
+    ~0.3 penalty vs ~10-20 task reward -- gentle enough not to swamp the task,
+    strong enough to discourage reversals.  Start there and watch
+    ``action_rate_cost`` vs success-rate in W&B.
+
+    Diagnostics surfaced in ``info``:
+    * ``info["task_reward"]``     — reward before penalty.
+    * ``info["action_rate_cost"]``— penalty actually subtracted this step.
+    """
+
+    def __init__(self, env: gym.Env, rate_cost: float, mag_cost: float = 0.0) -> None:  # type: ignore[type-arg]
+        super().__init__(env)
+        self._rate_cost = float(rate_cost)
+        self._mag_cost = float(mag_cost)
+        self._prev_action: np.ndarray | None = None
+
+    def reset(self, **kwargs: Any) -> tuple[ObsDict, dict[str, Any]]:
+        self._prev_action = None
+        return self.env.reset(**kwargs)
+
+    def step(self, action: np.ndarray) -> tuple[ObsDict, float, bool, bool, dict[str, Any]]:
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        task_reward = float(reward)
+
+        penalty = 0.0
+        if self._rate_cost != 0.0 and self._prev_action is not None:
+            penalty += self._rate_cost * float(np.sum((action - self._prev_action) ** 2))
+        if self._mag_cost != 0.0:
+            penalty += self._mag_cost * float(np.sum(action**2))
+
+        self._prev_action = np.array(action, copy=True)
+
+        info["task_reward"] = task_reward
+        info["action_rate_cost"] = penalty
+        return obs, task_reward - penalty, terminated, truncated, info
+
+
 # --------------------------------------------------------------- vectorisation
 
 
