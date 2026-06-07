@@ -66,6 +66,10 @@ def run(cfg: DictConfig) -> None:
             extra["wrist_camera"] = str(cfg.envs.wrist_camera)
         if "camera_jitter" in cfg.envs:
             extra["camera_jitter"] = float(cfg.envs.camera_jitter)
+        if "scene_randomize" in cfg.envs:
+            extra["scene_randomize"] = bool(cfg.envs.scene_randomize)
+        if "camera_pose_randomize" in cfg.envs:
+            extra["camera_pose_randomize"] = bool(cfg.envs.camera_pose_randomize)
         if hasattr(cfg, "arm") and cfg.arm is not None:
             extra["arm"] = str(cfg.arm.name)
         if "action_rate_cost" in cfg.envs:

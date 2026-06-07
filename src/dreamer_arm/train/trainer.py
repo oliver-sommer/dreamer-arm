@@ -232,18 +232,24 @@ class OnlineTrainer:
         successes = np.zeros(n, dtype=bool)
         done_once = np.zeros(n, dtype=bool)
         eval_tasks: list[str | None] = [None] * n
-        video: list[np.ndarray] = []
-        wrist_video: list[np.ndarray] = []
+
+        # Collect one episode's worth of frames from up to eval_episode_num envs.
+        # In MT runs each env is pinned to a different task, so this shows one
+        # video stream per task side-by-side in W&B.  The length is determined
+        # by env 0's episode so all streams are the same number of frames.
+        n_video = min(n, self.config.eval_episode_num)
+        videos: list[list[np.ndarray]] = [[] for _ in range(n_video)]
+        wrist_videos: list[list[np.ndarray]] = [[] for _ in range(n_video)]
 
         while not done_once.all():
-            # Record env 0's frame before stepping so we capture the current
-            # observation rather than the post-auto-reset one. Stop once env 0
-            # has finished so the video is exactly one clean episode.
+            # Record before stepping to capture the current obs, not post-reset.
+            # Stop appending once env 0 finishes so all streams stay the same length.
             if not done_once[0]:
-                if "scene" in obs_np:
-                    video.append(obs_np["scene"][0])
-                if "wrist_image" in obs_np:
-                    wrist_video.append(obs_np["wrist_image"][0])
+                for vi in range(n_video):
+                    if "scene" in obs_np:
+                        videos[vi].append(obs_np["scene"][vi])
+                    if "wrist_image" in obs_np:
+                        wrist_videos[vi].append(obs_np["wrist_image"][vi])
             obs_t = self._obs_to_tensor(obs_np, device)
             act, agent_state = agent.act(obs_t, agent_state, eval_mode=True)
             obs_np, reward_np, terminated_np, truncated_np, eval_infos = envs.step(
@@ -267,10 +273,17 @@ class OnlineTrainer:
         for task in {t for t in eval_tasks if t is not None}:
             mask = np.array([t == task for t in eval_tasks], dtype=bool)
             self.logger.scalar(f"episode/eval_success/{task}", float(successes[mask].mean()))
-        if video:
-            self.logger.video("eval/video", np.stack(video, axis=0)[None])
-        if wrist_video:
-            self.logger.video("eval/wrist_video", np.stack(wrist_video, axis=0)[None])
+        # Stack per-env frame lists → (n_video, T, H, W, C); logger tiles horizontally.
+        if videos[0]:
+            self.logger.video(
+                "eval/video",
+                np.stack([np.stack(v, axis=0) for v in videos], axis=0),
+            )
+        if wrist_videos[0]:
+            self.logger.video(
+                "eval/wrist_video",
+                np.stack([np.stack(v, axis=0) for v in wrist_videos], axis=0),
+            )
         self.logger.write(train_step)
         agent.train()
 

@@ -63,11 +63,39 @@ ObsDict = dict[str, np.ndarray]
 # the _apply_action hook handles the frame_skip loop.
 _YAM_MW_EE_STEP_M = 0.01
 
+# ---------------------------------------------------------------------------
+# Scene domain-randomization constants
+# ---------------------------------------------------------------------------
+
+# Texture-pool name prefixes used in basic_scene.xml (resolved by name at init).
+_DR_CUBE_POOL_PREFIX = "T_pool_"  # cube textures for table / retaining walls
+_DR_FLOOR_POOL_PREFIX = "T_floorpool_"  # 2d textures for the floor plane
+# RGBA channel jitter magnitude (applied independently per channel, clamped [0,1]).
+_SCENE_RGBA_JITTER = 0.3
+# Light-color jitter magnitude (headlight ambient + directional diffuse/specular).
+_SCENE_LIGHT_JITTER = 0.15
+
+# ---------------------------------------------------------------------------
+# Camera-pose domain-randomization constants
+# ---------------------------------------------------------------------------
+# World layout (from the MetaWorld XMLs):
+#   arm base  ≈ (0, 0.23, 0.01)   — mounts at the near table edge
+#   table top ≈ x∈[-0.7,0.7], y∈[0.2,1.0], z≈0
+#   "behind arm" = open near side (y < 0.23), looking in +y toward the table.
+# Ranges are research-informed (robosuite / MV-MWM camera DR literature).
+_CAM_TARGET = (0.0, 0.6, 0.08)  # look-at point: table centre, slightly above top
+_CAM_TARGET_JITTER = 0.02  # ± m of noise on the look-at point per episode
+_CAM_AZIMUTH_DEG = 60.0  # half-width azimuth sweep (°) around directly-behind
+_CAM_ELEVATION_MIN_DEG = 20.0  # minimum elevation above table plane
+_CAM_ELEVATION_MAX_DEG = 60.0  # maximum elevation above table plane
+_CAM_DISTANCE_MIN_M = 0.6  # minimum camera-target distance (m)
+_CAM_DISTANCE_MAX_M = 1.1  # maximum camera-target distance (m)
+
 
 class MetaWorld(gym.Env):  # type: ignore[type-arg]
     """Single Meta-World MT1 task as a Gymnasium env with a Dict obs space.
 
-    The obs dict carries ``image`` (uint8 RGB at ``size``) and ``state``
+    The obs dict carries ``scene`` (uint8 RGB at ``size``) and ``state``
     (the raw proprioceptive vector from Meta-World's observation space).
 
     Parameters
@@ -83,6 +111,22 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         ``(height, width)`` of the rendered image in pixels.
     camera:
         MuJoCo camera name (e.g. ``"corner2"``).
+    wrist_camera:
+        Optional second MuJoCo camera name for a wrist-mounted view.
+    camera_jitter:
+        Per-episode Gaussian noise magnitude (m) added to the scene-camera
+        position.  ``0`` disables.  When ``camera_pose_randomize`` is also
+        enabled this noise is layered on top of the sampled pose.
+    scene_randomize:
+        When ``True``, each ``reset()`` randomly swaps the table, retaining-wall,
+        and floor textures from a pre-loaded pool and jitters RGBA tints and
+        lighting colours.  Requires the DR texture pool to be present in the
+        scene XML (``basic_scene.xml`` includes it by default).
+    camera_pose_randomize:
+        When ``True``, each ``reset()`` samples a new scene-camera pose on a
+        wide hemisphere **behind the arm** (azimuth +-60 deg, elevation 20-60 deg,
+        distance 0.6-1.1 m from the table centre), aimed at the table with a
+        computed look-at quaternion.  This is independent of ``camera_jitter``.
     seed:
         Used to seed the MT1 benchmark for reproducible task sampling.
     viewer:
@@ -107,6 +151,8 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         camera: str = "corner2",
         wrist_camera: str | None = None,
         camera_jitter: float = 0.0,
+        scene_randomize: bool = False,
+        camera_pose_randomize: bool = False,
         seed: int = 0,
         viewer: bool = False,
         task_idx: int | None = None,
@@ -122,6 +168,8 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._camera = camera
         self._wrist_camera = wrist_camera
         self._camera_jitter = float(camera_jitter)
+        self._scene_randomize = scene_randomize
+        self._camera_pose_randomize = camera_pose_randomize
         self._rng = np.random.default_rng(seed)
 
         # One-hot task conditioning (multi-task runs only).  Constant per env
@@ -172,6 +220,23 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         # Snapshot the (possibly overridden) base position for per-episode jitter.
         self._cam_base_pos: np.ndarray = np.array(env.model.cam_pos[self._camera_id], copy=True)
 
+        # corner2's original euler produces an upside-down image; render() corrects
+        # it with a vertical flip.  When camera_pose_randomize computes an upright
+        # look-at quaternion directly, no flip is needed.
+        self._scene_flip: bool = (camera == "corner2") and not camera_pose_randomize
+
+        # Per-episode appearance DR state (populated lazily by _dr_init).
+        self._dr_cube_mat_ids: list[int] = []
+        self._dr_floor_mat_ids: list[int] = []
+        self._dr_mat_base_rgba: dict[int, np.ndarray] = {}
+        self._dr_cube_pool: list[int] = []
+        self._dr_floor_pool: list[int] = []
+        self._dr_headlight_ambient_base: np.ndarray | None = None
+        self._dr_light_diffuse_base: np.ndarray | None = None
+        self._dr_light_specular_base: np.ndarray | None = None
+        if scene_randomize:
+            self._dr_init(env)
+
         self._wrist_camera_id: int | None = None
         if wrist_camera is not None:
             wc_id = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_CAMERA, wrist_camera)
@@ -198,6 +263,191 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             env.action_space.high,
             dtype=np.float32,
         )
+
+    # ---------------------------------------------------------------- DR helpers
+
+    def _dr_init(self, env: Any) -> None:
+        """Cache material IDs, texture pool IDs, and baseline values for DR.
+
+        Called once in ``__init__`` when ``scene_randomize=True``.  Safe to call
+        on scenes where the named pool textures are absent — the pools stay empty
+        and ``_apply_scene_dr`` skips texture-swapping for those surfaces.
+        """
+        import mujoco as _mj
+
+        model = env.model
+
+        # Material IDs and baseline RGBA for the three randomised surfaces.
+        for mat_name in ("table_wood", "wall_metal"):
+            mid = _mj.mj_name2id(model, _mj.mjtObj.mjOBJ_MATERIAL, mat_name)
+            if mid >= 0:
+                self._dr_cube_mat_ids.append(mid)
+                self._dr_mat_base_rgba[mid] = np.array(model.mat_rgba[mid], copy=True)
+        for mat_name in ("basic_floor",):
+            mid = _mj.mj_name2id(model, _mj.mjtObj.mjOBJ_MATERIAL, mat_name)
+            if mid >= 0:
+                self._dr_floor_mat_ids.append(mid)
+                self._dr_mat_base_rgba[mid] = np.array(model.mat_rgba[mid], copy=True)
+
+        # Collect named texture pools (T_pool_0, T_pool_1, … and T_floorpool_0, …).
+        for prefix, pool in (
+            (_DR_CUBE_POOL_PREFIX, self._dr_cube_pool),
+            (_DR_FLOOR_POOL_PREFIX, self._dr_floor_pool),
+        ):
+            i = 0
+            while True:
+                tid = _mj.mj_name2id(model, _mj.mjtObj.mjOBJ_TEXTURE, f"{prefix}{i}")
+                if tid < 0:
+                    break
+                pool.append(tid)
+                i += 1
+
+        # Also include each material's original texture so the default appearance
+        # is part of the random distribution (one-in-N chance per episode).
+        is_multi_role = model.mat_texid.ndim == 2  # MuJoCo ≥3 multi-role layout
+        for mat_ids, pool in (
+            (self._dr_cube_mat_ids, self._dr_cube_pool),
+            (self._dr_floor_mat_ids, self._dr_floor_pool),
+        ):
+            if not pool:
+                continue
+            for mid in mat_ids:
+                orig = int(model.mat_texid[mid, 0] if is_multi_role else model.mat_texid[mid])
+                if orig >= 0 and orig not in pool:
+                    pool.insert(0, orig)
+
+        # Snapshot baseline lighting for per-episode jitter.
+        self._dr_headlight_ambient_base = np.array(model.vis.headlight.ambient, copy=True)
+        self._dr_light_diffuse_base = np.array(model.light_diffuse, copy=True)
+        self._dr_light_specular_base = np.array(model.light_specular, copy=True)
+
+    def _apply_scene_dr(self) -> None:
+        """Per-episode: swap textures, jitter RGBA tints, and jitter lighting."""
+        model = self._env.model
+        is_multi_role = model.mat_texid.ndim == 2  # MuJoCo ≥3 multi-role layout
+
+        def _write_texid(mat_id: int, tex_id: int) -> None:
+            if is_multi_role:
+                model.mat_texid[mat_id, 0] = tex_id  # role 0 = legacy/user texture
+            else:
+                model.mat_texid[mat_id] = tex_id
+
+        # Table + retaining walls: random cube texture + RGBA tint.
+        if self._dr_cube_pool:
+            for mid in self._dr_cube_mat_ids:
+                _write_texid(mid, int(self._rng.choice(self._dr_cube_pool)))
+                rgba = self._dr_mat_base_rgba[mid].copy()
+                rgba[:3] = np.clip(
+                    rgba[:3] + self._rng.uniform(-_SCENE_RGBA_JITTER, _SCENE_RGBA_JITTER, 3),
+                    0.0,
+                    1.0,
+                )
+                model.mat_rgba[mid] = rgba
+
+        # Floor: random 2d texture + RGBA tint.
+        if self._dr_floor_pool:
+            for mid in self._dr_floor_mat_ids:
+                _write_texid(mid, int(self._rng.choice(self._dr_floor_pool)))
+                rgba = self._dr_mat_base_rgba[mid].copy()
+                rgba[:3] = np.clip(
+                    rgba[:3] + self._rng.uniform(-_SCENE_RGBA_JITTER, _SCENE_RGBA_JITTER, 3),
+                    0.0,
+                    1.0,
+                )
+                model.mat_rgba[mid] = rgba
+
+        # Background: jitter headlight ambient and directional light colors.
+        if self._dr_headlight_ambient_base is not None:
+            model.vis.headlight.ambient[:] = np.clip(
+                self._dr_headlight_ambient_base
+                + self._rng.uniform(-_SCENE_LIGHT_JITTER, _SCENE_LIGHT_JITTER, 3),
+                0.0,
+                1.0,
+            )
+        if self._dr_light_diffuse_base is not None:
+            model.light_diffuse[:] = np.clip(
+                self._dr_light_diffuse_base
+                + self._rng.uniform(
+                    -_SCENE_LIGHT_JITTER,
+                    _SCENE_LIGHT_JITTER,
+                    self._dr_light_diffuse_base.shape,
+                ),
+                0.0,
+                1.0,
+            )
+            model.light_specular[:] = np.clip(
+                self._dr_light_specular_base  # type: ignore[operator]
+                + self._rng.uniform(
+                    -_SCENE_LIGHT_JITTER,
+                    _SCENE_LIGHT_JITTER,
+                    self._dr_light_specular_base.shape,  # type: ignore[union-attr]
+                ),
+                0.0,
+                1.0,
+            )
+
+    def _sample_camera_pose(self) -> None:
+        """Per-episode: place the scene camera on the hemisphere behind the arm.
+
+        Samples azimuth, elevation, and distance uniformly within the ranges
+        defined by the module-level ``_CAM_*`` constants, then computes a
+        look-at quaternion so the camera frames the table centre.
+
+        MuJoCo cameras look along local **-z** with local **+y** as up.  We
+        build the rotation matrix from the sampled position to the look-at
+        target and convert it to a quaternion with ``mju_mat2Quat``.
+        """
+        import mujoco as _mj
+
+        target = np.array(_CAM_TARGET) + self._rng.uniform(
+            -_CAM_TARGET_JITTER, _CAM_TARGET_JITTER, 3
+        )
+        a = np.deg2rad(self._rng.uniform(-_CAM_AZIMUTH_DEG, _CAM_AZIMUTH_DEG))
+        e = np.deg2rad(self._rng.uniform(_CAM_ELEVATION_MIN_DEG, _CAM_ELEVATION_MAX_DEG))
+        d = self._rng.uniform(_CAM_DISTANCE_MIN_M, _CAM_DISTANCE_MAX_M)
+
+        # Camera sits on the open near side (-y), elevated by e, swept +-a left/right.
+        # a=0 -> directly behind the arm (world -y direction from table centre).
+        pos = target + d * np.array(
+            [
+                np.cos(e) * np.sin(a),
+                -np.cos(e) * np.cos(a),
+                np.sin(e),
+            ]
+        )
+
+        # Look-at quaternion: camera->world rotation with columns [x_cam, y_cam, z_cam].
+        #   z_cam  = -forward  (camera looks along local -z)
+        #   x_cam  = normalise(cross(world_up, z_cam))  (rightward)
+        #   y_cam  = cross(z_cam, x_cam)                (upward, orthogonalised)
+        forward = target - pos
+        forward /= np.linalg.norm(forward)
+        z_cam = -forward
+        world_up = np.array([0.0, 0.0, 1.0])
+        x_cam = np.cross(world_up, z_cam)
+        x_cam /= np.linalg.norm(x_cam)
+        y_cam = np.cross(z_cam, x_cam)
+
+        mat = np.array(
+            [
+                x_cam[0],
+                y_cam[0],
+                z_cam[0],
+                x_cam[1],
+                y_cam[1],
+                z_cam[1],
+                x_cam[2],
+                y_cam[2],
+                z_cam[2],
+            ]
+        )
+        quat = np.zeros(4)
+        _mj.mju_mat2Quat(quat, mat)
+
+        self._env.model.cam_pos[self._camera_id] = pos
+        self._env.model.cam_quat[self._camera_id] = quat
+
+    # ---------------------------------------------------------------- YAM control
 
     def _setup_yam_control(self, env: Any) -> None:
         """Wire the YAM EEController into the Meta-World env via hook injection.
@@ -356,11 +606,24 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             self._env.set_task(mt1.train_tasks[0])
 
         self._success = False
-        if self._camera_jitter > 0.0:
+
+        # Camera randomization: full hemisphere pose OR small position jitter.
+        if self._camera_pose_randomize:
+            self._sample_camera_pose()
+            # camera_jitter stacks on top of the sampled pose as extra noise.
+            if self._camera_jitter > 0.0:
+                j = self._camera_jitter
+                self._env.model.cam_pos[self._camera_id] += self._rng.uniform(-j, j, 3)
+        elif self._camera_jitter > 0.0:
             j = self._camera_jitter
             self._env.model.cam_pos[self._camera_id] = self._cam_base_pos + self._rng.uniform(
                 -j, j, 3
             )
+
+        # Appearance randomization: textures + RGBA tints + lighting.
+        if self._scene_randomize:
+            self._apply_scene_dr()
+
         state, _ = self._env.reset()
         if self._viewer_requested:
             import mujoco.viewer as _mv
@@ -393,7 +656,7 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         )
 
     def render(self) -> np.ndarray:
-        return self._render_camera(self._camera_id, flip=self._camera == "corner2")
+        return self._render_camera(self._camera_id, flip=self._scene_flip)
 
     def _sync_viewer(self) -> None:
         if self._passive_viewer is not None and self._passive_viewer.is_running():

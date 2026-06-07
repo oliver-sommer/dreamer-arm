@@ -29,6 +29,8 @@ action_rate_cost: 0.02
 camera: corner2
 wrist_camera: wrist     # second image stream; null to disable
 camera_jitter: 0.05     # per-episode scene-camera position jitter (m); 0 disables
+scene_randomize: true           # per-episode table/wall/floor texture + tint + light DR
+camera_pose_randomize: true     # per-episode scene-camera viewpoint (hemisphere behind arm)
 viewer: false
 
 encoder:

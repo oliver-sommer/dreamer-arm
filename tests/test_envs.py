@@ -154,6 +154,99 @@ def test_action_rate_penalty_alternating_action_incurs_cost() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Visual domain randomization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_scene_randomize_changes_frames_and_model_arrays() -> None:
+    """scene_randomize=True must change mat_rgba and the rendered image each reset."""
+    from dreamer_arm.envs.metaworld import MetaWorld
+
+    env = MetaWorld("reach", scene_randomize=True, seed=1)
+    model = env._env.model
+
+    env.reset()
+    rgba_a = model.mat_rgba.copy()
+    frame_a = env.render().copy()
+
+    env.reset()
+    rgba_b = model.mat_rgba.copy()
+    frame_b = env.render().copy()
+
+    # At least one material RGBA must differ between resets.
+    assert not np.allclose(rgba_a, rgba_b), "mat_rgba should differ across DR resets"
+    # Rendered images must differ (RGBA tint + possible texture swap).
+    assert np.mean(np.abs(frame_a.astype(float) - frame_b.astype(float))) > 1.0, (
+        "rendered scene frames should differ when scene_randomize=True"
+    )
+    env.close()
+
+
+@pytest.mark.slow
+def test_camera_pose_randomize_changes_pose_and_frames() -> None:
+    """camera_pose_randomize=True must change cam_pos/cam_quat and the rendered image."""
+    from dreamer_arm.envs.metaworld import MetaWorld
+
+    env = MetaWorld("reach", camera_pose_randomize=True, camera_jitter=0.0, seed=2)
+    model = env._env.model
+    cam_id = env._camera_id
+
+    env.reset()
+    pos_a = model.cam_pos[cam_id].copy()
+    quat_a = model.cam_quat[cam_id].copy()
+    frame_a = env.render().copy()
+
+    env.reset()
+    pos_b = model.cam_pos[cam_id].copy()
+    quat_b = model.cam_quat[cam_id].copy()
+    frame_b = env.render().copy()
+
+    # Camera position must differ between resets.
+    assert not np.allclose(pos_a, pos_b), "cam_pos should differ across pose-randomize resets"
+    # Camera orientation must also differ.
+    assert not np.allclose(quat_a, quat_b), "cam_quat should differ across pose-randomize resets"
+
+    # Each sampled position must be on the near/behind-arm side (y < arm base + margin).
+    _ARM_BASE_Y = 0.23
+    _MARGIN = 0.5  # allow up to 0.5 m in front of arm base (generous for wide azimuth)
+    for pos in (pos_a, pos_b):
+        assert pos[1] < _ARM_BASE_Y + _MARGIN, (
+            f"camera y={pos[1]:.3f} should be on the near side (< {_ARM_BASE_Y + _MARGIN})"
+        )
+
+    # Rendered images must differ.
+    assert np.mean(np.abs(frame_a.astype(float) - frame_b.astype(float))) > 1.0, (
+        "rendered scene frames should differ when camera_pose_randomize=True"
+    )
+    env.close()
+
+
+@pytest.mark.slow
+def test_dr_flags_off_leave_model_arrays_unchanged() -> None:
+    """With both DR flags False, cam_pos and mat_rgba must not change across resets."""
+    from dreamer_arm.envs.metaworld import MetaWorld
+
+    env = MetaWorld(
+        "reach", scene_randomize=False, camera_pose_randomize=False, camera_jitter=0.0, seed=3
+    )
+    model = env._env.model
+    cam_id = env._camera_id
+
+    env.reset()
+    pos_a = model.cam_pos[cam_id].copy()
+    rgba_a = model.mat_rgba.copy()
+
+    env.reset()
+    pos_b = model.cam_pos[cam_id].copy()
+    rgba_b = model.mat_rgba.copy()
+
+    assert np.allclose(pos_a, pos_b), "cam_pos must not change when DR is disabled"
+    assert np.allclose(rgba_a, rgba_b), "mat_rgba must not change when DR is disabled"
+    env.close()
+
+
+# ---------------------------------------------------------------------------
 # YAM self-collision gate
 # ---------------------------------------------------------------------------
 
