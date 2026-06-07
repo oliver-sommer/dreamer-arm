@@ -5,14 +5,12 @@ W&B-only sink. The logger buffers metrics between :meth:`write` calls so the
 trainer can accumulate scalars / videos / histograms throughout a step and
 flush them in one ``wandb.log`` call.
 
-When ``WANDB_API_KEY`` is unset (e.g. inside CI or a local smoke test) the
-run is started with ``mode="disabled"`` so the logger becomes a no-op
-instead of blocking on auth.
+Pass ``mode="disabled"`` (or set it in the config) to suppress W&B for CI /
+local dry-runs.
 """
 
 from __future__ import annotations
 
-import os
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -84,7 +82,7 @@ class WandbLogger:
         video_fps: int = 16,
     ) -> None:
         if mode is None:
-            mode = "online" if os.environ.get("WANDB_API_KEY") else "disabled"
+            mode = "online"
         self._run = wandb.init(
             project=project,
             entity=entity,

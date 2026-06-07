@@ -54,4 +54,4 @@ test = "pytest"
 train = "python -m dreamer_arm"
 train-dmc = "python -m dreamer_arm env=dmc_vision"
 # Live MuJoCo viewer window (macOS + mjpython only).
-train-view = "mjpython -m dreamer_arm env.viewer=true env.env_num=1"
+train-view = "mjpython -m dreamer_arm env.viewer=true env.env_num=1 wandb.mode=disabled"

@@ -20,7 +20,7 @@ logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
 wandb:
   project: dreamer-arm
   entity: null
-  mode: null  # null -> "online" if WANDB_API_KEY set else "disabled"
+  mode: online
   tags: []
   name: ${env.task}-${model.rep_loss}-${seed}
 
