@@ -1,6 +1,6 @@
 """Smoke tests for env factories.
 
-These are marked ``slow`` because MuJoCo + dm_control take noticeable time to
+These are marked ``slow`` because MuJoCo takes noticeable time to
 import and compile models on first use. They run only with ``pixi run pytest
 -m slow``; the default ``test`` task skips them.
 """
@@ -155,24 +155,4 @@ def test_manip_yam_ik_moves_tcp() -> None:
     tcp_after = env._controller.tcp_pos(env._data).copy()  # type: ignore[attr-defined]
     dx = float(tcp_after[0] - tcp_before[0])
     assert dx > 0.005, f"TCP x should increase with +x action; got Δx={dx:.4f} m"
-    env.close()
-
-
-# ---------------------------------------------------------------------------
-# DMC benchmark (unchanged)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow
-def test_dmc_cartpole_swingup_obs_action_spaces() -> None:
-    from dreamer_arm.envs.factory import make_env
-
-    env = make_env("dmc:cartpole_swingup", seed=0, time_limit=10)
-    obs, _info = env.reset()
-    assert "image" in obs
-    assert obs["image"].dtype == np.uint8
-    for _ in range(5):
-        act = env.action_space.sample()
-        obs, reward, _terminated, _truncated, _info = env.step(act)
-        assert np.isfinite(reward)
     env.close()

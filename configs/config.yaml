@@ -7,7 +7,6 @@
 #   pixi run train arm=sawyer                         # Sawyer + pick_place
 #   pixi run train task.task=reach                    # YAM + reach
 #   pixi run train arm=sawyer task.task=reach         # Sawyer + reach
-#   pixi run train task=dmc_vision task.task=cartpole_swingup model=dreamerv3
 defaults:
   - arm: yam
   - task: manip

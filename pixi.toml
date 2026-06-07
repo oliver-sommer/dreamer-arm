@@ -33,6 +33,7 @@ torchrl = ">=0.12"
 tensordict = ">=0.12"
 gymnasium = ">=1.3"
 moviepy = ">=2.0"
+metaworld = ">=3.0"
 
 
 [feature.dev.dependencies]
@@ -51,9 +52,9 @@ lint = "ruff check src tests"
 fmt = "ruff format src tests"
 typecheck = "mypy src"
 test = "pytest"
-train = { cmd = "python -m dreamer_arm", env = { MUJOCO_GL = "egl" } }
-train-yam = { cmd = "python -m dreamer_arm arm=yam", env = { MUJOCO_GL = "egl" } }
-train-sawyer = { cmd = "python -m dreamer_arm arm=sawyer", env = { MUJOCO_GL = "egl" } }
-train-dmc = { cmd = "python -m dreamer_arm task=dmc_vision", env = { MUJOCO_GL = "egl" } }
+train = "python -m dreamer_arm"
+train-yam = "python -m dreamer_arm arm=yam"
+train-metaworld = "python -m dreamer_arm task=metaworld"
 # Live MuJoCo viewer window (macOS + mjpython only).
 train-view = "mjpython -m dreamer_arm task.viewer=true task.env_num=1 wandb.mode=disabled"
+train-metaworld-view = "mjpython -m dreamer_arm task=metaworld task.viewer=true task.env_num=1 wandb.mode=disabled"

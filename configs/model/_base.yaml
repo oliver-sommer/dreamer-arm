@@ -17,7 +17,7 @@ imag_horizon: 15
 horizon: 333
 lamb: 0.95
 log_grads: false
-compile: false  # set true to torch.compile _cal_grad (~20-30% faster on CUDA/MPS)
+compile: ${auto_compile:}  # true on CUDA automatically; override with model.compile=false
 device: ${device}
 
 # Optimiser.

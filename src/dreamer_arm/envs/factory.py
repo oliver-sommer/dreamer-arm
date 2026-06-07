@@ -2,9 +2,9 @@
 
 Naming convention:
 
-* ``"manip"`` or ``"manip:<task>"``  → :class:`dreamer_arm.envs.manip.Manipulation`.
+* ``"manip"`` or ``"manip:<task>"``    → :class:`dreamer_arm.envs.manip.Manipulation`.
   The arm is supplied via the ``arm=`` kwarg (default ``"yam"``).
-* ``"dmc:<domain>_<task>"``          → :class:`dreamer_arm.envs.dmc.DeepMindControl`.
+* ``"metaworld:<task>"``              → :class:`dreamer_arm.envs.metaworld.MetaWorld`.
 
 All envs are wrapped with :class:`DreamerObsWrapper` so the obs dict gets
 ``is_first``/``is_last``/``is_terminal`` flags, and (optionally) with
@@ -64,6 +64,18 @@ def make_env(
             size=size,
             seed=seed,
             **kwargs,
+        )
+    elif name.startswith("metaworld:"):
+        from dreamer_arm.envs.metaworld import MetaWorld
+
+        kwargs.pop("arm", None)  # arm is manip-only; discard for metaworld
+        env = MetaWorld(
+            name=name.split(":", 1)[1],
+            action_repeat=action_repeat,
+            size=size,
+            seed=seed,
+            viewer=viewer,
+            **kwargs,  # forwards camera= from the task config
         )
     else:
         raise ValueError(f"unknown env name: {name!r}")

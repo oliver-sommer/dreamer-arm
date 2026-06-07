@@ -31,7 +31,12 @@ def _auto_device() -> str:
     return "cpu"
 
 
+def _auto_compile() -> bool:
+    return torch.cuda.is_available()
+
+
 OmegaConf.register_new_resolver("auto_device", _auto_device, replace=True)
+OmegaConf.register_new_resolver("auto_compile", _auto_compile, replace=True)
 
 
 def run(cfg: DictConfig) -> None:
@@ -44,14 +49,11 @@ def run(cfg: DictConfig) -> None:
 
     def _make_envs(*, viewer: bool = False) -> Any:
         # Forward only the optional kwargs defined by the active task config.
-        # This keeps dmc_vision (no success_threshold) and manip (no camera)
-        # from crashing on each other's keys.
         extra: dict[str, Any] = {}
         if "success_threshold" in cfg.task:
             extra["success_threshold"] = float(cfg.task.success_threshold)
         if "camera" in cfg.task:
             extra["camera"] = str(cfg.task.camera)
-        # Forward the arm name for manip envs; ignored by dmc.
         if hasattr(cfg, "arm") and cfg.arm is not None:
             extra["arm"] = str(cfg.arm.name)
         return make_vector_env(
