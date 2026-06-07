@@ -6,6 +6,14 @@ buffer → logger → trainer, then call ``trainer.begin(agent)``.
 
 from __future__ import annotations
 
+import os
+
+# Must be set before any MuJoCo context is created.  On headless Linux servers
+# MuJoCo defaults to GLFW, which requires an X display.  EGL is the right
+# backend for GPU-equipped servers; on CPU-only machines export
+# MUJOCO_GL=osmesa before launching.  setdefault preserves any user override.
+os.environ.setdefault("MUJOCO_GL", "egl")
+
 from pathlib import Path
 from typing import Any
 

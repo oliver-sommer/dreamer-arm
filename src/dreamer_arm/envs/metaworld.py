@@ -13,8 +13,9 @@ the ``metaworld:`` suite prefix, which is stripped before passing to this class.
 Rendering
 ---------
 We bypass Meta-World's built-in ``mujoco_renderer`` and use ``mujoco.Renderer``
-directly (the same pattern as the manip env).  This avoids OpenGL context
-conflicts when the passive viewer is also open.
+directly (the same pattern as the manip env).  The Meta-World env is therefore
+constructed with ``render_mode=None`` so gymnasium does not create a second,
+unused renderer object.
 
 Success tracking
 ----------------
@@ -83,10 +84,10 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._camera = camera
 
         mt1 = metaworld.MT1(name + "-v3", seed=seed)
-        env = mt1.train_classes[name + "-v3"](
-            render_mode="rgb_array",
-            camera_name=camera,
-        )
+        # render_mode=None: we manage all rendering via our own mujoco.Renderer
+        # below; passing "rgb_array" would make gymnasium create a second,
+        # unused MujocoRenderer object.
+        env = mt1.train_classes[name + "-v3"](render_mode=None)
         env.set_task(mt1.train_tasks[0])
 
         # Adjust camera position for the corner2 view used in the paper.
@@ -102,8 +103,8 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._viewer_requested = viewer
         self._passive_viewer: _viewer_mod.Handle | None = None
 
-        # Own renderer — bypasses Meta-World's mujoco_renderer to avoid
-        # OpenGL context conflicts with the passive viewer.
+        # Own renderer — gives us full control over camera and image format;
+        # Meta-World's internal mujoco_renderer is never initialised (render_mode=None).
         self._renderer: mujoco.Renderer = _mj.Renderer(env.model, height=size[0], width=size[1])
         cam_id = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_CAMERA, camera)
         self._camera_id: int = int(cam_id) if cam_id >= 0 else 0
