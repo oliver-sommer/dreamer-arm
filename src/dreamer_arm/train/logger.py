@@ -11,11 +11,14 @@ local dry-runs.
 
 from __future__ import annotations
 
+import os
+import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import imageio
 import numpy as np
 import torch
 
@@ -137,7 +140,7 @@ class WandbLogger:
         if fps_value is not None:
             payload["fps/fps"] = fps_value
         for name, arr in self._videos.items():
-            payload[name] = wandb.Video(arr, fps=self._video_fps, format="mp4")
+            payload[name] = self._encode_video(arr)
         for name, arr in self._images.items():
             payload[name] = wandb.Image(arr)
         for name, arr in self._histograms.items():
@@ -156,6 +159,25 @@ class WandbLogger:
 
     # --------------------------------------------------------------- internals
 
+    def _encode_video(self, arr: np.ndarray) -> "wandb.Video":
+        """Encode (T, C, H, W) uint8 video via imageio-ffmpeg, then hand wandb a path.
+
+        wandb.Video(numpy_array) calls ffmpeg as a subprocess in a way that can
+        hang on headless Linux servers.  Writing the file ourselves with imageio
+        (which ships its own ffmpeg binary) and passing the resulting path avoids
+        that code path entirely.
+
+        The temp file is left on disk because wandb.Video stores the path and
+        uploads the file asynchronously; deleting it before the upload would
+        silently drop the video.  OS temp-dir cleanup handles the rest.
+        """
+        # _as_uint8_video produces (T, C, H, W); imageio wants (T, H, W, C).
+        frames = arr.transpose(0, 2, 3, 1)
+        fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+        imageio.mimwrite(tmp_path, list(frames), fps=self._video_fps)
+        return wandb.Video(tmp_path, format="mp4")
+
     def _console_line(self, step: int, fps_value: float | None) -> str:
         # --- header: step + optional fps / episode scores ---
         parts = [f"step {step:>8}"]
@@ -168,12 +190,12 @@ class WandbLogger:
 
         # --- loss sub-line: only present on train-burst flushes ---
         loss_keys = [
-            ("train/dyn", "dyn"),
-            ("train/rep", "rep"),
-            ("train/rew", "rew"),
-            ("train/con", "con"),
-            ("train/policy", "policy"),
-            ("train/value", "value"),
+            ("train/loss/dyn", "dyn"),
+            ("train/loss/rep", "rep"),
+            ("train/loss/rew", "rew"),
+            ("train/loss/con", "con"),
+            ("train/loss/policy", "policy"),
+            ("train/loss/value", "value"),
         ]
         loss_parts = [
             f"{label} {self._scalars[key]:.3f}" for key, label in loss_keys if key in self._scalars

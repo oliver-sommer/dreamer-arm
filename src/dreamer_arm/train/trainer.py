@@ -198,7 +198,7 @@ class OnlineTrainer:
                 update_count += update_num
                 window_updates += update_num
 
-                if self._should_log(step) and window_updates > 0:
+                if window_updates > 0 and self._should_log(step):
                     for name, total in metric_sums.items():
                         self.logger.scalar(f"train/{name}", total / window_updates)
                     self.logger.scalar("train/opt/updates", float(update_count))
