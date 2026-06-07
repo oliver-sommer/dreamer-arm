@@ -39,7 +39,7 @@ torchrl = ">=0.12"
 tensordict = ">=0.12"
 gymnasium = ">=1.3"
 moviepy = ">=2.0"
-metaworld = ">=3.0"
+metaworld = { path = "third_party/metaworld", editable = true }
 
 
 
@@ -67,3 +67,5 @@ train-metaworld = { cmd = "python -m dreamer_arm task=metaworld", env = { TORCHI
 # Live MuJoCo viewer window (macOS + mjpython only).
 train-view = "mjpython -m dreamer_arm task.viewer=true task.env_num=1 wandb.mode=disabled"
 train-metaworld-view = "mjpython -m dreamer_arm task=metaworld task.viewer=true task.env_num=1 wandb.mode=disabled"
+train-metaworld-yam = "python -m dreamer_arm task=metaworld arm=yam wandb.mode=disabled"
+train-metaworld-yam-view = "mjpython -m dreamer_arm task=metaworld arm=yam task.viewer=true task.env_num=1 wandb.mode=disabled"

@@ -1,4 +1,4 @@
-"""Damped-least-squares end-effector (EE) controller.
+"""Damped-least-squares end-effector (EE) controller — 6-DOF pose servoing.
 
 Maps a 4-D arm-agnostic action ``[Δx, Δy, Δz, gripper]`` to
 position-actuator ``ctrl`` values via differential inverse kinematics (IK).
@@ -12,13 +12,19 @@ Algorithm
 Given action ``a ∈ [-1, 1]^4``:
 
 1. Compute desired EE displacement ``Δp = a[:3] * ee_step_m``.
-2. Build the 3xn TCP site Jacobian ``J`` restricted to the arm's DOFs via
-   ``mujoco.mj_jacSite``.
-3. Damped-least-squares (DLS) solution:
-   ``dq = J^T (J J^T + λ²I)^{-1} Δp``
-4. Update position-actuator ctrl:
+2. Compute orientation error ``e_ori`` (world-frame, 3-vector) between the
+   current TCP quaternion and the fixed target quaternion (captured once from
+   the arm's ``home`` keyframe at construction time).
+3. Build the 6xn TCP site Jacobian (translational + rotational rows) via
+   ``mujoco.mj_jacSite``, restricted to the arm's DOFs.
+4. Damped-least-squares (DLS) solution on the stacked 6-D error:
+   ``dq = J^T (J J^T + λ²I₆)^{-1} [Δp; e_ori]``
+5. Update position-actuator ctrl:
    ``ctrl[arm] = clip(q_arm + dq, ctrl_low, ctrl_high)``
-5. Map gripper ``a[3] ∈ [-1, 1]`` → ``[gripper_closed, gripper_open]`` ctrl.
+6. Map gripper ``a[3] ∈ [-1, 1]`` → ``[gripper_closed, gripper_open]`` ctrl.
+
+The orientation is **not** commanded by the policy; it is regulated to the
+target pose defined by the home keyframe (typically gripper-down).
 
 Position actuators drive joints to their ctrl target within the physics step;
 no integration timestep arithmetic is needed here.
@@ -86,8 +92,27 @@ class EEController:
         self._ctrl_low = model.actuator_ctrlrange[:, 0].astype(np.float64)
         self._ctrl_high = model.actuator_ctrlrange[:, 1].astype(np.float64)
 
-        # Pre-allocate Jacobian buffer (3 x nv, translational part only).
+        # Pre-allocate Jacobian buffers (3 x nv: translational + rotational).
         self._jacp = np.zeros((3, model.nv), dtype=np.float64)
+        self._jacr = np.zeros((3, model.nv), dtype=np.float64)
+
+        # Target TCP orientation: use arm override or capture from home keyframe.
+        if arm.tcp_target_quat is not None:
+            self._quat_target = np.array(arm.tcp_target_quat, dtype=np.float64)
+        else:
+            scratch = mujoco.MjData(model)
+            key_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home"))
+            if key_id < 0:
+                raise RuntimeError(
+                    "No 'home' keyframe found; cannot capture target TCP orientation."
+                )
+            mujoco.mj_resetDataKeyframe(model, scratch, key_id)
+            mujoco.mj_forward(model, scratch)
+            self._quat_target = np.zeros(4, dtype=np.float64)
+            mujoco.mju_mat2Quat(self._quat_target, scratch.site_xmat[self._tcp_id])
+
+        # Scale factor for the orientation error term (relative to translation).
+        self._ori_gain = 1.0
 
         # Cache scalars.
         self._lam2 = float(arm.ik_damping) ** 2
@@ -114,14 +139,25 @@ class EEController:
         """
         delta_pos = np.asarray(action[:3], dtype=np.float64) * self._step_m
 
-        # ---- DLS IK for arm joints ----
+        # ---- 6-DOF DLS IK for arm joints ----
         self._jacp[:] = 0.0
-        mujoco.mj_jacSite(model, data, self._jacp, None, self._tcp_id)
-        # Restrict to arm DOFs only.
-        J = self._jacp[:, self._arm_dof_adrs]  # (3, n_arm)
+        self._jacr[:] = 0.0
+        mujoco.mj_jacSite(model, data, self._jacp, self._jacr, self._tcp_id)
 
-        JJT = J @ J.T + self._lam2 * np.eye(3)
-        dq = J.T @ np.linalg.solve(JJT, delta_pos)  # (n_arm,)
+        jacp_arm = self._jacp[:, self._arm_dof_adrs]  # (3, n_arm)
+        jacr_arm = self._jacr[:, self._arm_dof_adrs]  # (3, n_arm)
+        J = np.vstack([jacp_arm, jacr_arm])  # (6, n_arm)
+
+        # Orientation error: world-frame angular velocity from current to target.
+        quat_cur = np.zeros(4, dtype=np.float64)
+        mujoco.mju_mat2Quat(quat_cur, data.site_xmat[self._tcp_id])
+        e_ori = np.zeros(3, dtype=np.float64)
+        mujoco.mju_subQuat(e_ori, self._quat_target, quat_cur)
+
+        e = np.concatenate([delta_pos, self._ori_gain * e_ori])  # (6,)
+
+        JJT = J @ J.T + self._lam2 * np.eye(6)
+        dq = J.T @ np.linalg.solve(JJT, e)  # (n_arm,)
 
         q_cur = np.asarray(data.qpos)[self._arm_qpos_adrs]
         q_new = np.clip(

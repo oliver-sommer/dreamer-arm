@@ -75,6 +75,9 @@ class Arm:
     # scene but before task bodies are spliced in.  Use this to patch the raw
     # vendor assets at load time (e.g. attach a gripper to a bare arm model).
     patch_spec: Callable[[Any], None] | None = field(default=None, compare=False, hash=False)
+    # Optional fixed TCP target orientation (w, x, y, z).  None → capture from
+    # the arm's 'home' keyframe at controller construction time.
+    tcp_target_quat: tuple[float, float, float, float] | None = None
 
 
 def get_arm(name: str) -> Arm:

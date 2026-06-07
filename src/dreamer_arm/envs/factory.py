@@ -68,9 +68,10 @@ def make_env(
     elif name.startswith("metaworld:"):
         from dreamer_arm.envs.metaworld import MetaWorld
 
-        kwargs.pop("arm", None)  # arm is manip-only; discard for metaworld
+        arm = kwargs.pop("arm", "sawyer")  # forward arm to MetaWorld for YAM support
         env = MetaWorld(
             name=name.split(":", 1)[1],
+            arm=arm,
             action_repeat=action_repeat,
             size=size,
             seed=seed,

@@ -1,0 +1,4 @@
+[submodule "third_party/metaworld"]
+	path = third_party/metaworld
+	url = git@github.com:oliver-sommer/YAMetaworld.git
+	shallow = true

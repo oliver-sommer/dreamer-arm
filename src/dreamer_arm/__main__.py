@@ -7,13 +7,7 @@ buffer → logger → trainer, then call ``trainer.begin(agent)``.
 from __future__ import annotations
 
 import os
-
-# Must be set before any MuJoCo context is created.  On headless Linux servers
-# MuJoCo defaults to GLFW, which requires an X display.  EGL is the right
-# backend for GPU-equipped servers; on CPU-only machines export
-# MUJOCO_GL=osmesa before launching.  setdefault preserves any user override.
-os.environ.setdefault("MUJOCO_GL", "egl")
-
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +21,12 @@ from dreamer_arm.envs.factory import make_vector_env
 from dreamer_arm.train.logger import WandbLogger
 from dreamer_arm.train.trainer import OnlineTrainer, TrainerConfig
 from dreamer_arm.utils.seed import set_seed_everywhere
+
+# Must be set before any MuJoCo context is created.  On headless Linux servers
+# MuJoCo defaults to GLFW, which requires an X display.  EGL is the right
+# backend for GPU-equipped servers; on CPU-only machines export
+# MUJOCO_GL=osmesa before launching.  setdefault preserves any user override.
+os.environ.setdefault("MUJOCO_GL", "egl" if sys.platform == "linux" else "cgl")
 
 CONFIG_PATH = str(Path(__file__).resolve().parents[2] / "configs")
 

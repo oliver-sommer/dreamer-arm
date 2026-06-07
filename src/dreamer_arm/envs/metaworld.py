@@ -10,6 +10,21 @@ Task names use the raw Meta-World convention without the ``-v3`` suffix
 (e.g. ``"reach"``, ``"pick-place"``, ``"door-open"``).  The factory prepends
 the ``metaworld:`` suite prefix, which is stripped before passing to this class.
 
+Arm selection
+-------------
+Pass ``arm="yam"`` to drive YAM's real actuated arm through the
+``EEController`` instead of Sawyer's mocap weld.  When ``arm="yam"``:
+
+1. ``metaworld.set_active_arm("yam")`` is called before building the env so
+   ``full_V3_path_for`` routes to the YAM task XML variants.
+2. After building the env, an ``EEController`` is wired in via the fork's
+   injectable ``_external_actuation`` and ``_external_reset_hand`` hooks.
+3. Gripper sign is negated: Meta-World action ``+1 = close`` whereas
+   ``EEController`` interprets ``+1 = open``.
+4. Action-scale: Meta-World's ``action_scale=1/100`` over ``frame_skip=5``
+   corresponds to a maximum displacement of ~1cm per controlled step.
+   The YAM controller uses ``ee_step_m=0.01`` to match this scale.
+
 Rendering
 ---------
 We bypass Meta-World's built-in ``mujoco_renderer`` and use ``mujoco.Renderer``
@@ -30,6 +45,7 @@ last step's.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
@@ -40,6 +56,12 @@ import gymnasium as gym
 import numpy as np
 
 ObsDict = dict[str, np.ndarray]
+
+# ee_step_m for YAM in Meta-World context: action_scale=1/100, frame_skip=5
+# → max displacement ≈ 5 * (1/100) m = 0.05 m/step.  We use a per-substep
+# step of 0.01 m so the IK is called once per outer step (no inner loop);
+# the _apply_action hook handles the frame_skip loop.
+_YAM_MW_EE_STEP_M = 0.01
 
 
 class MetaWorld(gym.Env):  # type: ignore[type-arg]
@@ -52,6 +74,9 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
     ----------
     name:
         MT1 task name without the ``-v3`` suffix, e.g. ``"reach"``.
+    arm:
+        Arm identifier.  ``"sawyer"`` (default) uses the upstream Sawyer mocap
+        control; ``"yam"`` drives the YAM arm via ``EEController`` IK.
     action_repeat:
         Number of inner ``step()`` calls per outer ``step()``; reward summed.
     size:
@@ -69,6 +94,7 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
     def __init__(
         self,
         name: str,
+        arm: str = "sawyer",
         action_repeat: int = 1,
         size: tuple[int, int] = (64, 64),
         camera: str = "corner2",
@@ -79,9 +105,16 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         import mujoco as _mj
 
         self._name = name
+        self._arm = arm
         self._action_repeat = int(action_repeat)
         self._size = size
         self._camera = camera
+
+        # Route asset paths for the YAM arm before building any env class.
+        if arm == "yam":
+            metaworld.set_active_arm("yam")
+        else:
+            metaworld.set_active_arm("sawyer")
 
         mt1 = metaworld.MT1(name + "-v3", seed=seed)
         # render_mode=None: we manage all rendering via our own mujoco.Renderer
@@ -103,6 +136,10 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._viewer_requested = viewer
         self._passive_viewer: _viewer_mod.Handle | None = None
 
+        # Wire in the YAM IK controller via the fork's injectable hooks.
+        if arm == "yam":
+            self._setup_yam_control(env)
+
         # Own renderer — gives us full control over camera and image format;
         # Meta-World's internal mujoco_renderer is never initialised (render_mode=None).
         self._renderer: mujoco.Renderer = _mj.Renderer(env.model, height=size[0], width=size[1])
@@ -120,6 +157,120 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             env.action_space.high,
             dtype=np.float32,
         )
+
+    def _setup_yam_control(self, env: Any) -> None:
+        """Wire the YAM EEController into the Meta-World env via hook injection.
+
+        Steps:
+        1. Forward kinematics at the default qpos to capture the TCP orientation
+           (gripper-down) as the IK target.
+        2. Build an EEController with this orientation locked in.
+        3. Inject _external_actuation: loops frame_skip IK steps per outer step,
+           negating the gripper channel (MW convention: +1=close; EE: +1=open).
+        4. Inject _external_reset_hand: resets arm to init_qpos, syncs ctrl,
+           settles physics, and sets init_tcp.
+        """
+        import mujoco as _mj
+
+        from dreamer_arm.envs.arms.yam import YAM_ARM
+        from dreamer_arm.envs.control import EEController
+
+        # Capture the gripper-down TCP orientation from the default state.
+        # The XML sets joint2.ref=1.047 and joint3.ref=1.047, so after
+        # mj_resetData the arm is already in home (gripper-down) pose.
+        scratch = _mj.MjData(env.model)
+        _mj.mj_resetData(env.model, scratch)
+        _mj.mj_forward(env.model, scratch)
+        tcp_id = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_SITE, "grasp_site")
+        if tcp_id < 0:
+            raise RuntimeError(
+                "grasp_site not found in YAM Meta-World model.  "
+                "Check that yam_xyz_base.xml is included correctly."
+            )
+        quat_down = np.zeros(4, dtype=np.float64)
+        _mj.mju_mat2Quat(quat_down, scratch.site_xmat[tcp_id])
+
+        # Build YAM_ARM variant with MW-specific settings:
+        #   - tcp_target_quat: the gripper-down orientation captured above
+        #   - ee_step_m: scaled to match MW's action_scale/frame_skip
+        yam_arm_mw = dataclasses.replace(
+            YAM_ARM,
+            tcp_target_quat=tuple(quat_down),
+            ee_step_m=_YAM_MW_EE_STEP_M,
+        )
+        controller = EEController(yam_arm_mw, env.model)
+        # Reduce orientation gain for MW: position tracking matters more than
+        # holding the exact home orientation.  A small gain still prevents wrist
+        # drift without fighting the IK's position component.
+        controller._ori_gain = 0.1
+
+        frame_skip: int = int(env.frame_skip)
+
+        # Gripper joint qpos/dof addresses.
+        # left_finger is the actuated joint; right_finger mirrors it via equality
+        # (polycoef "0 -1 0 0 0" → right = -left).  Both must be kinematically
+        # anchored every substep so the equality constraint doesn't generate
+        # large corrective impulses during mj_step.
+        gripper_jid = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_JOINT, "left_finger")
+        _gripper_qpos_adr = int(env.model.jnt_qposadr[gripper_jid])
+        _gripper_dof_adr = int(env.model.jnt_dofadr[gripper_jid])
+        right_jid = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_JOINT, "right_finger")
+        _right_qpos_adr = int(env.model.jnt_qposadr[right_jid])
+        _right_dof_adr = int(env.model.jnt_dofadr[right_jid])
+
+        def _apply_action(mw_env: Any, action: np.ndarray) -> None:
+            """IK-based actuation matching Sawyer's mocap-weld semantics.
+
+            Sawyer's mocap weld re-anchors the hand body every physics step.
+            We replicate this by:
+              1. Computing IK once to get new joint position targets.
+              2. Re-anchoring arm qpos + zeroing arm velocities every substep.
+            This ensures the arm holds its new pose against gravity throughout
+            the frame_skip window while object physics runs normally.
+            Gripper sign negated: MW +1=close, EEController +1=open.
+            """
+            action_ee = np.array(action, dtype=np.float64)
+            action_ee[3] = -action_ee[3]  # negate gripper channel
+
+            # IK: compute new joint position targets → stored in data.ctrl.
+            controller.apply(action_ee, mw_env.model, mw_env.data)
+
+            # Cache targets (read once; don't re-run IK per substep).
+            q_arm = [float(mw_env.data.ctrl[aid]) for aid in controller._arm_act_ids]
+            g_ctrl = float(mw_env.data.ctrl[controller._gripper_act_id])
+
+            for _ in range(frame_skip):
+                # Re-anchor arm kinematically (equivalent to mocap weld).
+                for qpos_adr, dof_adr, q in zip(
+                    controller._arm_qpos_adrs, controller._arm_dof_adrs, q_arm, strict=True
+                ):
+                    mw_env.data.qpos[qpos_adr] = q
+                    mw_env.data.qvel[dof_adr] = 0.0
+                mw_env.data.qpos[_gripper_qpos_adr] = g_ctrl
+                mw_env.data.qvel[_gripper_dof_adr] = 0.0
+                mw_env.data.qpos[_right_qpos_adr] = -g_ctrl  # equality: right = -left
+                mw_env.data.qvel[_right_dof_adr] = 0.0
+                # Keep ctrl in sync so position actuators generate zero force
+                # (arm is held kinematically; only object physics matters).
+                for aid, q in zip(controller._arm_act_ids, q_arm, strict=True):
+                    mw_env.data.ctrl[aid] = q
+                mw_env.data.ctrl[controller._gripper_act_id] = g_ctrl
+                _mj.mj_step(mw_env.model, mw_env.data)
+
+        def _reset_hand(mw_env: Any, steps: int = 50) -> None:
+            """Reset arm to home pose kinematically, then settle object physics."""
+            mw_env.set_state(mw_env.init_qpos, mw_env.init_qvel)
+            # Sync ctrl to qpos so actuators hold the pose between steps.
+            for i, aid in enumerate(controller._arm_act_ids):
+                mw_env.data.ctrl[aid] = mw_env.data.qpos[controller._arm_qpos_adrs[i]]
+            mw_env.data.ctrl[controller._gripper_act_id] = controller._g_lo
+            _mj.mj_forward(mw_env.model, mw_env.data)
+            for _ in range(steps):
+                _mj.mj_step(mw_env.model, mw_env.data)
+            mw_env.init_tcp = mw_env.tcp_center
+
+        env._external_actuation = _apply_action
+        env._external_reset_hand = _reset_hand
 
     # ---------------------------------------------------------------- gym API
 
