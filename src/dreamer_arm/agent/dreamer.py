@@ -148,7 +148,9 @@ class Dreamer(nn.Module):
         self._clone_and_freeze()
 
         if bool(config.compile):
-            self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")  # type: ignore[method-assign]
+            # "default" compiles in seconds; "reduce-overhead" (CUDA graphs) can
+            # take 5-10 min on first run before any progress shows in the logs.
+            self._cal_grad = torch.compile(self._cal_grad, mode="default")  # type: ignore[method-assign]
 
     # ------------------------------------------------------------------ utils
 

@@ -1,6 +1,6 @@
 [workspace]
 authors = ["Oliver SOMMER <63651102+oliver-sommer@users.noreply.github.com>"]
-channels = ["conda-forge", "pytorch"]
+channels = ["conda-forge", "pytorch", "nvidia"]
 name = "dreamer-arm"
 platforms = ["osx-arm64", "linux-64"]
 version = "0.1.0"
@@ -12,7 +12,6 @@ macos = "14.0"
 
 [dependencies]
 python = "3.13.*"
-pytorch = ">=2.10"
 numpy = ">=2.4"
 # dm-control 1.0.41 still references MjModel.flex_bandwidth, which mujoco 3.9
 # removed; pin mujoco below 3.9 until dm-control catches up.
@@ -27,13 +26,21 @@ imageio = ">=2.37"
 imageio-ffmpeg = ">=0.6"
 wandb = ">=0.26"
 
+# CUDA 12.6 wheels for Linux; macOS pip falls through to the standard PyPI index.
+[pypi-options]
+extra-index-urls = ["https://download.pytorch.org/whl/cu126"]
+index-strategy = "unsafe-best-match"
+
 [pypi-dependencies]
 dreamer-arm = { path = ".", editable = true }
+# torch installed via pip so we can target a CUDA 12.6 build on Linux.
+torch = ">=2.10"
 torchrl = ">=0.12"
 tensordict = ">=0.12"
 gymnasium = ">=1.3"
 moviepy = ">=2.0"
 metaworld = ">=3.0"
+
 
 
 [feature.dev.dependencies]
@@ -52,9 +59,11 @@ lint = "ruff check src tests"
 fmt = "ruff format src tests"
 typecheck = "mypy src"
 test = "pytest"
-train = "python -m dreamer_arm"
-train-yam = "python -m dreamer_arm arm=yam"
-train-metaworld = "python -m dreamer_arm task=metaworld"
+# TORCHINDUCTOR_CACHE_DIR persists torch.compile kernels across runs so only
+# the very first run pays the compilation cost (~30s); subsequent runs start fast.
+train = { cmd = "python -m dreamer_arm", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache" } }
+train-yam = { cmd = "python -m dreamer_arm arm=yam", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache" } }
+train-metaworld = { cmd = "python -m dreamer_arm task=metaworld", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache" } }
 # Live MuJoCo viewer window (macOS + mjpython only).
 train-view = "mjpython -m dreamer_arm task.viewer=true task.env_num=1 wandb.mode=disabled"
 train-metaworld-view = "mjpython -m dreamer_arm task=metaworld task.viewer=true task.env_num=1 wandb.mode=disabled"
