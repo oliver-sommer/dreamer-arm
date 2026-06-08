@@ -260,9 +260,13 @@ class Dreamer(nn.Module):
             mets["opt/grad_rms"] = compute_rms(grads)
 
         adaptive_grad_clip(params, self._agc_clip, self._agc_pmin)
+        scale_before = self._scaler.get_scale()
         self._scaler.step(self._optimizer)
         self._scaler.update()
-        self._scheduler.step()
+        # Only step scheduler when the optimizer actually ran (scale decrease means
+        # GradScaler skipped the step due to inf/nan gradients).
+        if self._scaler.get_scale() >= scale_before:
+            self._scheduler.step()
         self._optimizer.zero_grad(set_to_none=True)
 
         mets["opt/lr"] = torch.tensor(self._scheduler.get_last_lr()[0])

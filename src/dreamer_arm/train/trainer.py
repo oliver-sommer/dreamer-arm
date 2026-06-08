@@ -282,16 +282,19 @@ class OnlineTrainer:
         for task in {t for t in eval_tasks if t is not None}:
             mask = np.array([t == task for t in eval_tasks], dtype=bool)
             self.logger.scalar(f"episode/eval_success/{task}", float(successes[mask].mean()))
-        # Stack per-env frame lists → (n_video, T, H, W, C); logger tiles horizontally.
+        # Stack per-env frame lists → (n_video, T, H, W, C); tile as 2 rows.
+        grid_cols = max(1, n_video // 2)
         if videos[0]:
             self.logger.video(
                 "eval/scene_video",
                 np.stack([np.stack(v, axis=0) for v in videos], axis=0),
+                cols=grid_cols,
             )
         if wrist_videos[0]:
             self.logger.video(
                 "eval/wrist_video",
                 np.stack([np.stack(v, axis=0) for v in wrist_videos], axis=0),
+                cols=grid_cols,
             )
         self.logger.write(train_step)
         agent.train()

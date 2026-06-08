@@ -66,6 +66,8 @@ def run(cfg: DictConfig) -> None:
             extra["wrist_camera"] = str(cfg.envs.wrist_camera)
         if "camera_jitter" in cfg.envs:
             extra["camera_jitter"] = float(cfg.envs.camera_jitter)
+        if "wrist_fisheye" in cfg.envs:
+            extra["wrist_fisheye"] = float(cfg.envs.wrist_fisheye)
         if "scene_randomize" in cfg.envs:
             extra["scene_randomize"] = bool(cfg.envs.scene_randomize)
         if "camera_pose_randomize" in cfg.envs:

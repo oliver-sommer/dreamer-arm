@@ -55,8 +55,20 @@ class Arm:
         Maximum end-effector displacement per *controlled* step (metres).
         The raw action ``∈ [-1,1]`` is scaled by this factor before the IK step.
     ik_damping:
-        Damped-least-squares λ.  Higher ⟹ more stable but less accurate
-        near singularities.
+        Damped-least-squares base λ.  Always-on regularisation; keep small so
+        accuracy is not needlessly degraded far from singularities.
+    ik_damping_max:
+        Nakamura adaptive-damping ceiling lam_max.  When sigma_min of the
+        Jacobian drops below ``ik_damping_sigma0``, lam2 is increased smoothly
+        up to lam_max^2  (formula: lam2_eff = lam0^2 + (1-(s/s0)^2)*lam_max^2).
+        Set to 0.0 (default) to disable adaptive damping.
+    ik_damping_sigma0:
+        Threshold sigma_0 at which adaptive damping begins to activate.
+        Set to 0.0 (default) to disable adaptive damping.
+    max_joint_step:
+        Hard ceiling on |dq_i| per control step (rad).  The raw DLS solution
+        is scaled uniformly so the largest component never exceeds this value.
+        Set to 0.0 (default) to disable the clamp.
     """
 
     name: str
@@ -71,6 +83,9 @@ class Arm:
     gripper_open: float
     ee_step_m: float = 0.02
     ik_damping: float = 5e-3
+    ik_damping_max: float = 0.0
+    ik_damping_sigma0: float = 0.0
+    max_joint_step: float = 0.0
     # Optional hook called by Manipulation._build_spec after loading the arm
     # scene but before task bodies are spliced in.  Use this to patch the raw
     # vendor assets at load time (e.g. attach a gripper to a bare arm model).

@@ -145,7 +145,10 @@ class EEController:
         self._ori_gain = 1.0
 
         # Cache scalars.
-        self._lam2 = float(arm.ik_damping) ** 2
+        self._lam2_base = float(arm.ik_damping) ** 2
+        self._lam2_max = float(arm.ik_damping_max) ** 2
+        self._sigma0 = float(arm.ik_damping_sigma0)
+        self._max_joint_step = float(arm.max_joint_step)
         self._step_m = float(arm.ee_step_m)
         self._g_lo = float(arm.gripper_closed)
         self._g_hi = float(arm.gripper_open)
@@ -167,6 +170,10 @@ class EEController:
                     if int(model.geom_bodyid[gid]) == bid:
                         arm_link_geoms.add(gid)
         self._arm_link_geoms: frozenset[int] = frozenset(arm_link_geoms)
+
+        # Per-step diagnostics populated by each call to apply().
+        # Keys: sigma_min, manip, dq_norm, dq_max, clip_active, backoff_alpha.
+        self.last_diag: dict[str, float] = {}
 
     # ------------------------------------------------------------------ API
 
@@ -204,8 +211,33 @@ class EEController:
 
         e = np.concatenate([delta_pos, self._ori_gain * e_ori])  # (6,)
 
-        JJT = J @ J.T + self._lam2 * np.eye(6)
+        # ---- SVD for diagnostics + adaptive damping (computed before solve) ----
+        svs = np.linalg.svd(J, compute_uv=False)  # min(6, n_arm) values
+        sigma_min = float(svs.min())
+        self.last_diag["sigma_min"] = sigma_min
+        self.last_diag["manip"] = float(np.prod(svs))
+
+        # Nakamura adaptive damping: lam2_eff ramps from lam0^2 up to lam_max^2
+        # as sigma_min falls below sigma_0.  Disabled when ik_damping_sigma0 == 0.
+        if self._sigma0 > 0.0 and sigma_min < self._sigma0:
+            t = 1.0 - (sigma_min / self._sigma0) ** 2
+            lam2 = self._lam2_base + t * self._lam2_max
+        else:
+            lam2 = self._lam2_base
+        self.last_diag["lam2_eff"] = lam2
+
+        JJT = J @ J.T + lam2 * np.eye(6)
         dq = J.T @ np.linalg.solve(JJT, e)  # (n_arm,)
+
+        # dq clamp: scale uniformly so max|dq_i| ≤ max_joint_step.
+        # Preserves the IK direction; turns blowups into bounded smooth steps.
+        if self._max_joint_step > 0.0:
+            dq_peak = float(np.abs(dq).max())
+            if dq_peak > self._max_joint_step:
+                dq *= self._max_joint_step / dq_peak
+
+        self.last_diag["dq_norm"] = float(np.linalg.norm(dq))
+        self.last_diag["dq_max"] = float(np.abs(dq).max())
 
         q_cur = np.asarray(data.qpos)[self._arm_qpos_adrs]
 
@@ -214,15 +246,22 @@ class EEController:
         # alpha=0.0 holds the current (known collision-free) pose and always wins,
         # so q_new is guaranteed to be set.
         q_new = q_cur  # initialise to current pose as the final fallback
+        _backoff_alpha = 0.0
+        _clip_active = False
         for alpha in _BACKOFF_ALPHAS:
+            q_unclamped = q_cur + alpha * dq
             q_cand = np.clip(
-                q_cur + alpha * dq,
+                q_unclamped,
                 self._ctrl_low[self._arm_act_ids],
                 self._ctrl_high[self._arm_act_ids],
             )
             if not self._self_collides(q_cand):
                 q_new = q_cand
+                _backoff_alpha = alpha
+                _clip_active = bool(np.any(q_cand != q_unclamped))
                 break
+        self.last_diag["backoff_alpha"] = _backoff_alpha
+        self.last_diag["clip_active"] = float(_clip_active)
 
         for i, aid in enumerate(self._arm_act_ids):
             data.ctrl[aid] = q_new[i]

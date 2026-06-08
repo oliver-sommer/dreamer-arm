@@ -92,6 +92,49 @@ _CAM_DISTANCE_MIN_M = 0.6  # minimum camera-target distance (m)
 _CAM_DISTANCE_MAX_M = 1.1  # maximum camera-target distance (m)
 
 
+def _build_fisheye_map(h: int, w: int, strength: float) -> tuple[np.ndarray, np.ndarray]:
+    """Precompute barrel-distortion source coordinates for an h x w image.
+
+    Returns (y_src, x_src) float32 arrays of shape (h, w).  Each entry gives
+    the source pixel to sample for the corresponding output pixel.  Coordinates
+    outside [0, h/w) are clamped (boundary-fill) at sample time.
+
+    ``strength`` controls barrel intensity: 0 = identity, 0.5 = visible fisheye
+    (corners sample from ~50% beyond the image radius).
+    """
+    y_out, x_out = np.mgrid[0:h, 0:w].astype(np.float32)
+    cx, cy = w * 0.5, h * 0.5
+    xn = (x_out - cx) / cx
+    yn = (y_out - cy) / cy
+    r = np.hypot(xn, yn)
+    r_src = r * (1.0 + strength * r * r)
+    safe_r = np.where(r > 0, r, 1.0)
+    x_src = np.where(r > 0, xn / safe_r * r_src * cx + cx, cx).astype(np.float32)
+    y_src = np.where(r > 0, yn / safe_r * r_src * cy + cy, cy).astype(np.float32)
+    return y_src, x_src
+
+
+def _apply_fisheye(frame: np.ndarray, fisheye_map: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+    """Remap an (H, W, 3) uint8 frame through precomputed fisheye coordinates."""
+    y_src, x_src = fisheye_map
+    h, w = frame.shape[:2]
+    x0 = np.floor(x_src).astype(np.int32)
+    y0 = np.floor(y_src).astype(np.int32)
+    dx = (x_src - x0)[..., None].astype(np.float32)
+    dy = (y_src - y0)[..., None].astype(np.float32)
+    x0c = np.clip(x0, 0, w - 1)
+    x1c = np.clip(x0 + 1, 0, w - 1)
+    y0c = np.clip(y0, 0, h - 1)
+    y1c = np.clip(y0 + 1, 0, h - 1)
+    result = (
+        frame[y0c, x0c].astype(np.float32) * (1 - dy) * (1 - dx)
+        + frame[y0c, x1c].astype(np.float32) * (1 - dy) * dx
+        + frame[y1c, x0c].astype(np.float32) * dy * (1 - dx)
+        + frame[y1c, x1c].astype(np.float32) * dy * dx
+    )
+    return result.astype(np.uint8)
+
+
 class MetaWorld(gym.Env):  # type: ignore[type-arg]
     """Single Meta-World MT1 task as a Gymnasium env with a Dict obs space.
 
@@ -153,6 +196,7 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         camera_jitter: float = 0.0,
         scene_randomize: bool = False,
         camera_pose_randomize: bool = False,
+        wrist_fisheye: float = 0.0,
         seed: int = 0,
         viewer: bool = False,
         task_idx: int | None = None,
@@ -246,6 +290,11 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
                     "Check that yam_xyz_base.xml defines it."
                 )
             self._wrist_camera_id = int(wc_id)
+
+        # Precompute barrel-distortion remap for the wrist camera once.
+        self._fisheye_map: tuple[np.ndarray, np.ndarray] | None = None
+        if wrist_fisheye > 0.0 and self._wrist_camera_id is not None:
+            self._fisheye_map = _build_fisheye_map(size[0], size[1], wrist_fisheye)
 
         obs_spaces: dict[str, gym.spaces.Space] = {  # type: ignore[type-arg]
             "scene": gym.spaces.Box(0, 255, (*size, 3), dtype=np.uint8),
@@ -583,7 +632,10 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             "state": np.asarray(state, dtype=np.float32),
         }
         if self._wrist_camera_id is not None:
-            obs["wrist_image"] = self._render_camera(self._wrist_camera_id, flip=False)
+            wrist = self._render_camera(self._wrist_camera_id, flip=False)
+            if self._fisheye_map is not None:
+                wrist = _apply_fisheye(wrist, self._fisheye_map)
+            obs["wrist_image"] = wrist
         if self._task_onehot is not None:
             obs["task_id"] = self._task_onehot
         return obs

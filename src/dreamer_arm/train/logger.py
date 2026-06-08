@@ -38,12 +38,12 @@ def _to_numpy(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
-def _as_uint8_video(frames: _Array) -> np.ndarray:
-    """Normalise a ``(B?, T, H, W, C)`` array into ``(T, C, H, B*W)`` uint8.
+def _as_uint8_video(frames: _Array, cols: int | None = None) -> np.ndarray:
+    """Normalise a ``(B?, T, H, W, C)`` array into ``(T, C, rows*H, cols*W)`` uint8.
 
-    Accepts an optional leading batch axis. Batched videos are tiled
-    horizontally so a single W&B video panel shows all rollouts side-by-side
-    — the same trick the reference repo used for its TensorBoard panel.
+    Accepts an optional leading batch axis. ``cols`` controls how many videos
+    appear per row; the remainder fill the rows below. Defaults to all videos
+    in a single row (``cols=B``).
     """
     arr = _to_numpy(frames)
     if arr.ndim == 4:
@@ -55,8 +55,11 @@ def _as_uint8_video(frames: _Array) -> np.ndarray:
     elif arr.dtype != np.uint8:
         arr = arr.astype(np.uint8)
     b, t, h, w, c = arr.shape
-    # (B, T, H, W, C) -> (T, H, B, W, C) -> (T, C, H, B*W)
-    arr = arr.transpose(1, 4, 2, 0, 3).reshape(t, c, h, b * w)
+    n_cols = cols if cols is not None else b
+    n_rows = b // n_cols
+    # (B, T, H, W, C) -> (rows, cols, T, H, W, C) -> (T, C, rows*H, cols*W)
+    arr = arr.reshape(n_rows, n_cols, t, h, w, c)
+    arr = arr.transpose(2, 5, 0, 3, 1, 4).reshape(t, c, n_rows * h, n_cols * w)
     return arr
 
 
@@ -116,8 +119,8 @@ class WandbLogger:
         for k, v in values.items():
             self.scalar(k, v)
 
-    def video(self, name: str, frames: _Array) -> None:
-        self._videos[name] = _as_uint8_video(frames)
+    def video(self, name: str, frames: _Array, cols: int | None = None) -> None:
+        self._videos[name] = _as_uint8_video(frames, cols=cols)
 
     def image(self, name: str, image: _Array) -> None:
         self._images[name] = _to_numpy(image)
