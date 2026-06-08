@@ -132,6 +132,15 @@ class OnlineTrainer:
                 and self.eval_envs is not None
             ):
                 self.eval(agent, step)
+                if self.eval_envs is self.train_envs:
+                    # eval reset the shared envs; resync training state so the
+                    # next env step uses a fresh obs rather than a stale one.
+                    obs_np, _ = envs.reset()
+                    returns[:] = 0
+                    lengths[:] = 0
+                    video_cache.clear()
+                    agent_state = agent.get_initial_state(n)
+                    act = agent_state["prev_action"].clone()
 
             # ---- env step ----
             obs_t = self._obs_to_tensor(obs_np, device)

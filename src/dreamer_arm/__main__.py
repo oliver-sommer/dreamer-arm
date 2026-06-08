@@ -88,7 +88,10 @@ def run(cfg: DictConfig) -> None:
         )
 
     train_envs = _make_envs(viewer=_viewer)
-    eval_envs = _make_envs() if int(cfg.envs.eval_episode_num) > 0 else None
+    # Reuse train_envs for eval to avoid doubling the EGL renderer count.
+    # With MT50 (50 train + 50 eval envs), 100 EGL contexts exhaust VRAM on
+    # most GPUs.  The trainer resets shared envs after eval to resync obs state.
+    eval_envs = train_envs if int(cfg.envs.eval_episode_num) > 0 else None
 
     agent = Dreamer(cfg.model, train_envs.observation_space, train_envs.action_space).to(cfg.device)
 
@@ -131,7 +134,7 @@ def run(cfg: DictConfig) -> None:
     finally:
         logger.finish()
         train_envs.close()
-        if eval_envs is not None:
+        if eval_envs is not None and eval_envs is not train_envs:
             eval_envs.close()
 
 
