@@ -168,7 +168,7 @@ class OnlineTrainer:
                 if not d:
                     continue
                 if i == 0 and video_cache:
-                    self.logger.video("train/video", np.stack(video_cache, axis=0)[None])
+                    self.logger.video("train/scene_video", np.stack(video_cache, axis=0)[None])
                     video_cache = []
                 self.logger.scalar("episode/score", float(returns[i]))
                 self.logger.scalar("episode/length", float(lengths[i]))
@@ -276,7 +276,7 @@ class OnlineTrainer:
         # Stack per-env frame lists → (n_video, T, H, W, C); logger tiles horizontally.
         if videos[0]:
             self.logger.video(
-                "eval/video",
+                "eval/scene_video",
                 np.stack([np.stack(v, axis=0) for v in videos], axis=0),
             )
         if wrist_videos[0]:

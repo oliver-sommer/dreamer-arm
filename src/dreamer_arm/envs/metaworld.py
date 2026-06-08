@@ -583,7 +583,7 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             "state": np.asarray(state, dtype=np.float32),
         }
         if self._wrist_camera_id is not None:
-            obs["wrist_image"] = self._render_camera(self._wrist_camera_id, flip=True)
+            obs["wrist_image"] = self._render_camera(self._wrist_camera_id, flip=False)
         if self._task_onehot is not None:
             obs["task_id"] = self._task_onehot
         return obs
