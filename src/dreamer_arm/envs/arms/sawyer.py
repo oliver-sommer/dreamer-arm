@@ -137,7 +137,6 @@ SAWYER_ARM = Arm(
     gripper_closed=0.0,
     gripper_open=0.041,
     ee_step_m=0.02,
-    ik_damping=5e-3,
     patch_spec=_patch_sawyer_spec,
 )
 

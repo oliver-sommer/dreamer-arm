@@ -6,14 +6,7 @@ name: "yam"
 # End-effector controller tuning.
 # Defaults from arms/yam.py are shown below; uncomment to override.
 # ee_step_m: 0.02
-# ik_damping: 5e-3        # base DLS λ (always-on)
 
-# Nakamura adaptive damping: λ²_eff ramps from ik_damping² up to
-# ik_damping_max² as σ_min(J) falls below ik_damping_sigma0.
-# At true singularity (σ→0) the DLS solution is bounded by ≈ e/ik_damping_max.
-# ik_damping_max: 0.1
-# ik_damping_sigma0: 0.1
-
-# Hard ceiling on per-joint step size (rad).  The raw DLS dq is scaled
+# Hard ceiling on per-joint step size (rad).  The pseudo-inverse dq is scaled
 # uniformly so no joint moves more than this per control frame.
 # max_joint_step: 0.3

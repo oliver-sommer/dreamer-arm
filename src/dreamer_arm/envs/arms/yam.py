@@ -33,8 +33,5 @@ YAM_ARM = Arm(
     gripper_closed=0.0,
     gripper_open=0.041,
     ee_step_m=0.02,
-    ik_damping=5e-3,
-    ik_damping_max=0.1,
-    ik_damping_sigma0=0.1,
     max_joint_step=0.3,
 )

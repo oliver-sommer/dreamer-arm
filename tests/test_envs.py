@@ -253,16 +253,16 @@ def test_dr_flags_off_leave_model_arrays_unchanged() -> None:
 
 @pytest.mark.slow
 def test_yam_ee_controller_dq_bounded_near_singularity() -> None:
-    """Adaptive damping + dq clamp bound joint steps at a near-singular wrist pose.
+    """Pseudo-inverse + dq clamp bound joint steps at a near-singular wrist pose.
 
     Drives joint5 to within 0.01 rad of its +π/2 wrist-singularity limit, then
     applies 20 max-amplitude random actions.  Two assertions:
 
-    1. Without the fix (ik_damping_max=0, max_joint_step=0), the DLS solution
-       blows up and dq_max exceeds ``arm.max_joint_step`` — confirming the test
+    1. Without the clamp (max_joint_step=0), the pseudo-inverse solution blows
+       up and dq_max exceeds ``arm.max_joint_step`` — confirming the test
        actually exercises the singularity.
-    2. With the fix enabled (default YAM_ARM settings), every step satisfies
-       ``last_diag["dq_max"] ≤ max_joint_step``.
+    2. With max_joint_step enabled (default YAM_ARM settings), every step
+       satisfies ``last_diag["dq_max"] ≤ max_joint_step``.
     """
     import dataclasses
 
@@ -287,32 +287,29 @@ def test_yam_ee_controller_dq_bounded_near_singularity() -> None:
         data.qpos[ctrl._arm_qpos_adrs[j5_idx]] = np.pi / 2 - 0.01
         mujoco.mj_forward(model, data)
 
-    # ---- Sanity check: unfixed controller blows up ----
-    arm_unfixed = dataclasses.replace(
-        arm, ik_damping_max=0.0, ik_damping_sigma0=0.0, max_joint_step=0.0
-    )
-    ctrl_unfixed = EEController(arm_unfixed, model)
+    # ---- Sanity check: unclamped controller blows up ----
+    arm_unclamped = dataclasses.replace(arm, max_joint_step=0.0)
+    ctrl_unclamped = EEController(arm_unclamped, model)
     data = mujoco.MjData(model)
-    _reset_near_singular(data, ctrl_unfixed)
-    unfixed_peaks = []
+    _reset_near_singular(data, ctrl_unclamped)
+    unclamped_peaks = []
     for a in actions:
-        ctrl_unfixed.apply(a, model, data)
-        unfixed_peaks.append(ctrl_unfixed.last_diag["dq_max"])
-    assert max(unfixed_peaks) > arm.max_joint_step, (
-        "sanity-check failed: unfixed controller should exceed max_joint_step "
+        ctrl_unclamped.apply(a, model, data)
+        unclamped_peaks.append(ctrl_unclamped.last_diag["dq_max"])
+    assert max(unclamped_peaks) > arm.max_joint_step, (
+        "sanity-check failed: unclamped controller should exceed max_joint_step "
         "near a wrist singularity (joint5 ≈ π/2)"
     )
 
-    # ---- Fixed controller: every step must stay within max_joint_step ----
-    ctrl_fixed = EEController(arm, model)
-    _reset_near_singular(data, ctrl_fixed)
+    # ---- Clamped controller: every step must stay within max_joint_step ----
+    ctrl_clamped = EEController(arm, model)
+    _reset_near_singular(data, ctrl_clamped)
     for i, a in enumerate(actions):
-        ctrl_fixed.apply(a, model, data)
-        dq_max = ctrl_fixed.last_diag["dq_max"]
+        ctrl_clamped.apply(a, model, data)
+        dq_max = ctrl_clamped.last_diag["dq_max"]
         assert dq_max <= arm.max_joint_step + 1e-9, (
             f"step {i}: dq_max={dq_max:.4f} exceeded max_joint_step={arm.max_joint_step} "
-            f"(sigma_min={ctrl_fixed.last_diag['sigma_min']:.4f}, "
-            f"lam2_eff={ctrl_fixed.last_diag['lam2_eff']:.2e})"
+            f"(sigma_min={ctrl_clamped.last_diag['sigma_min']:.4f})"
         )
 
 

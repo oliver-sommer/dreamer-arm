@@ -1,4 +1,4 @@
-"""Damped-least-squares end-effector (EE) controller — 6-DOF pose servoing.
+"""End-effector (EE) controller — 6-DOF pose servoing via pseudo-inverse IK.
 
 Maps a 4-D arm-agnostic action ``[Δx, Δy, Δz, gripper]`` to
 position-actuator ``ctrl`` values via differential inverse kinematics (IK).
@@ -17,14 +17,13 @@ Given action ``a ∈ [-1, 1]^4``:
    the arm's ``home`` keyframe at construction time).
 3. Build the 6xn TCP site Jacobian (translational + rotational rows) via
    ``mujoco.mj_jacSite``, restricted to the arm's DOFs.
-4. Damped-least-squares (DLS) solution on the stacked 6-D error:
-   ``dq = J^T (J J^T + λ²I₆)^{-1} [Δp; e_ori]``
-5. Compute the candidate joint target:
-   ``q_cand = clip(q_arm + dq, ctrl_low, ctrl_high)``
-6. Self-collision gate: if ``q_cand`` puts any arm link into self-penetration,
-   back off by halving ``dq`` (alpha = 0.5, 0.25) before falling back to holding
-   the current pose.  Finger/gripper bodies are excluded from the check so
-   normal gripper closing is never blocked.
+4. Moore-Penrose pseudo-inverse solution on the stacked 6-D error:
+   ``dq = J⁺ [Δp; e_ori]``
+5. Scale ``dq`` uniformly so ``max|dq_i| ≤ max_joint_step`` (step clamp).
+6. Self-collision gate: if the candidate joint target puts any arm link into
+   self-penetration, back off by halving ``dq`` (alpha = 0.5, 0.25) before
+   falling back to holding the current pose.  Finger/gripper bodies are
+   excluded from the check so normal gripper closing is never blocked.
 7. Map gripper ``a[3] ∈ [-1, 1]`` → ``[gripper_closed, gripper_open]`` ctrl.
 
 The orientation is **not** commanded by the policy; it is regulated to the
@@ -48,6 +47,10 @@ from dreamer_arm.envs.arms import Arm
 # ---------------------------------------------------------------------------
 # Self-collision gate
 # ---------------------------------------------------------------------------
+
+# Singular-value threshold below which a mode is treated as numerically zero
+# and excluded from the pseudo-inverse (Moore-Penrose truncation).
+_SV_EPS: float = 1e-9
 
 # Signed-distance threshold: contact.dist < this → treat as penetration.
 # MuJoCo reports dist < 0 when surfaces overlap; 0.0 is the strict boundary.
@@ -73,7 +76,7 @@ _ARM_LINK_BODY_NAMES: tuple[str, ...] = (
 
 
 class EEController:
-    """Stateless (per-step) DLS end-effector controller.
+    """Stateless (per-step) pseudo-inverse end-effector controller.
 
     Parameters
     ----------
@@ -145,9 +148,6 @@ class EEController:
         self._ori_gain = 1.0
 
         # Cache scalars.
-        self._lam2_base = float(arm.ik_damping) ** 2
-        self._lam2_max = float(arm.ik_damping_max) ** 2
-        self._sigma0 = float(arm.ik_damping_sigma0)
         self._max_joint_step = float(arm.max_joint_step)
         self._step_m = float(arm.ee_step_m)
         self._g_lo = float(arm.gripper_closed)
@@ -194,7 +194,7 @@ class EEController:
         """
         delta_pos = np.asarray(action[:3], dtype=np.float64) * self._step_m
 
-        # ---- 6-DOF DLS IK for arm joints ----
+        # ---- 6-DOF pseudo-inverse IK for arm joints ----
         self._jacp[:] = 0.0
         self._jacr[:] = 0.0
         mujoco.mj_jacSite(model, data, self._jacp, self._jacr, self._tcp_id)
@@ -211,23 +211,15 @@ class EEController:
 
         e = np.concatenate([delta_pos, self._ori_gain * e_ori])  # (6,)
 
-        # ---- SVD for diagnostics + adaptive damping (computed before solve) ----
-        svs = np.linalg.svd(J, compute_uv=False)  # min(6, n_arm) values
-        sigma_min = float(svs.min())
-        self.last_diag["sigma_min"] = sigma_min
+        # ---- Pseudo-inverse IK ----
+        # Full SVD: U (6,k), svs (k,), Vt (k,n_arm) where k = min(6, n_arm).
+        U, svs, Vt = np.linalg.svd(J, full_matrices=False)
+        self.last_diag["sigma_min"] = float(svs.min())
         self.last_diag["manip"] = float(np.prod(svs))
 
-        # Nakamura adaptive damping: lam2_eff ramps from lam0^2 up to lam_max^2
-        # as sigma_min falls below sigma_0.  Disabled when ik_damping_sigma0 == 0.
-        if self._sigma0 > 0.0 and sigma_min < self._sigma0:
-            t = 1.0 - (sigma_min / self._sigma0) ** 2
-            lam2 = self._lam2_base + t * self._lam2_max
-        else:
-            lam2 = self._lam2_base
-        self.last_diag["lam2_eff"] = lam2
-
-        JJT = J @ J.T + lam2 * np.eye(6)
-        dq = J.T @ np.linalg.solve(JJT, e)  # (n_arm,)
+        # Moore-Penrose: dq = V diag(1/s) U^T e, truncating near-zero modes.
+        inv = np.where(svs > _SV_EPS, 1.0 / svs, 0.0)
+        dq = Vt.T @ (inv * (U.T @ e))
 
         # dq clamp: scale uniformly so max|dq_i| ≤ max_joint_step.
         # Preserves the IK direction; turns blowups into bounded smooth steps.

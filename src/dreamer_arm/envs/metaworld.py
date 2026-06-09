@@ -74,6 +74,8 @@ _DR_FLOOR_POOL_PREFIX = "T_floorpool_"  # 2d textures for the floor plane
 _SCENE_RGBA_JITTER = 0.3
 # Light-color jitter magnitude (headlight ambient + directional diffuse/specular).
 _SCENE_LIGHT_JITTER = 0.15
+# Light-direction jitter magnitude (added to each component before renorm).
+_SCENE_LIGHT_DIR_JITTER = 0.15
 
 # ---------------------------------------------------------------------------
 # Camera-pose domain-randomization constants
@@ -278,6 +280,7 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._dr_headlight_ambient_base: np.ndarray | None = None
         self._dr_light_diffuse_base: np.ndarray | None = None
         self._dr_light_specular_base: np.ndarray | None = None
+        self._dr_light_dir_base: np.ndarray | None = None
         if scene_randomize:
             self._dr_init(env)
 
@@ -369,6 +372,7 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._dr_headlight_ambient_base = np.array(model.vis.headlight.ambient, copy=True)
         self._dr_light_diffuse_base = np.array(model.light_diffuse, copy=True)
         self._dr_light_specular_base = np.array(model.light_specular, copy=True)
+        self._dr_light_dir_base = np.array(model.light_dir, copy=True)
 
     def _apply_scene_dr(self) -> None:
         """Per-episode: swap textures, jitter RGBA tints, and jitter lighting."""
@@ -434,6 +438,14 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
                 0.0,
                 1.0,
             )
+        if self._dr_light_dir_base is not None:
+            noisy = self._dr_light_dir_base + self._rng.uniform(
+                -_SCENE_LIGHT_DIR_JITTER,
+                _SCENE_LIGHT_DIR_JITTER,
+                self._dr_light_dir_base.shape,
+            )
+            norms = np.linalg.norm(noisy, axis=-1, keepdims=True)
+            model.light_dir[:] = noisy / np.where(norms > 0, norms, 1.0)
 
     def _sample_camera_pose(self) -> None:
         """Per-episode: place the scene camera on the hemisphere behind the arm.
