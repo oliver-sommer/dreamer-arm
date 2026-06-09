@@ -1,12 +1,18 @@
 # i2rt YAM arm configuration.
-# Override IK tuning per-arm here; body/joint names live in envs/arms/yam.py.
+# IK tuning and body/joint names live in envs/arms/yam.py (YAM_ARM); the values
+# below document the active defaults.
 
 name: "yam"
 
-# End-effector controller tuning.
-# Defaults from arms/yam.py are shown below; uncomment to override.
-# ee_step_m: 0.02
-
-# Hard ceiling on per-joint step size (rad).  The pseudo-inverse dq is scaled
-# uniformly so no joint moves more than this per control frame.
-# max_joint_step: 0.3
+# End-effector controller tuning (defaults from arms/yam.py):
+#   ee_step_m: 0.02          # EE displacement per controlled step (m)
+#   max_joint_step: 0.3      # hard ceiling on |dq_i| per control frame (rad);
+#                            # the DLS solution is scaled uniformly to respect it
+#
+# Damped-least-squares IK:
+#   ik_damping: 5e-3         # base damping λ
+#   ik_damping_max: 0.1      # extra λ ramped in near singularities (Nakamura)
+#   ik_damping_sigma0: 0.1   # sigma_min threshold where adaptive damping starts
+#
+# Orientation: tcp_approach_axis=0 regulates the gripper's local x-axis to
+# straight-down while leaving wrist roll free (keeps joint4/5 off their limits).

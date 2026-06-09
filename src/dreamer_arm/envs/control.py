@@ -1,4 +1,4 @@
-"""End-effector (EE) controller — 6-DOF pose servoing via pseudo-inverse IK.
+"""End-effector (EE) controller — 6-DOF pose servoing via damped-least-squares IK.
 
 Maps a 4-D arm-agnostic action ``[Δx, Δy, Δz, gripper]`` to
 position-actuator ``ctrl`` values via differential inverse kinematics (IK).
@@ -12,22 +12,27 @@ Algorithm
 Given action ``a ∈ [-1, 1]^4``:
 
 1. Compute desired EE displacement ``Δp = a[:3] * ee_step_m``.
-2. Compute orientation error ``e_ori`` (world-frame, 3-vector) between the
-   current TCP quaternion and the fixed target quaternion (captured once from
-   the arm's ``home`` keyframe at construction time).
+2. Compute orientation error ``e_ori`` (world-frame, 3-vector).  In *down-axis*
+   mode (``arm.tcp_approach_axis`` set) this is ``a_cur x a_tgt`` — it drives the
+   gripper approach axis toward ``ori_target_axis`` (e.g. straight down) while
+   leaving roll about that axis free, so the wrist is never pinned at its limits.
+   Otherwise it is the quaternion error to a fixed captured target orientation.
 3. Build the 6xn TCP site Jacobian (translational + rotational rows) via
    ``mujoco.mj_jacSite``, restricted to the arm's DOFs.
-4. Moore-Penrose pseudo-inverse solution on the stacked 6-D error:
-   ``dq = J⁺ [Δp; e_ori]``
-5. Scale ``dq`` uniformly so ``max|dq_i| ≤ max_joint_step`` (step clamp).
-6. Self-collision gate: if the candidate joint target puts any arm link into
+4. Damped-least-squares solve on the stacked 6-D error, with Nakamura adaptive
+   damping that ramps in near singularities:
+   ``dq = Jᵀ (J Jᵀ + λ²I)⁻¹ [Δp; e_ori]``
+5. Nullspace joint-limit avoidance: add ``N (k · (q_center - q))`` so redundant
+   DOF(s) drift toward each joint's range centre, keeping joints off their limits.
+6. Scale ``dq`` uniformly so ``max|dq_i| ≤ max_joint_step`` (step clamp).
+7. Self-collision gate: if the candidate joint target puts any arm link into
    self-penetration, back off by halving ``dq`` (alpha = 0.5, 0.25) before
    falling back to holding the current pose.  Finger/gripper bodies are
    excluded from the check so normal gripper closing is never blocked.
-7. Map gripper ``a[3] ∈ [-1, 1]`` → ``[gripper_closed, gripper_open]`` ctrl.
+8. Map gripper ``a[3] ∈ [-1, 1]`` → ``[gripper_closed, gripper_open]`` ctrl.
 
-The orientation is **not** commanded by the policy; it is regulated to the
-target pose defined by the home keyframe (typically gripper-down).
+The orientation is **not** commanded by the policy; it is regulated toward the
+target axis/orientation defined by the arm descriptor (typically gripper-down).
 
 Position actuators drive joints to their ctrl target within the physics step;
 no integration timestep arithmetic is needed here.
@@ -48,9 +53,10 @@ from dreamer_arm.envs.arms import Arm
 # Self-collision gate
 # ---------------------------------------------------------------------------
 
-# Singular-value threshold below which a mode is treated as numerically zero
-# and excluded from the pseudo-inverse (Moore-Penrose truncation).
-_SV_EPS: float = 1e-9
+# Fraction of each joint's range used as the limit-avoidance margin: the
+# nullspace bias is zero in the safe interior and ramps in only within this
+# margin of a limit (so it never resists normal reaching motion).
+_LIMIT_MARGIN_FRAC: float = 0.15
 
 # Signed-distance threshold: contact.dist < this → treat as penetration.
 # MuJoCo reports dist < 0 when surfaces overlap; 0.0 is the strict boundary.
@@ -76,7 +82,7 @@ _ARM_LINK_BODY_NAMES: tuple[str, ...] = (
 
 
 class EEController:
-    """Stateless (per-step) pseudo-inverse end-effector controller.
+    """Stateless (per-step) damped-least-squares end-effector controller.
 
     Parameters
     ----------
@@ -94,15 +100,28 @@ class EEController:
         if self._tcp_id < 0:
             raise RuntimeError(f"TCP site {arm.tcp_site!r} not found in model (arm={arm.name!r})")
 
-        # Arm joint → DOF / qpos address mappings.
+        # Arm joint → DOF / qpos address mappings + range centres (used as the
+        # neutral posture for the nullspace joint-limit-avoidance bias).
         self._arm_dof_adrs: list[int] = []
         self._arm_qpos_adrs: list[int] = []
+        jnt_lo: list[float] = []
+        jnt_hi: list[float] = []
         for jname in arm.arm_joint_names:
             jid = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname))
             if jid < 0:
                 raise RuntimeError(f"Arm joint {jname!r} not found in model (arm={arm.name!r})")
             self._arm_dof_adrs.append(int(model.jnt_dofadr[jid]))
             self._arm_qpos_adrs.append(int(model.jnt_qposadr[jid]))
+            lo_j, hi_j = model.jnt_range[jid]
+            jnt_lo.append(float(lo_j))
+            jnt_hi.append(float(hi_j))
+        # Joint-limit-avoidance band: the nullspace bias is zero in the safe
+        # interior [lo+margin, hi-margin] and repulsive only near a limit, so it
+        # never resists normal reaching motion — it just keeps joints (notably the
+        # wrist) off their hard limits.  Margin = _LIMIT_MARGIN_FRAC of each range.
+        self._jnt_lo = np.array(jnt_lo, dtype=np.float64)
+        self._jnt_hi = np.array(jnt_hi, dtype=np.float64)
+        self._jnt_margin = _LIMIT_MARGIN_FRAC * (self._jnt_hi - self._jnt_lo)
 
         # Arm actuator IDs.
         self._arm_act_ids: list[int] = []
@@ -129,26 +148,47 @@ class EEController:
         self._jacp = np.zeros((3, model.nv), dtype=np.float64)
         self._jacr = np.zeros((3, model.nv), dtype=np.float64)
 
-        # Target TCP orientation: use arm override or capture from home keyframe.
-        if arm.tcp_target_quat is not None:
-            self._quat_target = np.array(arm.tcp_target_quat, dtype=np.float64)
-        else:
-            scratch = mujoco.MjData(model)
-            key_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home"))
-            if key_id < 0:
-                raise RuntimeError(
-                    "No 'home' keyframe found; cannot capture target TCP orientation."
-                )
-            mujoco.mj_resetDataKeyframe(model, scratch, key_id)
-            mujoco.mj_forward(model, scratch)
-            self._quat_target = np.zeros(4, dtype=np.float64)
-            mujoco.mju_mat2Quat(self._quat_target, scratch.site_xmat[self._tcp_id])
-
         # Scale factor for the orientation error term (relative to translation).
         self._ori_gain = 1.0
 
+        # Down-axis orientation regulation: regulate the gripper approach axis to
+        # ``ori_target_axis`` (world frame), leaving roll about it free.  When
+        # ``tcp_approach_axis`` is None we fall back to full-orientation tracking
+        # of a fixed target quaternion (captured below).
+        self._approach_axis = arm.tcp_approach_axis
+        self._ori_target_axis = np.array(arm.ori_target_axis, dtype=np.float64)
+        n = np.linalg.norm(self._ori_target_axis)
+        if n > 0.0:
+            self._ori_target_axis /= n
+
+        # Fixed target TCP orientation — only needed in full-orientation mode.
+        # Use the arm override, else capture from the 'home' keyframe.  Skipped
+        # entirely in down-axis mode (the target is ori_target_axis, no quat).
+        self._quat_target = np.zeros(4, dtype=np.float64)
+        if self._approach_axis is None:
+            if arm.tcp_target_quat is not None:
+                self._quat_target = np.array(arm.tcp_target_quat, dtype=np.float64)
+            else:
+                scratch = mujoco.MjData(model)
+                key_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home"))
+                if key_id < 0:
+                    raise RuntimeError(
+                        "No 'home' keyframe found; cannot capture target TCP orientation."
+                    )
+                mujoco.mj_resetDataKeyframe(model, scratch, key_id)
+                mujoco.mj_forward(model, scratch)
+                mujoco.mju_mat2Quat(self._quat_target, scratch.site_xmat[self._tcp_id])
+
         # Cache scalars.
         self._max_joint_step = float(arm.max_joint_step)
+        # DLS damping: base λ² plus Nakamura adaptive ramp up to λ²_max as
+        # sigma_min falls below sigma0.  sigma0 == 0 disables the adaptive term.
+        self._lam2_base = float(arm.ik_damping) ** 2
+        self._lam2_max = float(arm.ik_damping_max) ** 2
+        self._sigma0 = float(arm.ik_damping_sigma0)
+        # Nullspace bias gain pulling the wrist off its limits (down-axis mode
+        # leaves a 1-DOF nullspace; see apply()).
+        self._null_gain = 0.1
         self._step_m = float(arm.ee_step_m)
         self._g_lo = float(arm.gripper_closed)
         self._g_hi = float(arm.gripper_open)
@@ -172,7 +212,7 @@ class EEController:
         self._arm_link_geoms: frozenset[int] = frozenset(arm_link_geoms)
 
         # Per-step diagnostics populated by each call to apply().
-        # Keys: sigma_min, manip, dq_norm, dq_max, clip_active, backoff_alpha.
+        # Keys: sigma_min, manip, lam2_eff, dq_norm, dq_max, clip_active, backoff_alpha.
         self.last_diag: dict[str, float] = {}
 
     # ------------------------------------------------------------------ API
@@ -194,7 +234,7 @@ class EEController:
         """
         delta_pos = np.asarray(action[:3], dtype=np.float64) * self._step_m
 
-        # ---- 6-DOF pseudo-inverse IK for arm joints ----
+        # ---- 6-DOF damped-least-squares IK for arm joints ----
         self._jacp[:] = 0.0
         self._jacr[:] = 0.0
         mujoco.mj_jacSite(model, data, self._jacp, self._jacr, self._tcp_id)
@@ -203,23 +243,60 @@ class EEController:
         jacr_arm = self._jacr[:, self._arm_dof_adrs]  # (3, n_arm)
         J = np.vstack([jacp_arm, jacr_arm])  # (6, n_arm)
 
-        # Orientation error: world-frame angular velocity from current to target.
-        quat_cur = np.zeros(4, dtype=np.float64)
-        mujoco.mju_mat2Quat(quat_cur, data.site_xmat[self._tcp_id])
-        e_ori = np.zeros(3, dtype=np.float64)
-        mujoco.mju_subQuat(e_ori, self._quat_target, quat_cur)
+        # ---- Orientation error ----
+        if self._approach_axis is not None:
+            # Down-axis regulation: rotate the gripper approach axis toward the
+            # world target axis (e.g. straight down).  The cross product is a
+            # small-angle rotation vector that is identically zero for any roll
+            # about the approach axis, so wrist roll is left free — this is what
+            # keeps the wrist off its ±limits at near-singular poses.
+            site_mat = np.asarray(data.site_xmat[self._tcp_id]).reshape(3, 3)
+            a_cur = site_mat[:, self._approach_axis]
+            e_ori = np.cross(a_cur, self._ori_target_axis)
+        else:
+            # Full-orientation tracking of the captured target quaternion.
+            quat_cur = np.zeros(4, dtype=np.float64)
+            mujoco.mju_mat2Quat(quat_cur, data.site_xmat[self._tcp_id])
+            e_ori = np.zeros(3, dtype=np.float64)
+            mujoco.mju_subQuat(e_ori, self._quat_target, quat_cur)
 
         e = np.concatenate([delta_pos, self._ori_gain * e_ori])  # (6,)
 
-        # ---- Pseudo-inverse IK ----
-        # Full SVD: U (6,k), svs (k,), Vt (k,n_arm) where k = min(6, n_arm).
-        U, svs, Vt = np.linalg.svd(J, full_matrices=False)
-        self.last_diag["sigma_min"] = float(svs.min())
+        # ---- Damped-least-squares IK with adaptive damping ----
+        svs = np.linalg.svd(J, compute_uv=False)  # min(6, n_arm) values
+        sigma_min = float(svs.min())
+        self.last_diag["sigma_min"] = sigma_min
         self.last_diag["manip"] = float(np.prod(svs))
 
-        # Moore-Penrose: dq = V diag(1/s) U^T e, truncating near-zero modes.
-        inv = np.where(svs > _SV_EPS, 1.0 / svs, 0.0)
-        dq = Vt.T @ (inv * (U.T @ e))
+        # Nakamura adaptive damping: λ²_eff ramps from λ²_base toward
+        # λ²_base + λ²_max as sigma_min falls below sigma0.  Disabled when
+        # sigma0 == 0 (constant base damping only).
+        if self._sigma0 > 0.0 and sigma_min < self._sigma0:
+            t = 1.0 - (sigma_min / self._sigma0) ** 2
+            lam2 = self._lam2_base + t * self._lam2_max
+        else:
+            lam2 = self._lam2_base
+        self.last_diag["lam2_eff"] = lam2
+
+        # Single factorisation shared by the DLS solve and the nullspace
+        # projector: M = (J Jᵀ + λ²I)⁻¹.
+        M = np.linalg.solve(J @ J.T + lam2 * np.eye(6), np.eye(6))  # (6, 6)
+        dq = J.T @ (M @ e)  # (n_arm,)
+
+        # ---- Nullspace joint-limit avoidance ----
+        # Repel each joint from its hard limits, but only within the avoidance
+        # margin — the gradient is zero in the safe interior so it never resists
+        # normal reaching.  Projected through N = I - J⁺J it perturbs only the
+        # redundant DOF(s), keeping the wrist off its ±limits without changing
+        # the commanded task motion.
+        if self._null_gain > 0.0:
+            q_full = np.asarray(data.qpos)[self._arm_qpos_adrs]
+            lo_violation = np.maximum(self._jnt_lo + self._jnt_margin - q_full, 0.0)
+            hi_violation = np.minimum(self._jnt_hi - self._jnt_margin - q_full, 0.0)
+            grad = lo_violation + hi_violation  # inward push, zero in the interior
+            if np.any(grad):
+                N = np.eye(dq.shape[0]) - J.T @ (M @ J)
+                dq = dq + N @ (self._null_gain * grad)
 
         # dq clamp: scale uniformly so max|dq_i| ≤ max_joint_step.
         # Preserves the IK direction; turns blowups into bounded smooth steps.

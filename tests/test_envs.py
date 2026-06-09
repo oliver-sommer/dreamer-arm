@@ -252,20 +252,19 @@ def test_dr_flags_off_leave_model_arrays_unchanged() -> None:
 
 
 @pytest.mark.slow
-def test_yam_ee_controller_dq_bounded_near_singularity() -> None:
-    """Pseudo-inverse + dq clamp bound joint steps at a near-singular wrist pose.
+def test_yam_ee_controller_bounded_and_progressing_near_singularity() -> None:
+    """DLS IK stays bounded *and* keeps moving at a near-singular wrist pose.
 
     Drives joint5 to within 0.01 rad of its +π/2 wrist-singularity limit, then
-    applies 20 max-amplitude random actions.  Two assertions:
+    applies 20 max-amplitude random actions.  Asserts:
 
-    1. Without the clamp (max_joint_step=0), the pseudo-inverse solution blows
-       up and dq_max exceeds ``arm.max_joint_step`` — confirming the test
-       actually exercises the singularity.
-    2. With max_joint_step enabled (default YAM_ARM settings), every step
-       satisfies ``last_diag["dq_max"] ≤ max_joint_step``.
+    1. Damping keeps the solve well-posed: ``sigma_min`` of the DLS-solvable
+       system stays finite and ``dq`` never contains NaNs/Infs.
+    2. The step clamp holds: every step satisfies ``dq_max ≤ max_joint_step``.
+    3. No lock: the committed joint target changes across the rollout (the arm
+       does not freeze in place), which was the failure mode of the undamped
+       pseudo-inverse near this singularity.
     """
-    import dataclasses
-
     import mujoco
 
     from dreamer_arm.envs.arms import get_arm
@@ -277,40 +276,79 @@ def test_yam_ee_controller_dq_bounded_near_singularity() -> None:
 
     rng = np.random.default_rng(0)
     actions = rng.uniform(-1.0, 1.0, size=(20, 4))
-
     j5_idx = list(arm.arm_joint_names).index("joint5")
 
-    def _reset_near_singular(data: mujoco.MjData, ctrl: EEController) -> None:
-        key_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home"))
-        mujoco.mj_resetDataKeyframe(model, data, key_id)
-        # Place joint5 near its +π/2 upper limit — classic YAM wrist singularity.
-        data.qpos[ctrl._arm_qpos_adrs[j5_idx]] = np.pi / 2 - 0.01
-        mujoco.mj_forward(model, data)
-
-    # ---- Sanity check: unclamped controller blows up ----
-    arm_unclamped = dataclasses.replace(arm, max_joint_step=0.0)
-    ctrl_unclamped = EEController(arm_unclamped, model)
+    ctrl = EEController(arm, model)
     data = mujoco.MjData(model)
-    _reset_near_singular(data, ctrl_unclamped)
-    unclamped_peaks = []
-    for a in actions:
-        ctrl_unclamped.apply(a, model, data)
-        unclamped_peaks.append(ctrl_unclamped.last_diag["dq_max"])
-    assert max(unclamped_peaks) > arm.max_joint_step, (
-        "sanity-check failed: unclamped controller should exceed max_joint_step "
-        "near a wrist singularity (joint5 ≈ π/2)"
-    )
+    key_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home"))
+    mujoco.mj_resetDataKeyframe(model, data, key_id)
+    # Place joint5 near its +π/2 upper limit — classic YAM wrist singularity.
+    data.qpos[ctrl._arm_qpos_adrs[j5_idx]] = np.pi / 2 - 0.01
+    mujoco.mj_forward(model, data)
 
-    # ---- Clamped controller: every step must stay within max_joint_step ----
-    ctrl_clamped = EEController(arm, model)
-    _reset_near_singular(data, ctrl_clamped)
+    q_targets = []
     for i, a in enumerate(actions):
-        ctrl_clamped.apply(a, model, data)
-        dq_max = ctrl_clamped.last_diag["dq_max"]
+        ctrl.apply(a, model, data)
+        dq_max = ctrl.last_diag["dq_max"]
+        assert np.isfinite(dq_max), f"step {i}: non-finite dq near singularity"
         assert dq_max <= arm.max_joint_step + 1e-9, (
             f"step {i}: dq_max={dq_max:.4f} exceeded max_joint_step={arm.max_joint_step} "
-            f"(sigma_min={ctrl_clamped.last_diag['sigma_min']:.4f})"
+            f"(sigma_min={ctrl.last_diag['sigma_min']:.4f})"
         )
+        q_targets.append(np.array([data.ctrl[aid] for aid in ctrl._arm_act_ids]))
+        mujoco.mj_step(model, data)
+
+    # No lock: the commanded joint target must actually change over the rollout.
+    q_targets = np.array(q_targets)
+    assert np.ptp(q_targets, axis=0).max() > 1e-3, (
+        "arm appears locked near the wrist singularity (joint targets never moved)"
+    )
+
+
+@pytest.mark.slow
+def test_yam_mw_no_singularity_lock() -> None:
+    """A random rollout in the real MW env does not lock or saturate the wrist.
+
+    Reproduces the original failure (near-singular home + wrist pinned at ±π/2 →
+    self-collision back-off freezes the arm).  After the down-axis + DLS +
+    re-posed-home fix the arm should stay well-conditioned: very few stuck steps,
+    the wrist off its limits, and ``sigma_min`` above the near-singular alarm.
+    """
+    from dreamer_arm.envs.metaworld import MetaWorld
+
+    env = MetaWorld("reach", arm="yam", seed=0)
+    ctrl = env._env._yam_controller
+    qadr = ctrl._arm_qpos_adrs
+    j4 = list(ctrl._arm.arm_joint_names).index("joint4")
+    j5 = list(ctrl._arm.arm_joint_names).index("joint5")
+
+    env.reset()
+    rng = np.random.default_rng(0)
+    prev = ctrl.tcp_pos(env._env.data).astype(np.float64)
+    stuck = 0
+    wrist_sat = 0
+    sigma_mins = []
+    n = 200
+    for _ in range(n):
+        env.step(rng.uniform(-1.0, 1.0, size=(4,)).astype(np.float32))
+        cur = ctrl.tcp_pos(env._env.data).astype(np.float64)
+        if np.linalg.norm(cur - prev) < 1e-4:
+            stuck += 1
+        prev = cur
+        sigma_mins.append(ctrl.last_diag["sigma_min"])
+        q4 = env._env.data.qpos[qadr[j4]]
+        q5 = env._env.data.qpos[qadr[j5]]
+        if abs(q4) > np.pi / 2 - 0.05 or abs(q5) > np.pi / 2 - 0.05:
+            wrist_sat += 1
+    env.close()
+
+    sigma_mins = np.array(sigma_mins)
+    # Baselines before the fix were ~41/200 stuck and ~106/300 wrist-saturated.
+    assert stuck <= 0.05 * n, f"arm locked on {stuck}/{n} steps (expected ~0)"
+    assert wrist_sat <= 0.10 * n, f"wrist saturated on {wrist_sat}/{n} steps"
+    assert np.mean(sigma_mins < 0.03) <= 0.10, (
+        f"near-singular on {np.mean(sigma_mins < 0.03):.0%} of steps"
+    )
 
 
 # ---------------------------------------------------------------------------

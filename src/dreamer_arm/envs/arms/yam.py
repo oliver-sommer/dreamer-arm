@@ -34,4 +34,13 @@ YAM_ARM = Arm(
     gripper_open=0.041,
     ee_step_m=0.02,
     max_joint_step=0.3,
+    # Damped-least-squares IK: small base damping + Nakamura adaptive ramp that
+    # adds damping once sigma_min drops below 0.1 (near a singularity).
+    ik_damping=5e-3,
+    ik_damping_max=0.1,
+    ik_damping_sigma0=0.1,
+    # The grasp_site local x-axis points along the gripper approach direction
+    # (verified: dot(world -z)=0.93 at home).  Regulating it to straight-down
+    # while leaving wrist roll free keeps joint4/5 off their ±π/2 limits.
+    tcp_approach_axis=0,
 )

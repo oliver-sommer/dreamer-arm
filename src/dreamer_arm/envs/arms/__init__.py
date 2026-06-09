@@ -58,6 +58,25 @@ class Arm:
         Hard ceiling on |dq_i| per control step (rad).  The raw DLS solution
         is scaled uniformly so the largest component never exceeds this value.
         Set to 0.0 (default) to disable the clamp.
+    ik_damping:
+        Base damped-least-squares damping λ (rad·s).  Larger → more stable near
+        singularities but looser tracking.  Always applied.
+    ik_damping_max:
+        Extra damping λ added on top of ``ik_damping`` when the arm approaches a
+        singularity (Nakamura adaptive damping; ramps in as ``sigma_min`` falls
+        below ``ik_damping_sigma0``).
+    ik_damping_sigma0:
+        Singular-value threshold below which the adaptive damping ramps in.  Set
+        to 0.0 to disable adaptive damping (constant ``ik_damping`` only).
+    tcp_approach_axis:
+        Local axis index (0=x, 1=y, 2=z) of the TCP site that points along the
+        gripper's approach direction.  The controller regulates this axis to
+        ``ori_target_axis`` in world frame, leaving roll about it free — this
+        avoids pinning the wrist at its limits.  ``None`` disables down-axis
+        regulation (falls back to full-orientation tracking of ``tcp_target_quat``).
+    ori_target_axis:
+        World-frame unit vector the approach axis is driven toward (default
+        straight down, ``(0, 0, -1)`` = gripper-down).
     """
 
     name: str
@@ -72,12 +91,20 @@ class Arm:
     gripper_open: float
     ee_step_m: float = 0.02
     max_joint_step: float = 0.0
+    # Damped-least-squares IK damping (see field docstrings above).
+    ik_damping: float = 5e-3
+    ik_damping_max: float = 0.0
+    ik_damping_sigma0: float = 0.0
+    # Down-axis orientation regulation (see field docstrings above).
+    tcp_approach_axis: int | None = None
+    ori_target_axis: tuple[float, float, float] = (0.0, 0.0, -1.0)
     # Optional hook called by Manipulation._build_spec after loading the arm
     # scene but before task bodies are spliced in.  Use this to patch the raw
     # vendor assets at load time (e.g. attach a gripper to a bare arm model).
     patch_spec: Callable[[Any], None] | None = field(default=None, compare=False, hash=False)
     # Optional fixed TCP target orientation (w, x, y, z).  None → capture from
-    # the arm's 'home' keyframe at controller construction time.
+    # the arm's 'home' keyframe at controller construction time.  Only used when
+    # tcp_approach_axis is None (full-orientation fallback).
     tcp_target_quat: tuple[float, float, float, float] | None = None
 
 

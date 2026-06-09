@@ -63,6 +63,15 @@ ObsDict = dict[str, np.ndarray]
 # the _apply_action hook handles the frame_skip loop.
 _YAM_MW_EE_STEP_M = 0.01
 
+# Well-conditioned arm home for the MW-spliced YAM model (joint1..joint6).
+# The model's default home (joints 2,3 = 1.047) sits at a wrist singularity
+# (sigma_min ≈ 0.044) precisely in the y-reach direction, which locked the arm.
+# Resetting joints 2,3 to ≈2.0/1.9 raises sigma_min to ≈0.13 (≈3x farther from
+# the singularity) while keeping the TCP over the table.  Applied by overwriting
+# the arm-joint entries of init_qpos (the model's joint `ref` only relabels qpos
+# and cannot move the home geometry, so it is left untouched).
+_YAM_MW_HOME_QPOS = (0.0, 2.0, 1.9, 0.0, 0.0, 0.0)
+
 # ---------------------------------------------------------------------------
 # Scene domain-randomization constants
 # ---------------------------------------------------------------------------
@@ -514,12 +523,13 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         """Wire the YAM EEController into the Meta-World env via hook injection.
 
         Steps:
-        1. Forward kinematics at the default qpos to capture the TCP orientation
-           (gripper-down) as the IK target.
-        2. Build an EEController with this orientation locked in.
-        3. Inject _external_actuation: loops frame_skip IK steps per outer step,
+        1. Build an EEController in down-axis orientation mode (YAM_ARM sets
+           tcp_approach_axis=0): the gripper's local x-axis is regulated to
+           straight-down each step while wrist roll stays free, which keeps the
+           wrist off its ±π/2 limits that previously locked the arm.
+        2. Inject _external_actuation: loops frame_skip IK steps per outer step,
            negating the gripper channel (MW convention: +1=close; EE: +1=open).
-        4. Inject _external_reset_hand: resets arm to init_qpos, syncs ctrl,
+        3. Inject _external_reset_hand: resets arm to init_qpos, syncs ctrl,
            settles physics, and sets init_tcp.
         """
         import mujoco as _mj
@@ -527,39 +537,28 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         from dreamer_arm.envs.arms.yam import YAM_ARM
         from dreamer_arm.envs.control import EEController
 
-        # Capture the gripper-down TCP orientation from the default state.
-        # The XML sets joint2.ref=1.047 and joint3.ref=1.047, so after
-        # mj_resetData the arm is already in home (gripper-down) pose.
-        scratch = _mj.MjData(env.model)
-        _mj.mj_resetData(env.model, scratch)
-        _mj.mj_forward(env.model, scratch)
         tcp_id = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_SITE, "grasp_site")
         if tcp_id < 0:
             raise RuntimeError(
                 "grasp_site not found in YAM Meta-World model.  "
                 "Check that yam_xyz_base.xml is included correctly."
             )
-        quat_down = np.zeros(4, dtype=np.float64)
-        _mj.mju_mat2Quat(quat_down, scratch.site_xmat[tcp_id])
 
-        # Build YAM_ARM variant with MW-specific settings:
-        #   - tcp_target_quat: the gripper-down orientation captured above
-        #   - ee_step_m: scaled to match MW's action_scale/frame_skip
-        yam_arm_mw = dataclasses.replace(
-            YAM_ARM,
-            tcp_target_quat=(
-                float(quat_down[0]),
-                float(quat_down[1]),
-                float(quat_down[2]),
-                float(quat_down[3]),
-            ),
-            ee_step_m=_YAM_MW_EE_STEP_M,
-        )
+        # Build YAM_ARM variant with MW-specific settings.  Orientation is handled
+        # by down-axis regulation (YAM_ARM.tcp_approach_axis), so no fixed target
+        # quaternion is needed; only ee_step_m is scaled to MW's action_scale.
+        yam_arm_mw = dataclasses.replace(YAM_ARM, ee_step_m=_YAM_MW_EE_STEP_M)
         controller = EEController(yam_arm_mw, env.model)
-        # Reduce orientation gain for MW: position tracking matters more than
-        # holding the exact home orientation.  A small gain still prevents wrist
-        # drift without fighting the IK's position component.
-        controller._ori_gain = 0.1
+        # Orientation gain for the down-axis error (gentler than full-quat
+        # tracking): enough to hold the gripper within ~0.1° of vertical during
+        # motion without fighting the IK's position component.
+        controller._ori_gain = 0.3
+
+        # Re-pose the arm home to a well-conditioned configuration (see
+        # _YAM_MW_HOME_QPOS).  init_qpos is what _reset_hand restores each reset;
+        # we only touch the 6 arm-joint entries, leaving object/finger DOFs intact.
+        for adr, q in zip(controller._arm_qpos_adrs, _YAM_MW_HOME_QPOS, strict=True):
+            env.init_qpos[adr] = q
 
         frame_skip: int = int(env.frame_skip)
 
