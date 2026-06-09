@@ -107,6 +107,8 @@ class WandbLogger:
         self._last_step: int | None = None
         self._last_time: float | None = None
         self._max_logged_step: int | None = None
+        self._last_log_time: float = time.time()
+        self._keepalive_secs: float = 60.0
 
     # --------------------------------------------------------------- buffering
 
@@ -148,12 +150,24 @@ class WandbLogger:
             payload[name] = wandb.Image(arr)
         for name, arr in self._histograms.items():
             payload[name] = wandb.Histogram(arr.tolist())
+        now = time.time()
         if payload:
             wandb.log(payload, step=step)
+            self._last_log_time = now
+        elif now - self._last_log_time >= self._keepalive_secs:
+            wandb.log({}, step=step)
+            self._last_log_time = now
         self._scalars.clear()
         self._videos.clear()
         self._images.clear()
         self._histograms.clear()
+
+    def keepalive(self, step: int) -> None:
+        """Send an empty wandb.log if no log has been sent recently."""
+        now = time.time()
+        if now - self._last_log_time >= self._keepalive_secs:
+            wandb.log({}, step=step)
+            self._last_log_time = now
 
     def finish(self) -> None:
         if self._run is not None:

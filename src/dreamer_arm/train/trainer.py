@@ -213,6 +213,7 @@ class OnlineTrainer:
                         metric_sums[name] = metric_sums.get(name, 0.0) + v
                 update_count += update_num
                 window_updates += update_num
+                self.logger.keepalive(step)
 
                 if window_updates > 0 and self._should_log(step):
                     for name, total in metric_sums.items():
