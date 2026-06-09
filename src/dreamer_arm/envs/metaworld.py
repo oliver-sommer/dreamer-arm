@@ -63,14 +63,11 @@ ObsDict = dict[str, np.ndarray]
 # the _apply_action hook handles the frame_skip loop.
 _YAM_MW_EE_STEP_M = 0.01
 
-# Well-conditioned arm home for the MW-spliced YAM model (joint1..joint6).
-# The model's default home (joints 2,3 = 1.047) sits at a wrist singularity
-# (sigma_min ≈ 0.044) precisely in the y-reach direction, which locked the arm.
-# Resetting joints 2,3 to ≈2.0/1.9 raises sigma_min to ≈0.13 (≈3x farther from
-# the singularity) while keeping the TCP over the table.  Applied by overwriting
-# the arm-joint entries of init_qpos (the model's joint `ref` only relabels qpos
-# and cannot move the home geometry, so it is left untouched).
-_YAM_MW_HOME_QPOS = (0.0, 2.0, 1.9, 0.0, 0.0, 0.0)
+# Arm home for the MW-spliced YAM model (joint1..joint6).
+# j2=2.2, j3=1.7 → TCP ≈ (0, 0.601, 0.174): sigma_min ≈ 0.15 (singularity-free),
+# z=0.174 is at the center of the reach goal range [0.05, 0.30], and the arm
+# stays well clear of all joint limits throughout the workspace.
+_YAM_MW_HOME_QPOS = (0.0, 2.2, 1.7, 0.0, 0.0, 0.0)
 
 # ---------------------------------------------------------------------------
 # Scene domain-randomization constants
