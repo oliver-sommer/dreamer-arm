@@ -98,6 +98,14 @@ class Arm:
     # Down-axis orientation regulation (see field docstrings above).
     tcp_approach_axis: int | None = None
     ori_target_axis: tuple[float, float, float] = (0.0, 0.0, -1.0)
+    # Optional world-frame TCP workspace box ``((xlo, ylo, zlo), (xhi, yhi, zhi))``.
+    # When set, the controller clamps the commanded EE *target* into this box each
+    # step (outward motion at a face is zeroed, inward motion is free).  This keeps
+    # the policy from driving the TCP below the table, behind the base, or out
+    # past the reachable workspace into the retract-fold singularity — without a
+    # base re-mount (an empirical base sweep showed moving the mount only shrinks
+    # forward reach).  ``None`` disables the clamp.
+    workspace_box: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
     # Optional hook called by Manipulation._build_spec after loading the arm
     # scene but before task bodies are spliced in.  Use this to patch the raw
     # vendor assets at load time (e.g. attach a gripper to a bare arm model).

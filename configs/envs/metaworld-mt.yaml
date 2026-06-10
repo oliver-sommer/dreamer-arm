@@ -39,10 +39,11 @@ camera_pose_randomize: true     # per-episode scene-camera viewpoint (hemisphere
 viewer: false
 
 encoder:
-  # Vision + one-hot task conditioning only.  The 39-dim proprioceptive `state`
-  # is intentionally excluded (it bundles privileged object/goal coords).
-  mlp_keys: "task_id"
+  # Vision + one-hot task conditioning + non-privileged proprioception
+  # (joint angles, gripper opening, TCP xyz).  The 39-dim `state` stays
+  # excluded — it bundles privileged object/goal coords.
+  mlp_keys: "proprio|task_id"
   cnn_keys: "scene|wrist_image"
 decoder:
-  mlp_keys: "task_id"
+  mlp_keys: "proprio|task_id"
   cnn_keys: "scene|wrist_image"

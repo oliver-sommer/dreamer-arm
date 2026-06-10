@@ -69,6 +69,13 @@ _YAM_MW_EE_STEP_M = 0.01
 # stays well clear of all joint limits throughout the workspace.
 _YAM_MW_HOME_QPOS = (0.0, 2.2, 1.7, 0.0, 0.0, 0.0)
 
+# World-frame TCP workspace box for the MW YAM arm ((xlo,ylo,zlo),(xhi,yhi,zhi)).
+# y floor 0.35 keeps the TCP in front of the base (mount at y=0.23) and clear of
+# the retract-fold swing-around to negative y, while still admitting door-open's
+# pull targets (y≈0.41).  z floor 0.02 keeps it above the table; the x/upper
+# bounds bracket the MT object+goal spawn ranges (objects y≤0.95, |x|≤0.5).
+_YAM_MW_WORKSPACE_BOX = ((-0.55, 0.35, 0.02), (0.55, 1.0, 0.6))
+
 # ---------------------------------------------------------------------------
 # Scene domain-randomization constants
 # ---------------------------------------------------------------------------
@@ -260,6 +267,16 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._viewer_requested = viewer
         self._passive_viewer: _viewer_mod.Handle | None = None
 
+        # Per-episode EEController diagnostics (YAM only).  Aggregated in
+        # step(), reset in reset(), and attached to info as "ctrl_diag" so the
+        # trainer can log the episode aggregate from final_info.
+        self._diag_n: int = 0
+        self._diag_sigma_sum: float = 0.0
+        self._diag_sigma_min: float = float("inf")
+        self._diag_near_singular: int = 0
+        self._diag_clip: int = 0
+        self._diag_backoff: int = 0
+
         # Wire in the YAM IK controller via the fork's injectable hooks.
         if arm == "yam":
             self._setup_yam_control(env)
@@ -311,6 +328,12 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         }
         if self._wrist_camera_id is not None:
             obs_spaces["wrist_image"] = gym.spaces.Box(0, 255, (*size, 3), dtype=np.uint8)
+        if arm == "yam":
+            # Non-privileged proprioception: 6 arm joint angles + gripper
+            # opening + TCP xyz.  Everything here is available from the real
+            # robot's encoders / forward kinematics — unlike `state`, which
+            # bundles privileged object and goal coordinates.
+            obs_spaces["proprio"] = gym.spaces.Box(-np.inf, np.inf, (10,), dtype=np.float32)
         if self._task_onehot is not None:
             obs_spaces["task_id"] = gym.spaces.Box(
                 0.0, 1.0, (self._task_onehot.shape[0],), dtype=np.float32
@@ -544,7 +567,9 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         # Build YAM_ARM variant with MW-specific settings.  Orientation is handled
         # by down-axis regulation (YAM_ARM.tcp_approach_axis), so no fixed target
         # quaternion is needed; only ee_step_m is scaled to MW's action_scale.
-        yam_arm_mw = dataclasses.replace(YAM_ARM, ee_step_m=_YAM_MW_EE_STEP_M)
+        yam_arm_mw = dataclasses.replace(
+            YAM_ARM, ee_step_m=_YAM_MW_EE_STEP_M, workspace_box=_YAM_MW_WORKSPACE_BOX
+        )
         controller = EEController(yam_arm_mw, env.model)
         # Orientation gain for the down-axis error (gentler than full-quat
         # tracking): enough to hold the gripper within ~0.1° of vertical during
@@ -558,28 +583,22 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             env.init_qpos[adr] = q
 
         frame_skip: int = int(env.frame_skip)
-
-        # Gripper joint qpos/dof addresses.
-        # left_finger is the actuated joint; right_finger mirrors it via equality
-        # (polycoef "0 -1 0 0 0" → right = -left).  Both must be kinematically
-        # anchored every substep so the equality constraint doesn't generate
-        # large corrective impulses during mj_step.
-        gripper_jid = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_JOINT, "left_finger")
-        _gripper_qpos_adr = int(env.model.jnt_qposadr[gripper_jid])
-        _gripper_dof_adr = int(env.model.jnt_dofadr[gripper_jid])
-        right_jid = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_JOINT, "right_finger")
-        _right_qpos_adr = int(env.model.jnt_qposadr[right_jid])
-        _right_dof_adr = int(env.model.jnt_dofadr[right_jid])
+        timestep: float = float(env.model.opt.timestep)
 
         def _apply_action(mw_env: Any, action: np.ndarray) -> None:
-            """IK-based actuation matching Sawyer's mocap-weld semantics.
+            """IK-based actuation with velocity-consistent kinematic anchoring.
 
-            Sawyer's mocap weld re-anchors the hand body every physics step.
-            We replicate this by:
-              1. Computing IK once to get new joint position targets.
-              2. Re-anchoring arm qpos + zeroing arm velocities every substep.
-            This ensures the arm holds its new pose against gravity throughout
-            the frame_skip window while object physics runs normally.
+            The arm joints are played back kinematically toward the IK target —
+            qpos interpolated across the frame_skip window with the *matching*
+            qvel — so tracking stays exact while contacts see real joint
+            velocities.  (A qpos teleport with qvel=0 moves the arm outside the
+            dynamics: friction can then never transport a grasped object, which
+            made lifting impossible.)
+
+            The fingers are NOT anchored: the gripper position actuator drives
+            left_finger and the equality constraint mirrors right_finger, so
+            closing on an object is compliant and produces a physical pinch
+            instead of teleporting through it.
             Gripper sign negated: MW +1=close, EEController +1=open.
             """
             action_ee = np.array(action, dtype=np.float64)
@@ -589,25 +608,23 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             controller.apply(action_ee, mw_env.model, mw_env.data)
 
             # Cache targets (read once; don't re-run IK per substep).
-            q_arm = [float(mw_env.data.ctrl[aid]) for aid in controller._arm_act_ids]
-            g_ctrl = float(mw_env.data.ctrl[controller._gripper_act_id])
+            q_tgt = np.array([mw_env.data.ctrl[aid] for aid in controller._arm_act_ids])
+            q_start = np.array([mw_env.data.qpos[adr] for adr in controller._arm_qpos_adrs])
+            dq_sub = (q_tgt - q_start) / frame_skip
+            qvel_sub = dq_sub / timestep
 
-            for _ in range(frame_skip):
-                # Re-anchor arm kinematically (equivalent to mocap weld).
-                for qpos_adr, dof_adr, q in zip(
-                    controller._arm_qpos_adrs, controller._arm_dof_adrs, q_arm, strict=True
+            for i in range(frame_skip):
+                # Pin the interval *start* (q_start + i*dq) with the matching
+                # velocity; mj_step's integration then lands exactly on the
+                # interval end, so the window finishes precisely at q_tgt.
+                q_i = q_start + i * dq_sub
+                for k, (qpos_adr, dof_adr) in enumerate(
+                    zip(controller._arm_qpos_adrs, controller._arm_dof_adrs, strict=True)
                 ):
-                    mw_env.data.qpos[qpos_adr] = q
-                    mw_env.data.qvel[dof_adr] = 0.0
-                mw_env.data.qpos[_gripper_qpos_adr] = g_ctrl
-                mw_env.data.qvel[_gripper_dof_adr] = 0.0
-                mw_env.data.qpos[_right_qpos_adr] = -g_ctrl  # equality: right = -left
-                mw_env.data.qvel[_right_dof_adr] = 0.0
-                # Keep ctrl in sync so position actuators generate zero force
-                # (arm is held kinematically; only object physics matters).
-                for aid, q in zip(controller._arm_act_ids, q_arm, strict=True):
-                    mw_env.data.ctrl[aid] = q
-                mw_env.data.ctrl[controller._gripper_act_id] = g_ctrl
+                    mw_env.data.qpos[qpos_adr] = q_i[k]
+                    mw_env.data.qvel[dof_adr] = qvel_sub[k]
+                for k, aid in enumerate(controller._arm_act_ids):
+                    mw_env.data.ctrl[aid] = q_tgt[k]
                 _mj.mj_step(mw_env.model, mw_env.data)
 
         def _reset_hand(mw_env: Any, steps: int = 50) -> None:
@@ -644,13 +661,43 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             if self._fisheye_map is not None:
                 wrist = _apply_fisheye(wrist, self._fisheye_map)
             obs["wrist_image"] = wrist
+        if self._arm == "yam":
+            ctrl = self._env._yam_controller
+            data = self._env.data
+            joints = [float(data.qpos[adr]) for adr in ctrl._arm_qpos_adrs]
+            obs["proprio"] = np.array(
+                [*joints, ctrl.gripper_opening(data), *ctrl.tcp_pos(data)],
+                dtype=np.float32,
+            )
         if self._task_onehot is not None:
             obs["task_id"] = self._task_onehot
         return obs
 
     def _info(self, **extra: Any) -> dict[str, Any]:
         """Step/reset info, tagged with the task name for per-task logging."""
-        return {"task": self._name, **extra}
+        info: dict[str, Any] = {"task": self._name, **extra}
+        if self._arm == "yam" and self._diag_n > 0:
+            info["ctrl_diag"] = {
+                "sigma_min_mean": self._diag_sigma_sum / self._diag_n,
+                "sigma_min_min": self._diag_sigma_min,
+                "frac_near_singular": self._diag_near_singular / self._diag_n,
+                "frac_clip_active": self._diag_clip / self._diag_n,
+                "frac_backoff": self._diag_backoff / self._diag_n,
+            }
+        return info
+
+    def _accumulate_ctrl_diag(self) -> None:
+        """Fold the controller's per-step diagnostics into episode aggregates."""
+        diag = self._env._yam_controller.last_diag
+        if not diag:
+            return
+        sigma = float(diag["sigma_min"])
+        self._diag_n += 1
+        self._diag_sigma_sum += sigma
+        self._diag_sigma_min = min(self._diag_sigma_min, sigma)
+        self._diag_near_singular += int(sigma < 0.03)
+        self._diag_clip += int(diag.get("clip_active", 0.0) > 0.0)
+        self._diag_backoff += int(diag.get("backoff_alpha", 1.0) < 1.0)
 
     def reset(
         self,
@@ -666,6 +713,12 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             self._env.set_task(mt1.train_tasks[0])
 
         self._success = False
+        self._diag_n = 0
+        self._diag_sigma_sum = 0.0
+        self._diag_sigma_min = float("inf")
+        self._diag_near_singular = 0
+        self._diag_clip = 0
+        self._diag_backoff = 0
 
         # Camera randomization: full hemisphere pose OR small position jitter.
         if self._camera_pose_randomize:
@@ -700,6 +753,8 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         for _ in range(self._action_repeat):
             state, reward, terminated, truncated, info = self._env.step(action)
             total_reward += float(reward)
+            if self._arm == "yam":
+                self._accumulate_ctrl_diag()
             if info.get("success", False):
                 self._success = True
             if terminated or truncated:

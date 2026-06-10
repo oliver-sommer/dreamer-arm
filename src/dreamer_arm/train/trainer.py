@@ -190,6 +190,11 @@ class OnlineTrainer:
                 if task is not None:
                     self.logger.scalar(f"episode/success/{task}", success)
                     self.logger.scalar(f"episode/score/{task}", float(returns[i]))
+                # EEController episode diagnostics (YAM arm only): the env
+                # attaches running episode aggregates each step, so the
+                # final_info values cover the whole episode.
+                for diag_name, diag_val in fin.get("ctrl_diag", {}).items():
+                    self.logger.scalar(f"episode/ctrl_{diag_name}", float(diag_val))
                 self.logger.write(step + i)
                 returns[i] = 0.0
                 lengths[i] = 0

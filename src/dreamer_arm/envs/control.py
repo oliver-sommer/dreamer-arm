@@ -17,6 +17,10 @@ Given action ``a ∈ [-1, 1]^4``:
    gripper approach axis toward ``ori_target_axis`` (e.g. straight down) while
    leaving roll about that axis free, so the wrist is never pinned at its limits.
    Otherwise it is the quaternion error to a fixed captured target orientation.
+   The gained error is clamped to ``max(|Δp|, 0.3 * ee_step_m)`` so an
+   *unachievable* orientation (e.g. wrist at its limit) can never outweigh the
+   commanded translation in the DLS objective — without the clamp the solver
+   sacrifices position to chase orientation, dragging the TCP metres off target.
 3. Build the 6xn TCP site Jacobian (translational + rotational rows) via
    ``mujoco.mj_jacSite``, restricted to the arm's DOFs.
 4. Damped-least-squares solve on the stacked 6-D error, with Nakamura adaptive
@@ -193,6 +197,15 @@ class EEController:
         self._g_lo = float(arm.gripper_closed)
         self._g_hi = float(arm.gripper_open)
 
+        # World-frame TCP workspace box (optional).  Outward motion at a face is
+        # zeroed so the policy cannot push the TCP below the table, behind the
+        # base, or out past the reachable workspace into the retract-fold.
+        self._ws_lo: np.ndarray | None = None
+        self._ws_hi: np.ndarray | None = None
+        if arm.workspace_box is not None:
+            self._ws_lo = np.array(arm.workspace_box[0], dtype=np.float64)
+            self._ws_hi = np.array(arm.workspace_box[1], dtype=np.float64)
+
         # ---- Self-collision gate ----
         # Scratch MjData used for collision queries (never stepped; only used
         # with mj_forward to probe whether a candidate q causes arm link
@@ -234,6 +247,16 @@ class EEController:
         """
         delta_pos = np.asarray(action[:3], dtype=np.float64) * self._step_m
 
+        # ---- Workspace-box clamp ----
+        # Clamp the commanded TCP *target* (current pos + delta) into the box, then
+        # back out the allowed delta.  Outward motion at a face becomes zero while
+        # inward motion is untouched, so the policy can ride the boundary but never
+        # cross it (no below-table, behind-base, or over-reach into the fold).
+        if self._ws_lo is not None:
+            tcp_now = np.asarray(data.site_xpos[self._tcp_id], dtype=np.float64)
+            target = np.clip(tcp_now + delta_pos, self._ws_lo, self._ws_hi)
+            delta_pos = target - tcp_now
+
         # ---- 6-DOF damped-least-squares IK for arm joints ----
         self._jacp[:] = 0.0
         self._jacr[:] = 0.0
@@ -260,7 +283,17 @@ class EEController:
             e_ori = np.zeros(3, dtype=np.float64)
             mujoco.mju_subQuat(e_ori, self._quat_target, quat_cur)
 
-        e = np.concatenate([delta_pos, self._ori_gain * e_ori])  # (6,)
+        # Clamp the gained orientation term relative to the commanded step so an
+        # unachievable orientation can never dominate the stacked error: position
+        # tracking always wins, orientation regulates within that budget.  The
+        # floor (0.3 * ee_step) keeps regulation alive for near-zero commands.
+        e_ori_term = self._ori_gain * e_ori
+        ori_cap = max(float(np.linalg.norm(delta_pos)), 0.3 * self._step_m)
+        ori_norm = float(np.linalg.norm(e_ori_term))
+        if ori_norm > ori_cap:
+            e_ori_term *= ori_cap / ori_norm
+
+        e = np.concatenate([delta_pos, e_ori_term])  # (6,)
 
         # ---- Damped-least-squares IK with adaptive damping ----
         svs = np.linalg.svd(J, compute_uv=False)  # min(6, n_arm) values

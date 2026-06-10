@@ -35,8 +35,11 @@ camera_pose_randomize: true     # per-episode scene-camera viewpoint (hemisphere
 viewer: false
 
 encoder:
-  mlp_keys: "$^"  # vision-only; no proprioceptive MLP stream
+  # `proprio` carries only non-privileged signals (joint angles, gripper
+  # opening, TCP xyz — all available on the real robot).  The privileged
+  # 39-dim `state` (object/goal coords) stays excluded.
+  mlp_keys: "proprio"
   cnn_keys: "scene|wrist_image"
 decoder:
-  mlp_keys: "$^"
+  mlp_keys: "proprio"
   cnn_keys: "scene|wrist_image"
