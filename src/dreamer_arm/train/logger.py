@@ -7,12 +7,20 @@ flush them in one ``wandb.log`` call.
 
 Pass ``mode="disabled"`` (or set it in the config) to suppress W&B for CI /
 local dry-runs.
+
+Pass ``mode="offline"`` on hosts with unreliable egress: the logger then
+uploads the run itself via periodic ``wandb sync --append`` from a background
+thread (every ``sync_interval`` seconds, plus a final sync on ``finish``),
+which survives network failures that permanently kill wandb's online stream.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -86,6 +94,7 @@ class WandbLogger:
         mode: str | None = None,
         logdir: str | Path | None = None,
         video_fps: int = 16,
+        sync_interval: float = 600.0,
     ) -> None:
         if mode is None:
             mode = "online"
@@ -109,6 +118,21 @@ class WandbLogger:
         self._max_logged_step: int | None = None
         self._last_log_time: float = time.time()
         self._keepalive_secs: float = 60.0
+
+        # Offline mode + periodic `wandb sync --append` is the robust setup for
+        # hosts with unreliable egress (e.g. vast.ai, whose proxy intermittently
+        # MITMs TLS to api.wandb.ai; wandb-core treats certificate errors as
+        # non-retryable and kills the online filestream *permanently*, leaving
+        # the run "crashed" on the website while training continues).  Each
+        # sync is a fresh subprocess, so a transient failure only delays the
+        # upload by one interval instead of ending it.
+        self._sync_stop = threading.Event()
+        self._sync_thread: threading.Thread | None = None
+        if mode == "offline" and sync_interval > 0:
+            self._sync_thread = threading.Thread(
+                target=self._sync_loop, args=(float(sync_interval),), daemon=True
+            )
+            self._sync_thread.start()
 
     # --------------------------------------------------------------- buffering
 
@@ -171,10 +195,40 @@ class WandbLogger:
 
     def finish(self) -> None:
         if self._run is not None:
+            sync_dir = str(self._run.settings.sync_dir)
+            had_syncer = self._sync_thread is not None
+            if self._sync_thread is not None:
+                self._sync_stop.set()
+                self._sync_thread.join(timeout=5.0)
+                self._sync_thread = None
             self._run.finish()
             self._run = None  # type: ignore[assignment]
+            if had_syncer:
+                # Final sync after finish() so the run's end state is uploaded.
+                self._sync_once(sync_dir)
 
     # --------------------------------------------------------------- internals
+
+    def _sync_loop(self, interval: float) -> None:
+        sync_dir = str(self._run.settings.sync_dir)
+        while not self._sync_stop.wait(interval):
+            self._sync_once(sync_dir)
+
+    @staticmethod
+    def _sync_once(sync_dir: str) -> None:
+        """Upload the offline run directory; failures are logged, never raised."""
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "wandb", "sync", "--append", sync_dir],
+                capture_output=True,
+                text=True,
+                timeout=1800,
+            )
+            if result.returncode != 0:
+                tail = (result.stderr or result.stdout).strip().splitlines()[-1:]
+                print(f"wandb sync failed (will retry): {' '.join(tail)}", flush=True)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"wandb sync failed (will retry): {exc}", flush=True)
 
     def _encode_video(self, arr: np.ndarray) -> wandb.Video:
         """Encode (T, C, H, W) uint8 video via imageio-ffmpeg, then hand wandb a path.

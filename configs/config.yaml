@@ -24,7 +24,12 @@ logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
 wandb:
   project: dreamer-arm
   entity: null
+  # Use mode=offline on hosts with unreliable egress (e.g. vast.ai): a TLS
+  # hiccup permanently kills wandb's online stream (run shows "crashed" while
+  # training continues).  In offline mode the logger uploads the run itself
+  # via `wandb sync --append` every sync_interval seconds (0 disables).
   mode: online
+  sync_interval: 600
   tags: []
   name: null
 
@@ -41,7 +46,12 @@ buffer:
 trainer:
   steps: ${envs.steps}
   pretrain: 0
-  eval_every: 5000
+  # Eval is expensive with shared train/eval envs: each eval steps the envs
+  # for a full episode (time_limit/action_repeat × env_num global steps —
+  # 25000 for MT50), so eval_every must be several times that or most env
+  # compute goes to eval.  The trainer additionally defers shared-env eval to
+  # episode boundaries so training episodes are never truncated.
+  eval_every: 50000
   eval_episode_num: ${envs.eval_episode_num}
   batch_size: ${batch_size}
   batch_length: ${batch_length}

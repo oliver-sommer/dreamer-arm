@@ -116,6 +116,7 @@ def run(cfg: DictConfig) -> None:
         tags=list(cfg.wandb.tags) if cfg.wandb.tags else None,
         mode=cfg.wandb.mode,
         logdir=str(cfg.logdir),
+        sync_interval=float(cfg.wandb.get("sync_interval", 600.0)),
     )
 
     trainer_cfg = TrainerConfig(

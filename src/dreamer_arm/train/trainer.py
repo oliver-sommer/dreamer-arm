@@ -124,13 +124,26 @@ class OnlineTrainer:
         # multi-episode windows; the RSSM resets internally on is_first.
         episode_ids = torch.arange(n, dtype=torch.int32, device=device)
 
+        # Shared-env eval may only run at episode boundaries: eval resets the
+        # envs, so a mid-episode eval would truncate every training episode
+        # (with MT50 at eval_every=5000 that cut episodes at 50/250 steps, so
+        # the buffer never contained late-episode states and episode-end
+        # metrics never fired).  ``eval_due`` latches the Every trigger until
+        # the boundary; envs stay in lockstep because they reset together and
+        # Meta-World episodes only end by truncation at the shared time limit.
+        eval_due = False
+        episode_boundary = True  # fresh reset above
+
         while step < self.config.steps:
             # ---- eval ----
+            eval_due = bool(self._should_eval(step)) or eval_due
             if (
-                self._should_eval(step)
+                eval_due
                 and self.config.eval_episode_num > 0
                 and self.eval_envs is not None
+                and (self.eval_envs is not self.train_envs or episode_boundary)
             ):
+                eval_due = False
                 self.eval(agent, step)
                 if self.eval_envs is self.train_envs:
                     # eval reset the shared envs; resync training state so the
@@ -149,6 +162,7 @@ class OnlineTrainer:
 
             next_obs_np, reward_np, terminated_np, truncated_np, infos = envs.step(act_np)
             done_np = terminated_np | truncated_np
+            episode_boundary = bool(done_np.all())
 
             # ---- record + push to buffer ----
             reward_t = torch.from_numpy(reward_np.astype(np.float32)).to(device)
