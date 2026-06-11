@@ -234,6 +234,14 @@ class Dreamer(nn.Module):
         feat = self._frozen_rssm.get_feat(stoch, deter)
         action_dist = self._frozen_actor(feat)
         action = action_dist.mode if eval_mode else action_dist.rsample()
+        if not self.act_discrete:
+            # bounded_normal bounds only the *mean* (tanh); samples are
+            # unbounded and reached ±4 in practice — 4x the EE controller's
+            # design velocity, 16x the jerk-penalty calibration, and a
+            # train/eval action-distribution mismatch.  Clamp here so the env,
+            # the replay buffer, and the RSSM's prev_action all condition on
+            # the same executed action.
+            action = action.clamp(-1.0, 1.0)
         return action, TensorDict(
             {"stoch": stoch, "deter": deter, "prev_action": action},
             batch_size=state.batch_size,

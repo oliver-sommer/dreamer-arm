@@ -106,6 +106,13 @@ class Arm:
     # base re-mount (an empirical base sweep showed moving the mount only shrinks
     # forward reach).  ``None`` disables the clamp.
     workspace_box: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
+    # Optional world-frame TCP reach sphere ``((cx, cy, cz), radius)``, applied
+    # after the workspace box.  Sized slightly inside the arm's full extension
+    # (the singular straight-arm pose), it stops the policy from chasing
+    # kinematically unreachable targets: without it the IK pulls the arm into
+    # the extension singularity where damping/backoff freeze all motion.
+    # ``None`` disables the clamp.
+    reach_sphere: tuple[tuple[float, float, float], float] | None = None
     # Optional hook called by Manipulation._build_spec after loading the arm
     # scene but before task bodies are spliced in.  Use this to patch the raw
     # vendor assets at load time (e.g. attach a gripper to a bare arm model).

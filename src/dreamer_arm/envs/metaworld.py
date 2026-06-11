@@ -74,7 +74,20 @@ _YAM_MW_HOME_QPOS = (0.0, 2.2, 1.7, 0.0, 0.0, 0.0)
 # the retract-fold swing-around to negative y, while still admitting door-open's
 # pull targets (y≈0.41).  z floor 0.02 keeps it above the table; the x/upper
 # bounds bracket the MT object+goal spawn ranges (objects y≤0.95, |x|≤0.5).
-_YAM_MW_WORKSPACE_BOX = ((-0.55, 0.35, 0.02), (0.55, 1.0, 0.6))
+# z ceiling 0.45 clears every MW object/goal (goals z≤0.30) while excluding the
+# near-vertical "candle" fold above the base that froze the arm at the old 0.6
+# ceiling (constant (0,-1,+1) commands parked the TCP at the (0.35, 0.6) corner
+# with sigma_min≈0.03 and zero motion).
+_YAM_MW_WORKSPACE_BOX = ((-0.55, 0.35, 0.02), (0.55, 1.0, 0.45))
+
+# World-frame TCP reach sphere ((cx,cy,cz), radius) for the MW YAM arm.
+# Center = link_2 (shoulder) origin at home, measured from the model.  Max
+# ||tcp - shoulder|| over the j2/j3 range grid is 0.743 m — the singular
+# straight-arm pose; radius 0.70 (~6% inside) keeps commanded targets off the
+# extension singularity that the box alone admits (its far corner sits 1.05 m
+# from the shoulder, 40% beyond physical reach, so the IK chased unreachable
+# targets until damping/backoff froze the arm).
+_YAM_MW_REACH_SPHERE = ((0.0, 0.25, 0.114), 0.70)
 
 # ---------------------------------------------------------------------------
 # Scene domain-randomization constants
@@ -578,7 +591,10 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         # by down-axis regulation (YAM_ARM.tcp_approach_axis), so no fixed target
         # quaternion is needed; only ee_step_m is scaled to MW's action_scale.
         yam_arm_mw = dataclasses.replace(
-            YAM_ARM, ee_step_m=_YAM_MW_EE_STEP_M, workspace_box=_YAM_MW_WORKSPACE_BOX
+            YAM_ARM,
+            ee_step_m=_YAM_MW_EE_STEP_M,
+            workspace_box=_YAM_MW_WORKSPACE_BOX,
+            reach_sphere=_YAM_MW_REACH_SPHERE,
         )
         controller = EEController(yam_arm_mw, env.model)
         # Orientation gain for the down-axis error (gentler than full-quat

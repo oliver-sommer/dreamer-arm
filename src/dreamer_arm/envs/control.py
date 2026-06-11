@@ -63,8 +63,14 @@ from dreamer_arm.envs.arms import Arm
 _LIMIT_MARGIN_FRAC: float = 0.15
 
 # Signed-distance threshold: contact.dist < this → treat as penetration.
-# MuJoCo reports dist < 0 when surfaces overlap; 0.0 is the strict boundary.
-_SELF_COLLISION_DIST: float = 0.0
+# MuJoCo reports dist < 0 when surfaces overlap.  The arm's collision geoms are
+# coarse capsules, so a few mm of capsule overlap is visually and physically
+# harmless (arm joints are kinematically anchored — no force blow-up).  A small
+# negative tolerance lets the arm *slide along* grazing configurations instead
+# of freezing at them: with a strict 0.0 the twisted-wrist fold reached by
+# constant (+1,-1,+1) commands vetoed every candidate step — including pure
+# retreat — and locked the arm permanently.
+_SELF_COLLISION_DIST: float = -0.003
 
 # Back-off scale factors tried in order.  alpha=1.0 is the full IK step; alpha=0.0
 # holds the current pose.  The first collision-free candidate wins.
@@ -206,6 +212,15 @@ class EEController:
             self._ws_lo = np.array(arm.workspace_box[0], dtype=np.float64)
             self._ws_hi = np.array(arm.workspace_box[1], dtype=np.float64)
 
+        # World-frame TCP reach sphere (optional), applied after the box: keeps
+        # commanded targets inside the arm's healthy reach so the IK never
+        # chases unreachable targets into the extension singularity.
+        self._reach_center: np.ndarray | None = None
+        self._reach_radius: float = 0.0
+        if arm.reach_sphere is not None:
+            self._reach_center = np.array(arm.reach_sphere[0], dtype=np.float64)
+            self._reach_radius = float(arm.reach_sphere[1])
+
         # ---- Self-collision gate ----
         # Scratch MjData used for collision queries (never stepped; only used
         # with mj_forward to probe whether a candidate q causes arm link
@@ -246,17 +261,28 @@ class EEController:
         model, data:
             Current MuJoCo model / data (after ``mj_forward`` or ``mj_step``).
         """
-        delta_pos = np.asarray(action[:3], dtype=np.float64) * self._step_m
+        # Defensive clip: the controller contract is action ∈ [-1, 1] but the
+        # actor's Normal samples are unbounded — never execute beyond design
+        # velocity even if a caller forgets to clamp.
+        action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
+        delta_pos = action[:3] * self._step_m
 
-        # ---- Workspace-box clamp ----
-        # Clamp the commanded TCP *target* (current pos + delta) into the box, then
-        # back out the allowed delta.  Outward motion at a face becomes zero while
-        # inward motion is untouched, so the policy can ride the boundary but never
-        # cross it (no below-table, behind-base, or over-reach into the fold).
+        # ---- Workspace clamp (box, then reach sphere) ----
+        # Clamp the commanded TCP *target* (current pos + delta), then back out
+        # the allowed delta.  Outward motion at a face becomes zero while
+        # inward motion is untouched, so the policy can ride the boundary but
+        # never cross it (no below-table, behind-base, or out past reach).
         _ws_clamp_active = False
-        if self._ws_lo is not None:
+        if self._ws_lo is not None or self._reach_center is not None:
             tcp_now = np.asarray(data.site_xpos[self._tcp_id], dtype=np.float64)
-            target = np.clip(tcp_now + delta_pos, self._ws_lo, self._ws_hi)
+            target = tcp_now + delta_pos
+            if self._ws_lo is not None:
+                target = np.clip(target, self._ws_lo, self._ws_hi)
+            if self._reach_center is not None:
+                v = target - self._reach_center
+                r = float(np.linalg.norm(v))
+                if r > self._reach_radius:
+                    target = self._reach_center + v * (self._reach_radius / r)
             clamped = target - tcp_now
             _ws_clamp_active = bool(np.any(clamped != delta_pos))
             delta_pos = clamped
@@ -357,9 +383,14 @@ class EEController:
         q_cur = q_full
 
         # ---- Self-collision gate with back-off ----
-        # Try alpha*dq for decreasing alpha.  The first collision-free candidate wins.
-        # alpha=0.0 holds the current (known collision-free) pose and always wins,
-        # so q_new is guaranteed to be set.
+        # Try alpha*dq for decreasing alpha; the first acceptable candidate wins.
+        # A candidate is acceptable if it is penetration-free OR does not worsen
+        # the *current* clearance — without the second condition a pose that is
+        # already (even marginally) penetrating vetoes every step including pure
+        # retreat, locking the arm permanently.  alpha=0.0 holds the current
+        # pose (clearance identical by construction) and always wins, so q_new
+        # is guaranteed to be set.
+        cur_clearance = self._arm_self_clearance(q_cur)
         q_new = q_cur  # initialise to current pose as the final fallback
         _backoff_alpha = 0.0
         _clip_active = False
@@ -370,7 +401,8 @@ class EEController:
                 self._ctrl_low[self._arm_act_ids],
                 self._ctrl_high[self._arm_act_ids],
             )
-            if not self._self_collides(q_cand):
+            cand_clearance = self._arm_self_clearance(q_cand)
+            if cand_clearance >= _SELF_COLLISION_DIST or cand_clearance >= cur_clearance:
                 q_new = q_cand
                 _backoff_alpha = alpha
                 _clip_active = bool(np.any(q_cand != q_unclamped))
@@ -401,12 +433,17 @@ class EEController:
     # ---------------------------------------------------------------- internals
 
     def _self_collides(self, q_candidate: np.ndarray) -> bool:
-        """Return True if ``q_candidate`` causes any arm link self-penetration.
+        """Return True if ``q_candidate`` penetrates beyond the tolerance."""
+        return self._arm_self_clearance(q_candidate) < _SELF_COLLISION_DIST
+
+    def _arm_self_clearance(self, q_candidate: np.ndarray) -> float:
+        """Worst signed distance among arm-link self-contact pairs at ``q_candidate``.
 
         Writes the 6 arm joint positions into a scratch :class:`mujoco.MjData`,
-        runs a forward pass to compute collision geometry, then checks whether
-        any contact pair has both geoms belonging to arm link bodies and a
-        signed distance below :data:`_SELF_COLLISION_DIST`.
+        runs a forward pass to compute collision geometry, then returns the most
+        negative signed distance over contact pairs whose geoms both belong to
+        arm link bodies (``+inf`` if there are none).  Values below
+        :data:`_SELF_COLLISION_DIST` mean penetration.
 
         Finger and hand geoms are excluded from the check (see
         :data:`_ARM_LINK_BODY_NAMES`), so gripper closing does not count as
@@ -423,8 +460,9 @@ class EEController:
             scratch.qpos[qpos_adr] = q
         mujoco.mj_forward(self._model_ref, scratch)
         geoms = self._arm_link_geoms
+        worst = float("inf")
         for i in range(scratch.ncon):
             c = scratch.contact[i]
-            if int(c.geom1) in geoms and int(c.geom2) in geoms and c.dist < _SELF_COLLISION_DIST:
-                return True
-        return False
+            if int(c.geom1) in geoms and int(c.geom2) in geoms:
+                worst = min(worst, float(c.dist))
+        return worst
