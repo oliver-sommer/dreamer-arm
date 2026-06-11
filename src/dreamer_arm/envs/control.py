@@ -225,7 +225,8 @@ class EEController:
         self._arm_link_geoms: frozenset[int] = frozenset(arm_link_geoms)
 
         # Per-step diagnostics populated by each call to apply().
-        # Keys: sigma_min, manip, lam2_eff, dq_norm, dq_max, clip_active, backoff_alpha.
+        # Keys: sigma_min, manip, lam2_eff, dq_norm, dq_max, clip_active,
+        # backoff_alpha, cmd_norm, ws_clamp_active, near_limit.
         self.last_diag: dict[str, float] = {}
 
     # ------------------------------------------------------------------ API
@@ -252,10 +253,19 @@ class EEController:
         # back out the allowed delta.  Outward motion at a face becomes zero while
         # inward motion is untouched, so the policy can ride the boundary but never
         # cross it (no below-table, behind-base, or over-reach into the fold).
+        _ws_clamp_active = False
         if self._ws_lo is not None:
             tcp_now = np.asarray(data.site_xpos[self._tcp_id], dtype=np.float64)
             target = np.clip(tcp_now + delta_pos, self._ws_lo, self._ws_hi)
-            delta_pos = target - tcp_now
+            clamped = target - tcp_now
+            _ws_clamp_active = bool(np.any(clamped != delta_pos))
+            delta_pos = clamped
+        # Post-clamp commanded TCP step (metres): the motion actually asked of
+        # the IK.  Together with the achieved TCP displacement (measured by the
+        # env after stepping) this drives stuck detection — wall-riding clamps
+        # cmd_norm to ~0 so it is never misreported as a lock-up.
+        self.last_diag["ws_clamp_active"] = float(_ws_clamp_active)
+        self.last_diag["cmd_norm"] = float(np.linalg.norm(delta_pos))
 
         # ---- 6-DOF damped-least-squares IK for arm joints ----
         self._jacp[:] = 0.0
@@ -322,14 +332,17 @@ class EEController:
         # normal reaching.  Projected through N = I - J⁺J it perturbs only the
         # redundant DOF(s), keeping the wrist off its ±limits without changing
         # the commanded task motion.
-        if self._null_gain > 0.0:
-            q_full = np.asarray(data.qpos)[self._arm_qpos_adrs]
-            lo_violation = np.maximum(self._jnt_lo + self._jnt_margin - q_full, 0.0)
-            hi_violation = np.minimum(self._jnt_hi - self._jnt_margin - q_full, 0.0)
-            grad = lo_violation + hi_violation  # inward push, zero in the interior
-            if np.any(grad):
-                N = np.eye(dq.shape[0]) - J.T @ (M @ J)
-                dq = dq + N @ (self._null_gain * grad)
+        q_full = np.asarray(data.qpos)[self._arm_qpos_adrs]
+        lo_violation = np.maximum(self._jnt_lo + self._jnt_margin - q_full, 0.0)
+        hi_violation = np.minimum(self._jnt_hi - self._jnt_margin - q_full, 0.0)
+        grad = lo_violation + hi_violation  # inward push, zero in the interior
+        # Any joint inside its limit margin → limit-pinning diagnostic.  Logged
+        # separately from sigma_min so limit lock-ups are distinguishable from
+        # kinematic singularities.
+        self.last_diag["near_limit"] = float(np.any(grad != 0.0))
+        if self._null_gain > 0.0 and np.any(grad):
+            N = np.eye(dq.shape[0]) - J.T @ (M @ J)
+            dq = dq + N @ (self._null_gain * grad)
 
         # dq clamp: scale uniformly so max|dq_i| ≤ max_joint_step.
         # Preserves the IK direction; turns blowups into bounded smooth steps.
@@ -341,7 +354,7 @@ class EEController:
         self.last_diag["dq_norm"] = float(np.linalg.norm(dq))
         self.last_diag["dq_max"] = float(np.abs(dq).max())
 
-        q_cur = np.asarray(data.qpos)[self._arm_qpos_adrs]
+        q_cur = q_full
 
         # ---- Self-collision gate with back-off ----
         # Try alpha*dq for decreasing alpha.  The first collision-free candidate wins.

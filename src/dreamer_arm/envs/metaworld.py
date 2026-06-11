@@ -276,6 +276,16 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._diag_near_singular: int = 0
         self._diag_clip: int = 0
         self._diag_backoff: int = 0
+        self._diag_ws_clamp: int = 0
+        self._diag_near_limit: int = 0
+        # Stuck detection: steps where the policy commands meaningful TCP motion
+        # but the arm achieves <25% of it (singularity / limit lock-up symptom).
+        self._diag_stuck: int = 0
+        self._diag_stuck_run: int = 0
+        self._diag_stuck_max_run: int = 0
+        self._diag_track_sum: float = 0.0
+        self._diag_track_n: int = 0
+        self._prev_tcp: np.ndarray | None = None
 
         # Wire in the YAM IK controller via the fork's injectable hooks.
         if arm == "yam":
@@ -683,12 +693,22 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
                 "frac_near_singular": self._diag_near_singular / self._diag_n,
                 "frac_clip_active": self._diag_clip / self._diag_n,
                 "frac_backoff": self._diag_backoff / self._diag_n,
+                "frac_ws_clamp": self._diag_ws_clamp / self._diag_n,
+                "frac_near_joint_limit": self._diag_near_limit / self._diag_n,
+                "frac_stuck": (
+                    self._diag_stuck / self._diag_track_n if self._diag_track_n else 0.0
+                ),
+                "stuck_max_run": float(self._diag_stuck_max_run),
+                "track_ratio_mean": (
+                    self._diag_track_sum / self._diag_track_n if self._diag_track_n else 1.0
+                ),
             }
         return info
 
     def _accumulate_ctrl_diag(self) -> None:
         """Fold the controller's per-step diagnostics into episode aggregates."""
-        diag = self._env._yam_controller.last_diag
+        ctrl = self._env._yam_controller
+        diag = ctrl.last_diag
         if not diag:
             return
         sigma = float(diag["sigma_min"])
@@ -698,6 +718,29 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._diag_near_singular += int(sigma < 0.03)
         self._diag_clip += int(diag.get("clip_active", 0.0) > 0.0)
         self._diag_backoff += int(diag.get("backoff_alpha", 1.0) < 1.0)
+        self._diag_ws_clamp += int(diag.get("ws_clamp_active", 0.0) > 0.0)
+        self._diag_near_limit += int(diag.get("near_limit", 0.0) > 0.0)
+
+        # Stuck detection: commanded TCP motion vs achieved TCP displacement.
+        # Only steps with a meaningful post-clamp command count (wall-riding at
+        # the workspace box clamps cmd_norm to ~0 and is tracked separately via
+        # frac_ws_clamp).  ratio < 0.25 → the arm is fighting a singularity,
+        # joint limit, or obstacle instead of moving.
+        tcp_now = ctrl.tcp_pos(self._env.data).astype(np.float64)
+        cmd_norm = float(diag.get("cmd_norm", 0.0))
+        if self._prev_tcp is not None and cmd_norm > 0.2 * ctrl._step_m:
+            ratio = float(np.linalg.norm(tcp_now - self._prev_tcp)) / cmd_norm
+            self._diag_track_sum += ratio
+            self._diag_track_n += 1
+            if ratio < 0.25:
+                self._diag_stuck += 1
+                self._diag_stuck_run += 1
+                self._diag_stuck_max_run = max(self._diag_stuck_max_run, self._diag_stuck_run)
+            else:
+                self._diag_stuck_run = 0
+        else:
+            self._diag_stuck_run = 0
+        self._prev_tcp = tcp_now
 
     def reset(
         self,
@@ -719,6 +762,14 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
         self._diag_near_singular = 0
         self._diag_clip = 0
         self._diag_backoff = 0
+        self._diag_ws_clamp = 0
+        self._diag_near_limit = 0
+        self._diag_stuck = 0
+        self._diag_stuck_run = 0
+        self._diag_stuck_max_run = 0
+        self._diag_track_sum = 0.0
+        self._diag_track_n = 0
+        self._prev_tcp = None
 
         # Camera randomization: full hemisphere pose OR small position jitter.
         if self._camera_pose_randomize:
@@ -738,6 +789,9 @@ class MetaWorld(gym.Env):  # type: ignore[type-arg]
             self._apply_scene_dr()
 
         state, _ = self._env.reset()
+        if self._arm == "yam":
+            # Anchor for achieved-TCP-displacement (stuck) tracking.
+            self._prev_tcp = self._env._yam_controller.tcp_pos(self._env.data).astype(np.float64)
         if self._viewer_requested:
             import mujoco.viewer as _mv
 

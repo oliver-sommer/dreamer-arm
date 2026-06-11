@@ -261,6 +261,8 @@ class OnlineTrainer:
         successes = np.zeros(n, dtype=bool)
         done_once = np.zeros(n, dtype=bool)
         eval_tasks: list[str | None] = [None] * n
+        # EEController episode diagnostics (YAM only), averaged over eval envs.
+        ctrl_diags: dict[str, list[float]] = {}
 
         # Collect one episode's worth of frames from up to eval_episode_num envs.
         # In MT runs each env is pinned to a different task, so this shows one
@@ -293,6 +295,8 @@ class OnlineTrainer:
                     fin = eval_infos[i].get("final_info", {})
                     successes[i] = bool(fin.get("success", False))
                     eval_tasks[i] = fin.get("task")
+                    for diag_name, diag_val in fin.get("ctrl_diag", {}).items():
+                        ctrl_diags.setdefault(diag_name, []).append(float(diag_val))
             done_once |= done_np
 
         self.logger.scalar("episode/eval_score", float(returns.mean()))
@@ -302,6 +306,8 @@ class OnlineTrainer:
         for task in {t for t in eval_tasks if t is not None}:
             mask = np.array([t == task for t in eval_tasks], dtype=bool)
             self.logger.scalar(f"episode/eval_success/{task}", float(successes[mask].mean()))
+        for diag_name, diag_vals in ctrl_diags.items():
+            self.logger.scalar(f"episode/eval_ctrl_{diag_name}", float(np.mean(diag_vals)))
         # Stack per-env frame lists → (n_video, T, H, W, C); tile as 2 rows.
         grid_cols = max(1, n_video // 2)
         if videos[0]:

@@ -351,6 +351,50 @@ def test_yam_mw_no_singularity_lock() -> None:
     )
 
 
+@pytest.mark.slow
+def test_yam_mw_ctrl_diag_metrics() -> None:
+    """ctrl_diag episode aggregates expose sane singularity/lock-up metrics.
+
+    Verifies the wandb-bound diagnostics: all keys present, fractions in
+    [0, 1], and free-space random motion shows good tracking (high
+    track_ratio_mean, ~no stuck steps).
+    """
+    from dreamer_arm.envs.metaworld import MetaWorld
+
+    env = MetaWorld("reach", arm="yam", seed=0)
+    env.reset()
+    rng = np.random.default_rng(0)
+    info: dict = {}
+    for _ in range(50):
+        *_, info = env.step(rng.uniform(-1.0, 1.0, size=(4,)).astype(np.float32))
+    env.close()
+
+    diag = info["ctrl_diag"]
+    expected = {
+        "sigma_min_mean",
+        "sigma_min_min",
+        "frac_near_singular",
+        "frac_clip_active",
+        "frac_backoff",
+        "frac_ws_clamp",
+        "frac_near_joint_limit",
+        "frac_stuck",
+        "stuck_max_run",
+        "track_ratio_mean",
+    }
+    assert expected <= diag.keys(), f"missing diag keys: {expected - diag.keys()}"
+    for key in (k for k in expected if k.startswith("frac_")):
+        assert 0.0 <= diag[key] <= 1.0, f"{key}={diag[key]} outside [0, 1]"
+    assert diag["stuck_max_run"] >= 0.0
+    # Free-space motion: commanded TCP steps should be mostly achieved.
+    assert diag["track_ratio_mean"] > 0.5, (
+        f"track_ratio_mean={diag['track_ratio_mean']:.2f} — arm not tracking commands"
+    )
+    assert diag["frac_stuck"] <= 0.05, (
+        f"frac_stuck={diag['frac_stuck']:.2f} — lock-ups in free space"
+    )
+
+
 # ---------------------------------------------------------------------------
 # YAM grasping + orientation-hijack regressions
 # ---------------------------------------------------------------------------
