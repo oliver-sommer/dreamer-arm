@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
@@ -47,6 +48,12 @@ class TrainerConfig:
     eval_episode_num: int
     update_log_every: int
 
+    checkpoint_every: int = 0
+    """Save an agent checkpoint every this many env steps (0 disables)."""
+
+    checkpoint_path: str = ""
+    """Destination file for the (single, atomically replaced) checkpoint."""
+
 
 class _AgentProto(Protocol):
     """Minimal interface the trainer needs from :class:`Dreamer`."""
@@ -64,6 +71,8 @@ class _AgentProto(Protocol):
     ) -> tuple[torch.Tensor, TensorDict]: ...
 
     def update(self, replay_buffer: ReplayBuffer) -> dict[str, torch.Tensor]: ...
+
+    def checkpoint_state(self) -> dict[str, Any]: ...
 
     def train(self) -> Any: ...
     def eval(self) -> Any: ...
@@ -96,16 +105,22 @@ class OnlineTrainer:
         self._should_pretrain = Once()
         self._should_log = Every(config.update_log_every)
         self._should_eval = Every(config.eval_every)
+        self._should_checkpoint = Every(config.checkpoint_every if config.checkpoint_path else 0)
 
     # ------------------------------------------------------------------- train
 
-    def begin(self, agent: _AgentProto) -> None:
-        """Main loop: collect one env step, maybe update, log, repeat."""
+    def begin(self, agent: _AgentProto, start_step: int = 0) -> None:
+        """Main loop: collect one env step, maybe update, log, repeat.
+
+        ``start_step`` continues the global step counter when resuming from a
+        checkpoint (the replay buffer starts empty after a resume, so the
+        buffer-derived count alone would restart from 0).
+        """
         device = agent.device
         envs = self.train_envs
         n = envs.num_envs
 
-        step = len(self.replay_buffer) * self.config.action_repeat
+        step = max(int(start_step), len(self.replay_buffer) * self.config.action_repeat)
         update_count = 0
 
         agent_state = agent.get_initial_state(n)
@@ -241,6 +256,31 @@ class OnlineTrainer:
                     self.logger.write(step, fps=True)
                     metric_sums.clear()
                     window_updates = 0
+
+            # ---- checkpoint ----
+            if self._should_checkpoint(step):
+                self._save_checkpoint(agent, step)
+
+        # Final checkpoint so a completed run is also resumable/exportable.
+        if self.config.checkpoint_path and self.config.checkpoint_every:
+            self._save_checkpoint(agent, step)
+
+    # --------------------------------------------------------------- checkpoint
+
+    def _save_checkpoint(self, agent: _AgentProto, step: int) -> None:
+        """Atomically write the agent + step to ``config.checkpoint_path``.
+
+        Write-to-temp + rename means a crash mid-save can never corrupt the
+        previous checkpoint.  The replay buffer is intentionally not saved
+        (10+ GB at capacity); on resume it refills from scratch while the
+        world model keeps everything it learned.
+        """
+        path = Path(self.config.checkpoint_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        torch.save({"step": int(step), "agent": agent.checkpoint_state()}, tmp)
+        tmp.replace(path)
+        print(f"checkpoint saved at step {step} -> {path}", flush=True)
 
     # -------------------------------------------------------------------- eval
 

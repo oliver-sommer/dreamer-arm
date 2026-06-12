@@ -284,7 +284,11 @@ class EEController:
                 if r > self._reach_radius:
                     target = self._reach_center + v * (self._reach_radius / r)
             clamped = target - tcp_now
-            _ws_clamp_active = bool(np.any(clamped != delta_pos))
+            # Tolerance, not equality: (tcp + delta) - tcp loses low bits in
+            # fp64, so exact comparison flagged ~every step as clamped (the
+            # frac_ws_clamp metric read a useless 1.0).  1 µm ≫ roundoff and
+            # ≪ any real clamping.
+            _ws_clamp_active = bool(np.any(np.abs(clamped - delta_pos) > 1e-6))
             delta_pos = clamped
         # Post-clamp commanded TCP step (metres): the motion actually asked of
         # the IK.  Together with the achieved TCP displacement (measured by the

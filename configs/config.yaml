@@ -21,13 +21,18 @@ deterministic_run: false
 
 logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
+# Path to a checkpoint.pt from a previous run to resume from (weights,
+# optimiser, and step counter; the replay buffer refills from scratch):
+#   pixi run train envs.task=MT50 envs.env_num=50 resume=logdir/<date>/<time>/checkpoint.pt
+resume: null
+
 wandb:
   project: dreamer-arm
   entity: null
-  # Use mode=offline on hosts with unreliable egress (e.g. vast.ai): a TLS
-  # hiccup permanently kills wandb's online stream (run shows "crashed" while
-  # training continues).  In offline mode the logger uploads the run itself
-  # via `wandb sync --append` every sync_interval seconds (0 disables).
+  # On vast.ai, pass wandb.mode=offline: a TLS hiccup permanently kills the
+  # online stream (run shows "crashed" while training continues).  In offline
+  # mode the logger uploads the run itself via `wandb sync --append` every
+  # sync_interval seconds (0 disables), so the website still updates ~10 min.
   mode: online
   sync_interval: 600
   tags: []
@@ -53,6 +58,9 @@ trainer:
   # episode boundaries so training episodes are never truncated.
   eval_every: 50000
   eval_episode_num: ${envs.eval_episode_num}
+  # Agent checkpoint cadence (env steps; 0 disables).  One file, atomically
+  # replaced at <logdir>/checkpoint.pt (~a few hundred MB: weights+optimiser).
+  checkpoint_every: 50000
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   train_ratio: ${envs.train_ratio}

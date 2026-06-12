@@ -200,6 +200,30 @@ class Dreamer(nn.Module):
         self._clone_and_freeze()
         return self
 
+    # -------------------------------------------------------------- checkpoint
+
+    def checkpoint_state(self) -> dict[str, Any]:
+        """Full training state for crash-resume (weights, optimiser, counters)."""
+        return {
+            "model": self.state_dict(),
+            "optimizer": self._optimizer.state_dict(),
+            "scaler": self._scaler.state_dict(),
+            "scheduler": self._scheduler.state_dict(),
+            "slow_value_updates": self._slow_value_updates,
+        }
+
+    def load_checkpoint_state(self, state: Mapping[str, Any]) -> None:
+        self.load_state_dict(state["model"])
+        self._optimizer.load_state_dict(state["optimizer"])
+        self._scaler.load_state_dict(state["scaler"])
+        self._scheduler.load_state_dict(state["scheduler"])
+        self._slow_value_updates = int(state["slow_value_updates"])
+        # load_state_dict copies into the existing parameter storages (which
+        # the frozen rollout views share), but the frozen views' *buffers* are
+        # independent deepcopies — rebuild them so act()/imagine see the
+        # loaded state.
+        self._clone_and_freeze()
+
     def _update_slow_target(self) -> None:
         if self._slow_value_updates % self.slow_target_update == 0:
             with torch.no_grad():
@@ -225,7 +249,11 @@ class Dreamer(nn.Module):
         self, obs: Mapping[str, torch.Tensor], state: TensorDict, eval_mode: bool = False
     ) -> tuple[torch.Tensor, TensorDict]:
         """Policy inference. Returns ``(action, next_state)``."""
-        torch.compiler.cudagraph_mark_step_begin()
+        # CUDA-graphs step marker; only meaningful (and only importable on
+        # some installs) with CUDA — importing it pulls in the full inductor
+        # stack, which CPU-only dev environments may not have working.
+        if self.device.type == "cuda":
+            torch.compiler.cudagraph_mark_step_begin()
         p_obs = self._preprocess(dict(obs))
         embed = self._frozen_encoder(p_obs)
         stoch, deter, _ = self._frozen_rssm.obs_step(

@@ -129,11 +129,23 @@ def run(cfg: DictConfig) -> None:
         eval_every=int(cfg.trainer.eval_every),
         eval_episode_num=int(cfg.trainer.eval_episode_num),
         update_log_every=int(cfg.trainer.update_log_every),
+        checkpoint_every=int(cfg.trainer.checkpoint_every),
+        checkpoint_path=str(Path(cfg.logdir) / "checkpoint.pt"),
     )
+
+    # Crash-resume: restore agent weights/optimiser and continue the step
+    # counter.  The replay buffer is not part of the checkpoint; it refills
+    # from scratch (model updates pause until the warmup minimum is met).
+    start_step = 0
+    if cfg.resume is not None:
+        ckpt = torch.load(str(cfg.resume), map_location=cfg.device, weights_only=False)
+        agent.load_checkpoint_state(ckpt["agent"])
+        start_step = int(ckpt["step"])
+        print(f"resumed from {cfg.resume} at step {start_step}", flush=True)
 
     try:
         trainer = OnlineTrainer(trainer_cfg, buffer, logger, train_envs, eval_envs)
-        trainer.begin(agent)
+        trainer.begin(agent, start_step=start_step)
     finally:
         logger.finish()
         train_envs.close()
