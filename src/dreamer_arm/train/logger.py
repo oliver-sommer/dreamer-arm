@@ -16,6 +16,7 @@ which survives network failures that permanently kill wandb's online stream.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -30,10 +31,14 @@ import imageio
 import numpy as np
 import torch
 
+from dreamer_arm.utils.logging import CONTINUATION_INDENT
+
 try:
     import wandb
 except ImportError as exc:  # pragma: no cover - import guard
     raise ImportError("wandb is required for dreamer_arm.train.logger; install via pixi.") from exc
+
+log = logging.getLogger(__name__)
 
 
 _Scalar = float | int
@@ -164,7 +169,7 @@ class WandbLogger:
         self._max_logged_step = step
 
         fps_value = self._compute_fps(step) if fps else None
-        print(self._console_line(step, fps_value), flush=True)
+        log.info(self._console_line(step, fps_value))
         payload: dict[str, Any] = dict(self._scalars)
         if fps_value is not None:
             payload["fps/fps"] = fps_value
@@ -226,9 +231,9 @@ class WandbLogger:
             )
             if result.returncode != 0:
                 tail = (result.stderr or result.stdout).strip().splitlines()[-1:]
-                print(f"wandb sync failed (will retry): {' '.join(tail)}", flush=True)
+                log.warning("wandb sync failed (will retry): %s", " ".join(tail))
         except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"wandb sync failed (will retry): {exc}", flush=True)
+            log.warning("wandb sync failed (will retry): %s", exc)
 
     def _encode_video(self, arr: np.ndarray) -> wandb.Video:
         """Encode (T, C, H, W) uint8 video via imageio-ffmpeg, then hand wandb a path.
@@ -251,6 +256,7 @@ class WandbLogger:
 
     def _console_line(self, step: int, fps_value: float | None) -> str:
         # --- header: step + optional fps / episode scores ---
+        # The logging formatter prepends the bracketed timestamp + level.
         parts = [f"step {step:>8}"]
         if fps_value is not None:
             parts.append(f"fps {fps_value:>6.1f}")
@@ -271,7 +277,11 @@ class WandbLogger:
         loss_parts = [
             f"{label} {self._scalars[key]:.3f}" for key, label in loss_keys if key in self._scalars
         ]
-        return header + ("\n  " + "  ".join(loss_parts) if loss_parts else "")
+        # Indent the continuation line flush under the message column (the
+        # formatter prefix only stamps the first line).
+        if loss_parts:
+            return header + "\n" + CONTINUATION_INDENT + "  ".join(loss_parts)
+        return header
 
     def _compute_fps(self, step: int) -> float:
         now = time.time()

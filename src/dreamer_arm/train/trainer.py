@@ -1,374 +1,350 @@
-"""Online Dreamer trainer: interleaves env steps with world-model updates.
+"""Online Dreamer training loop.
 
-The training loop runs N parallel envs through a :class:`SyncVectorEnv`,
-pushes each transition into the trajectory replay buffer, and every
-``batch_steps / train_ratio`` env steps takes ``update_num`` optimiser
-steps on the Dreamer agent. Eval rolls a fixed number of episodes with the
-deterministic actor mode and logs rendered video + return.
+``OnlineTrainer.begin`` is the only public entry point.  It runs the standard
+DreamerV3 collection → update → eval → checkpoint cycle until ``cfg.steps``
+environment steps have been taken.
 
-This is the W&B-only, single-process port of the reference repo's
-``r2dreamer/trainer.py`` — IsaacLab and TensorBoard branches are dropped.
+Design notes
+------------
+* The trainer counts **post-action-repeat** env steps (one ``SyncVectorEnv.step``
+  = 1 agent step = ``action_repeat`` inner physics steps).
+* Train ratio is fractional: each env step accrues ``train_ratio`` training
+  credits; whole credits are drained via ``agent.update`` calls.
+* Eval reuses the train envs (``eval_envs is train_envs``), so no extra EGL
+  contexts are created.  Eval is triggered when the step counter crosses a
+  multiple of ``eval_every``, then deferred until every env is at an episode
+  boundary (``is_first.all()``).
+* Episode ids are monotonically-increasing per-process int32 counters shared
+  across all envs; the SliceSampler uses them to avoid splicing across resets.
+* Checkpoints are atomic: ``torch.save`` to ``.tmp``, then ``os.replace``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import logging
+import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import numpy as np
 import torch
 from tensordict import TensorDict
 
-from dreamer_arm.data.buffer import ReplayBuffer
-from dreamer_arm.envs.wrappers import SyncVectorEnv
-from dreamer_arm.train.logger import WandbLogger
-from dreamer_arm.utils.modules import Every, Once
+log = logging.getLogger(__name__)
 
 
 @dataclass
 class TrainerConfig:
-    """Hyperparameters that drive the online training loop."""
+    """Hyperparameters for the online training loop."""
 
-    steps: int
-    """Total environment steps to run (counts in env-side steps, not grad steps)."""
-
-    pretrain: int
-    """Number of model updates to do once before the loop starts."""
-
-    train_ratio: float
-    """env-data steps / model-update steps; e.g. 32 means 1 update per 32 env steps."""
-
-    batch_size: int
-    batch_length: int
-    action_repeat: int
-
-    eval_every: int
-    eval_episode_num: int
-    update_log_every: int
-
-    checkpoint_every: int = 0
-    """Save an agent checkpoint every this many env steps (0 disables)."""
-
-    checkpoint_path: str = ""
-    """Destination file for the (single, atomically replaced) checkpoint."""
-
-
-class _AgentProto(Protocol):
-    """Minimal interface the trainer needs from :class:`Dreamer`."""
-
-    device: torch.device
-    act_dim: int
-
-    def get_initial_state(self, batch_size: int) -> TensorDict: ...
-
-    def act(
-        self,
-        obs: Mapping[str, torch.Tensor],
-        state: TensorDict,
-        eval_mode: bool = False,
-    ) -> tuple[torch.Tensor, TensorDict]: ...
-
-    def update(self, replay_buffer: ReplayBuffer) -> dict[str, torch.Tensor]: ...
-
-    def checkpoint_state(self) -> dict[str, Any]: ...
-
-    def train(self) -> Any: ...
-    def eval(self) -> Any: ...
+    steps: int  # total environment steps to train for
+    pretrain: int  # agent.update calls to run before collection
+    train_ratio: float  # update calls per env step (fractional)
+    batch_size: int  # stored here for documentation / config round-trip
+    batch_length: int  # stored here for documentation / config round-trip
+    action_repeat: int  # inner steps per outer step (owned by SyncVectorEnv)
+    eval_every: int  # eval after this many env steps
+    eval_episode_num: int  # episodes to collect during each eval pass
+    update_log_every: int  # write logger scalars every N env steps
+    checkpoint_every: int  # save checkpoint every N env steps
+    checkpoint_path: str  # path for the checkpoint file
 
 
 class OnlineTrainer:
-    """Online RL loop: env rollout → buffer → grad step.
+    """Runs the online DreamerV3 training loop.
 
-    ``train_envs`` and ``eval_envs`` are :class:`SyncVectorEnv` instances —
-    one for collection, optionally one for periodic evaluation.
+    Args:
+        cfg:        Hyper-parameter configuration.
+        buffer:     Replay buffer (``ReplayBuffer`` from ``data/buffer.py``).
+        logger:     ``WandbLogger`` instance.
+        train_envs: ``SyncVectorEnv`` used for both training and eval.
+        eval_envs:  Same as ``train_envs`` (or ``None`` to skip eval).
     """
 
     def __init__(
         self,
-        config: TrainerConfig,
-        replay_buffer: ReplayBuffer,
-        logger: WandbLogger,
-        train_envs: SyncVectorEnv,
-        eval_envs: SyncVectorEnv | None = None,
+        cfg: TrainerConfig,
+        buffer: Any,
+        logger: Any,
+        train_envs: Any,
+        eval_envs: Any | None,
     ) -> None:
-        self.config = config
-        self.replay_buffer = replay_buffer
-        self.logger = logger
-        self.train_envs = train_envs
-        self.eval_envs = eval_envs
+        self._cfg = cfg
+        self._buffer = buffer
+        self._logger = logger
+        self._train_envs = train_envs
+        self._eval_envs = eval_envs
+        self._N = train_envs.num_envs
 
-        # train_ratio is in data-steps (env_steps * action_repeat), not env steps.
-        batch_steps = config.batch_size * config.batch_length
-        self._updates_needed = Every(int(batch_steps / config.train_ratio * config.action_repeat))
-        self._should_pretrain = Once()
-        self._should_log = Every(config.update_log_every)
-        self._should_eval = Every(config.eval_every)
-        self._should_checkpoint = Every(config.checkpoint_every if config.checkpoint_path else 0)
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------- train
+    def begin(self, agent: Any, start_step: int = 0) -> None:
+        """Run the training loop.
 
-    def begin(self, agent: _AgentProto, start_step: int = 0) -> None:
-        """Main loop: collect one env step, maybe update, log, repeat.
-
-        ``start_step`` continues the global step counter when resuming from a
-        checkpoint (the replay buffer starts empty after a resume, so the
-        buffer-derived count alone would restart from 0).
+        Args:
+            agent:      Dreamer agent with ``get_initial_state``, ``act``,
+                        ``update``, ``checkpoint_state``.
+            start_step: Resume from this env-step count (crash recovery).
         """
+        cfg = self._cfg
+        N = self._N
         device = agent.device
-        envs = self.train_envs
-        n = envs.num_envs
+        obs_keys = sorted(self._train_envs.observation_space.spaces.keys())
 
-        step = max(int(start_step), len(self.replay_buffer) * self.config.action_repeat)
-        update_count = 0
+        # ---- initial collection state ----
+        obs_np = self._train_envs.reset(seed=None)
+        state = agent.get_initial_state(N)
 
-        agent_state = agent.get_initial_state(n)
-        act = agent_state["prev_action"].clone()
+        # RSSM latent seed shapes
+        stoch_zeros = torch.zeros_like(state["stoch"])
+        deter_zeros = torch.zeros_like(state["deter"])
 
-        # First reset — gives us is_first=True everywhere.
-        obs_np, _ = envs.reset(seed=0)
-        returns = np.zeros(n, dtype=np.float32)
-        lengths = np.zeros(n, dtype=np.int32)
-        video_cache: list[np.ndarray] = []
-        train_metrics: dict[str, torch.Tensor] = {}
-        metric_sums: dict[str, float] = {}
-        window_updates: int = 0
+        # is_first flags: first obs after reset is the start of episode
+        is_first = np.ones(N, dtype=bool)
 
-        # Episode IDs are kept constant across resets so SliceSampler can group
-        # multi-episode windows; the RSSM resets internally on is_first.
-        episode_ids = torch.arange(n, dtype=torch.int32, device=device)
+        # Monotonically-increasing episode ids (unique across process lifetime)
+        episode_ids = np.arange(N, dtype=np.int32)
+        _next_ep_id = N
 
-        # Shared-env eval may only run at episode boundaries: eval resets the
-        # envs, so a mid-episode eval would truncate every training episode
-        # (with MT50 at eval_every=5000 that cut episodes at 50/250 steps, so
-        # the buffer never contained late-episode states and episode-end
-        # metrics never fired).  ``eval_due`` latches the Every trigger until
-        # the boundary; envs stay in lockstep because they reset together and
-        # Meta-World episodes only end by truncation at the shared time limit.
-        eval_due = False
-        episode_boundary = True  # fresh reset above
+        # Per-env running stats
+        ep_return = np.zeros(N, dtype=np.float32)
+        ep_len = np.zeros(N, dtype=np.int32)
 
-        while step < self.config.steps:
-            # ---- eval ----
-            eval_due = bool(self._should_eval(step)) or eval_due
-            if (
-                eval_due
-                and self.config.eval_episode_num > 0
-                and self.eval_envs is not None
-                and (self.eval_envs is not self.train_envs or episode_boundary)
-            ):
-                eval_due = False
-                self.eval(agent, step)
-                if self.eval_envs is self.train_envs:
-                    # eval reset the shared envs; resync training state so the
-                    # next env step uses a fresh obs rather than a stale one.
-                    obs_np, _ = envs.reset()
-                    returns[:] = 0
-                    lengths[:] = 0
-                    video_cache.clear()
-                    agent_state = agent.get_initial_state(n)
-                    act = agent_state["prev_action"].clone()
+        # Minimum buffer fill before training starts
+        prefill_min = N * (cfg.batch_length + 1)
+        # Fractional training-step budget (drain via whole update() calls)
+        train_budget = 0.0
 
-            # ---- env step ----
-            obs_t = self._obs_to_tensor(obs_np, device)
-            act, agent_state = agent.act(obs_t, agent_state, eval_mode=False)
-            act_np = act.detach().cpu().numpy()
+        # Total (post-repeat) env steps taken
+        env_step = start_step
 
-            next_obs_np, reward_np, terminated_np, truncated_np, infos = envs.step(act_np)
-            done_np = terminated_np | truncated_np
-            episode_boundary = bool(done_np.all())
+        # Eval scheduling
+        eval_pending = False
+        _last_eval_trigger = (start_step // cfg.eval_every) * cfg.eval_every
+        # Checkpoint / log watermarks
+        _last_ckpt = (start_step // cfg.checkpoint_every) * cfg.checkpoint_every
+        _last_log = (start_step // cfg.update_log_every) * cfg.update_log_every
 
-            # ---- record + push to buffer ----
-            reward_t = torch.from_numpy(reward_np.astype(np.float32)).to(device)
-            transition = TensorDict(
+        # ---- pretrain ----
+        for _ in range(cfg.pretrain):
+            if len(self._buffer) >= prefill_min:
+                agent.update(self._buffer)
+
+        # ====================================================================
+        # Main loop
+        # ====================================================================
+        while env_step < cfg.steps:
+            # ---- deferred eval: fire once all envs hit an episode boundary ----
+            if eval_pending and is_first.all():
+                self._run_eval(agent, obs_keys, device, env_step)
+                eval_pending = False
+                # Resync: train_envs was used for eval; reset it so collection
+                # resumes from clean episode starts.
+                obs_np = self._train_envs.reset(seed=None)
+                state = agent.get_initial_state(N)
+                stoch_zeros = torch.zeros_like(state["stoch"])
+                deter_zeros = torch.zeros_like(state["deter"])
+                is_first = np.ones(N, dtype=bool)
+                # Bump episode ids for all envs after eval
+                episode_ids = np.arange(_next_ep_id, _next_ep_id + N, dtype=np.int32)
+                _next_ep_id += N
+
+            # ---- act ----
+            obs_torch: dict[str, torch.Tensor] = {
+                k: torch.from_numpy(obs_np[k]).to(device) for k in obs_keys
+            }
+            obs_torch["is_first"] = torch.from_numpy(is_first).to(device)
+
+            action_t, next_state = agent.act(obs_torch, state, eval_mode=False)
+            action_np = action_t.detach().cpu().numpy()  # (N, act_dim)
+
+            # ---- step ----
+            obs_next_np, rewards, terms, truncs, info = self._train_envs.step(action_np)
+            done = terms | truncs  # (N,) bool
+
+            # ---- store transition ----
+            obs_td: dict[str, torch.Tensor] = {k: torch.from_numpy(obs_np[k]) for k in obs_keys}
+            td = TensorDict(
                 {
-                    **{k: torch.from_numpy(np.asarray(v)).to(device) for k, v in obs_np.items()},
-                    "action": act.detach() * (~torch.from_numpy(done_np).to(device)).unsqueeze(-1),
-                    "reward": reward_t.unsqueeze(-1),
-                    "stoch": agent_state["stoch"],
-                    "deter": agent_state["deter"],
-                    "episode": episode_ids,
+                    **obs_td,
+                    "action": action_t.detach().cpu(),
+                    "reward": torch.from_numpy(rewards).unsqueeze(-1),  # (N,1)
+                    "is_first": torch.from_numpy(is_first),  # (N,) bool
+                    "is_last": torch.from_numpy(done),  # (N,) bool
+                    "is_terminal": torch.from_numpy(terms),  # (N,) bool
+                    "stoch": stoch_zeros,
+                    "deter": deter_zeros,
+                    "episode": torch.from_numpy(episode_ids).to(torch.int32),
                 },
-                batch_size=(n,),
+                batch_size=(N,),
             )
-            if "scene" in obs_np:
-                video_cache.append(obs_np["scene"][0])
-            self.replay_buffer.add_transition(transition.detach())
+            self._buffer.add_transition(td)
+
+            env_step += N
+            ep_return += rewards
+            ep_len += 1
+
+            # ---- episode logging ----
+            for i in range(N):
+                if done[i]:
+                    self._logger.scalar("episode/score", float(ep_return[i]))
+                    self._logger.scalar("episode/length", int(ep_len[i]))
+                    # sticky success from final_info
+                    fin = info["final_info"][i]
+                    if fin is not None and "success" in fin:
+                        self._logger.scalar("episode/success", float(fin["success"]))
+                    ep_return[i] = 0.0
+                    ep_len[i] = 0
 
             # ---- bookkeeping ----
-            returns += reward_np
-            lengths += 1
-            step += int(n) * self.config.action_repeat
+            is_first = done.copy()
+            state = next_state
+            # Zero prev_action for restarted envs so the RSSM doesn't condition
+            # on the last action of the old episode.
+            if done.any():
+                done_t = torch.from_numpy(done).to(device)
+                state["prev_action"][done_t] = 0.0
+                for i in range(N):
+                    if done[i]:
+                        episode_ids[i] = _next_ep_id
+                        _next_ep_id += 1
 
-            # ---- episode-end logging ----
-            for i, d in enumerate(done_np):
-                if not d:
-                    continue
-                if i == 0 and video_cache:
-                    self.logger.video("train/scene_video", np.stack(video_cache, axis=0)[None])
-                    video_cache = []
-                self.logger.scalar("episode/score", float(returns[i]))
-                self.logger.scalar("episode/length", float(lengths[i]))
-                fin = infos[i].get("final_info", {})
-                success = float(bool(fin.get("success", False)))
-                self.logger.scalar("episode/success", success)
-                # Per-task breakdown for multi-task (MT*) runs; the env tags
-                # each episode with its task name via info["task"].
-                task = fin.get("task")
-                if task is not None:
-                    self.logger.scalar(f"episode/success/{task}", success)
-                    self.logger.scalar(f"episode/score/{task}", float(returns[i]))
-                # EEController episode diagnostics (YAM arm only): the env
-                # attaches running episode aggregates each step, so the
-                # final_info values cover the whole episode.
-                for diag_name, diag_val in fin.get("ctrl_diag", {}).items():
-                    self.logger.scalar(f"episode/ctrl_{diag_name}", float(diag_val))
-                self.logger.write(step + i)
-                returns[i] = 0.0
-                lengths[i] = 0
+            stoch_zeros = torch.zeros_like(state["stoch"])
+            deter_zeros = torch.zeros_like(state["deter"])
+            obs_np = obs_next_np
 
-            obs_np = next_obs_np
+            # ---- training updates ----
+            if len(self._buffer) >= prefill_min:
+                train_budget += cfg.train_ratio * N
+                while train_budget >= 1.0:
+                    metrics = agent.update(self._buffer)
+                    train_budget -= 1.0
+                    # Prefix the agent's "loss/*" keys with "train/"
+                    for k, v in metrics.items():
+                        key = f"train/{k}" if not k.startswith("train/") else k
+                        self._logger.scalar(key, v)
 
-            # ---- model updates ----
-            min_buffer = (self.config.batch_length + 1) * n
-            if len(self.replay_buffer) > min_buffer:
-                update_num = (
-                    self.config.pretrain if self._should_pretrain() else self._updates_needed(step)
-                )
-                for _ in range(update_num):
-                    train_metrics = agent.update(self.replay_buffer)
-                    for name, value in train_metrics.items():
-                        v = (
-                            value.detach().cpu().item()
-                            if isinstance(value, torch.Tensor)
-                            else float(value)
-                        )
-                        metric_sums[name] = metric_sums.get(name, 0.0) + v
-                update_count += update_num
-                window_updates += update_num
-                self.logger.keepalive(step)
+            # ---- periodic logging ----
+            if env_step - _last_log >= cfg.update_log_every:
+                _last_log = (env_step // cfg.update_log_every) * cfg.update_log_every
+                self._logger.write(env_step, fps=True)
 
-                if window_updates > 0 and self._should_log(step):
-                    for name, total in metric_sums.items():
-                        self.logger.scalar(f"train/{name}", total / window_updates)
-                    self.logger.scalar("train/opt/updates", float(update_count))
-                    self.logger.write(step, fps=True)
-                    metric_sums.clear()
-                    window_updates = 0
+            # ---- eval trigger ----
+            if (
+                cfg.eval_episode_num > 0
+                and self._eval_envs is not None
+                and env_step - _last_eval_trigger >= cfg.eval_every
+            ):
+                _last_eval_trigger = (env_step // cfg.eval_every) * cfg.eval_every
+                eval_pending = True
 
             # ---- checkpoint ----
-            if self._should_checkpoint(step):
-                self._save_checkpoint(agent, step)
+            if env_step - _last_ckpt >= cfg.checkpoint_every:
+                _last_ckpt = (env_step // cfg.checkpoint_every) * cfg.checkpoint_every
+                self._save_checkpoint(agent, env_step)
 
-        # Final checkpoint so a completed run is also resumable/exportable.
-        if self.config.checkpoint_path and self.config.checkpoint_every:
-            self._save_checkpoint(agent, step)
+            self._logger.keepalive(env_step)
 
-    # --------------------------------------------------------------- checkpoint
+        # Final flush
+        self._logger.write(env_step, fps=True)
 
-    def _save_checkpoint(self, agent: _AgentProto, step: int) -> None:
-        """Atomically write the agent + step to ``config.checkpoint_path``.
+    # ------------------------------------------------------------------
+    # Eval
+    # ------------------------------------------------------------------
 
-        Write-to-temp + rename means a crash mid-save can never corrupt the
-        previous checkpoint.  The replay buffer is intentionally not saved
-        (10+ GB at capacity); on resume it refills from scratch while the
-        world model keeps everything it learned.
+    def _run_eval(
+        self,
+        agent: Any,
+        obs_keys: list[str],
+        device: Any,
+        env_step: int,
+    ) -> None:
+        """Run ``eval_episode_num`` episodes with ``eval_mode=True``.
+
+        Reuses ``self._eval_envs`` (= train_envs).  Logs per-task success rates
+        and the mean success.
         """
-        path = Path(self.config.checkpoint_path)
+        cfg = self._cfg
+        N = self._N
+        num_rounds = max(1, math.ceil(cfg.eval_episode_num / N))
+
+        # Per-task success tracking {task_name: [successes]}
+        task_success: dict[str, list[float]] = {}
+
+        obs_np = self._eval_envs.reset(seed=None)
+        state = agent.get_initial_state(N)
+        is_first = np.ones(N, dtype=bool)
+        ep_return = np.zeros(N, dtype=np.float32)
+        completed = np.zeros(N, dtype=np.int32)  # episodes done per env slot
+
+        video_frames: list[np.ndarray] = []
+        video_done = False
+
+        while completed.min() < num_rounds:
+            if not video_done and "scene" in obs_np:
+                video_frames.append(obs_np["scene"][0])
+
+            obs_torch: dict[str, torch.Tensor] = {
+                k: torch.from_numpy(obs_np[k]).to(device) for k in obs_keys
+            }
+            obs_torch["is_first"] = torch.from_numpy(is_first).to(device)
+
+            with torch.no_grad():
+                action_t, next_state = agent.act(obs_torch, state, eval_mode=True)
+            action_np = action_t.detach().cpu().numpy()
+
+            obs_next_np, rewards, terms, truncs, info = self._eval_envs.step(action_np)
+            done = terms | truncs
+            ep_return += rewards
+
+            for i in range(N):
+                if done[i] and completed[i] < num_rounds:
+                    fin = info["final_info"][i]
+                    task_name = fin.get("task_name", f"env_{i}") if fin is not None else f"env_{i}"
+                    success = float(fin.get("success", 0.0)) if fin is not None else 0.0
+                    task_success.setdefault(task_name, []).append(success)
+                    completed[i] += 1
+
+            if not video_done and done[0]:
+                video_done = True
+
+            is_first = done.copy()
+            state = next_state
+            if done.any():
+                done_t = torch.from_numpy(done).to(device)
+                state["prev_action"][done_t] = 0.0
+
+            obs_np = obs_next_np
+
+        if video_frames:
+            self._logger.video("eval/video", np.stack(video_frames))
+
+        # Log per-task and mean success
+        all_successes: list[float] = []
+        for task_name, successes in task_success.items():
+            mean_s = float(np.mean(successes))
+            safe_name = task_name.replace("-", "_").replace(" ", "_")
+            self._logger.scalar(f"eval/success/{safe_name}", mean_s)
+            all_successes.extend(successes)
+
+        if all_successes:
+            self._logger.scalar("eval/success_mean", float(np.mean(all_successes)))
+
+        self._logger.write(env_step, fps=False)
+
+    # ------------------------------------------------------------------
+    # Checkpoint
+    # ------------------------------------------------------------------
+
+    def _save_checkpoint(self, agent: Any, env_step: int) -> None:
+        """Atomically save ``{agent: ..., step: env_step}`` to disk."""
+        path = Path(self._cfg.checkpoint_path)
+        tmp = path.with_suffix(".tmp")
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        torch.save({"step": int(step), "agent": agent.checkpoint_state()}, tmp)
-        tmp.replace(path)
-        print(f"checkpoint saved at step {step} -> {path}", flush=True)
-
-    # -------------------------------------------------------------------- eval
-
-    @torch.no_grad()
-    def eval(self, agent: _AgentProto, train_step: int) -> None:
-        """Roll ``eval_episode_num`` episodes with the deterministic actor."""
-        if self.eval_envs is None:
-            return
-        envs = self.eval_envs
-        n = envs.num_envs
-        device = agent.device
-        agent.eval()
-
-        obs_np, _ = envs.reset(seed=12345)
-        agent_state = agent.get_initial_state(n)
-        returns = np.zeros(n, dtype=np.float32)
-        steps = np.zeros(n, dtype=np.int32)
-        successes = np.zeros(n, dtype=bool)
-        done_once = np.zeros(n, dtype=bool)
-        eval_tasks: list[str | None] = [None] * n
-        # EEController episode diagnostics (YAM only), averaged over eval envs.
-        ctrl_diags: dict[str, list[float]] = {}
-
-        # Collect one episode's worth of frames from up to eval_episode_num envs.
-        # In MT runs each env is pinned to a different task, so this shows one
-        # video stream per task side-by-side in W&B.  The length is determined
-        # by env 0's episode so all streams are the same number of frames.
-        n_video = min(n, self.config.eval_episode_num)
-        videos: list[list[np.ndarray]] = [[] for _ in range(n_video)]
-        wrist_videos: list[list[np.ndarray]] = [[] for _ in range(n_video)]
-
-        while not done_once.all():
-            # Record before stepping to capture the current obs, not post-reset.
-            # Stop appending once env 0 finishes so all streams stay the same length.
-            if not done_once[0]:
-                for vi in range(n_video):
-                    if "scene" in obs_np:
-                        videos[vi].append(obs_np["scene"][vi])
-                    if "wrist_image" in obs_np:
-                        wrist_videos[vi].append(obs_np["wrist_image"][vi])
-            obs_t = self._obs_to_tensor(obs_np, device)
-            act, agent_state = agent.act(obs_t, agent_state, eval_mode=True)
-            obs_np, reward_np, terminated_np, truncated_np, eval_infos = envs.step(
-                act.detach().cpu().numpy()
-            )
-            done_np = terminated_np | truncated_np
-            active = ~done_once
-            returns += reward_np * active
-            steps += active.astype(np.int32)
-            for i, d in enumerate(done_np):
-                if d and not done_once[i]:
-                    fin = eval_infos[i].get("final_info", {})
-                    successes[i] = bool(fin.get("success", False))
-                    eval_tasks[i] = fin.get("task")
-                    for diag_name, diag_val in fin.get("ctrl_diag", {}).items():
-                        ctrl_diags.setdefault(diag_name, []).append(float(diag_val))
-            done_once |= done_np
-
-        self.logger.scalar("episode/eval_score", float(returns.mean()))
-        self.logger.scalar("episode/eval_length", float(steps.mean()))
-        self.logger.scalar("episode/eval_success", float(successes.mean()))
-        # Per-task eval success for multi-task (MT*) runs.
-        for task in {t for t in eval_tasks if t is not None}:
-            mask = np.array([t == task for t in eval_tasks], dtype=bool)
-            self.logger.scalar(f"episode/eval_success/{task}", float(successes[mask].mean()))
-        for diag_name, diag_vals in ctrl_diags.items():
-            self.logger.scalar(f"episode/eval_ctrl_{diag_name}", float(np.mean(diag_vals)))
-        # Stack per-env frame lists → (n_video, T, H, W, C); tile as 2 rows.
-        grid_cols = max(1, n_video // 2)
-        if videos[0]:
-            self.logger.video(
-                "eval/scene_video",
-                np.stack([np.stack(v, axis=0) for v in videos], axis=0),
-                cols=grid_cols,
-            )
-        if wrist_videos[0]:
-            self.logger.video(
-                "eval/wrist_video",
-                np.stack([np.stack(v, axis=0) for v in wrist_videos], axis=0),
-                cols=grid_cols,
-            )
-        self.logger.write(train_step)
-        agent.train()
-
-    # ----------------------------------------------------------------- helpers
-
-    @staticmethod
-    def _obs_to_tensor(
-        obs: Mapping[str, np.ndarray], device: torch.device
-    ) -> dict[str, torch.Tensor]:
-        return {k: torch.from_numpy(np.asarray(v)).to(device) for k, v in obs.items()}
+        torch.save({"agent": agent.checkpoint_state(), "step": env_step}, tmp)
+        os.replace(tmp, path)
+        log.info("checkpoint saved at step %d → %s", env_step, path)

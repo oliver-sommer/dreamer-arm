@@ -429,8 +429,12 @@ class ReturnEMA(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x_quantile = torch.quantile(x.detach().flatten(), self.range)
-        # Out-of-place copy keeps torch.compile happy.
-        self.ema_vals.copy_(self.alpha * x_quantile.detach() + (1 - self.alpha) * self.ema_vals)
+        updated = self.alpha * x_quantile.detach() + (1 - self.alpha) * self.ema_vals
+        # Ignore a non-finite batch: ``ema = alpha*NaN + (1-alpha)*ema`` is NaN
+        # forever, which would permanently poison the return normaliser (and via
+        # it every policy loss).  ``torch.where`` stays branchless for compile.
+        # Out-of-place copy also keeps torch.compile happy.
+        self.ema_vals.copy_(torch.where(torch.isfinite(x_quantile), updated, self.ema_vals))
         scale = torch.clip(self.ema_vals[1] - self.ema_vals[0], min=1.0)
         offset = self.ema_vals[0]
         return offset.detach(), scale.detach()

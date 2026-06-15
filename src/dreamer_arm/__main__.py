@@ -6,6 +6,7 @@ buffer → logger → trainer, then call ``trainer.begin(agent)``.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -20,7 +21,10 @@ from dreamer_arm.data.buffer import BufferConfig, ReplayBuffer
 from dreamer_arm.envs.factory import make_vector_env
 from dreamer_arm.train.logger import WandbLogger
 from dreamer_arm.train.trainer import OnlineTrainer, TrainerConfig
+from dreamer_arm.utils.logging import configure_logging
 from dreamer_arm.utils.seed import set_seed_everywhere
+
+log = logging.getLogger(__name__)
 
 # Must be set before any MuJoCo context is created.  On headless Linux servers
 # MuJoCo defaults to GLFW, which requires an X display.  EGL is the right
@@ -141,7 +145,7 @@ def run(cfg: DictConfig) -> None:
         ckpt = torch.load(str(cfg.resume), map_location=cfg.device, weights_only=False)
         agent.load_checkpoint_state(ckpt["agent"])
         start_step = int(ckpt["step"])
-        print(f"resumed from {cfg.resume} at step {start_step}", flush=True)
+        log.info("resumed from %s at step %d", cfg.resume, start_step)
 
     try:
         trainer = OnlineTrainer(trainer_cfg, buffer, logger, train_envs, eval_envs)
@@ -155,6 +159,7 @@ def run(cfg: DictConfig) -> None:
 
 @hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="config")
 def main(cfg: DictConfig) -> None:
+    configure_logging()
     run(cfg)
 
 

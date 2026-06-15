@@ -1,8 +1,11 @@
-# Rethink Robotics Sawyer arm configuration.
-# Assets must be vendored first — run: pixi run vendor-sawyer
-# Override IK tuning per-arm here; body/joint names live in envs/arms/sawyer.py.
+# Sawyer arm — uses Meta-World's default mocap (kinematic) actuation.
+# IK parameters are listed here for schema uniformity but are not used
+# (SawyerArm is a no-op that leaves both hooks uninstalled).
 
-name: "sawyer"
-
-# End-effector controller tuning.
-# ee_step_m: 0.02
+name: sawyer
+ee_step_m: 0.05
+damping: 0.05
+nullspace_gain: 1.0
+ori_gain: 1.0
+joint_margin: 0.05
+settle_steps: 200

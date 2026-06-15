@@ -74,6 +74,8 @@ test = "pytest"
 # PYTHONFAULTHANDLER prints a Python-level stack if native code segfaults (a
 # 12h MT50 run died to a bare SIGSEGV with zero context otherwise).
 train = { cmd = "python -m dreamer_arm", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE", PYTHONFAULTHANDLER = "1" } }
-# Live MuJoCo viewer window (macOS + mjpython only); use a single-task env, e.g.
-#   pixi run train-view envs=metaworld envs.task=door-open
-train-view = { cmd = "mjpython -m dreamer_arm envs.viewer=true envs.env_num=1 wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE" } }
+# Live MuJoCo viewer window (macOS + mjpython only).
+# Works with any task / benchmark — the viewer attaches to env 0.
+#   pixi run train-view envs.task=door-open          # single task
+#   pixi run train-view envs.task=MT10               # MT10, viewer on task 0
+train-view = { cmd = "mjpython -m dreamer_arm envs.viewer=true wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE" } }

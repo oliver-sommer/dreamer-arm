@@ -1,49 +1,35 @@
-# Meta-World multi-task (generalist) config.
+# Multi-task Meta-World (MT10 / MT25 / MT50).
 #
-# Trains one policy across all tasks of an MT benchmark, conditioned on a
-# one-hot ``task_id``.  The factory pins one env per task (env i → task i), so
-# ``env_num`` must be a multiple of the task count (== task count recommended):
-#   MT10 → 10 tasks, MT25 → 25, MT50 → 50.
+# Usage:
+#   pixi run train                                         # default: MT10, 10 envs
+#   pixi run train envs.task=MT25 envs.env_num=25
+#   pixi run train envs.task=MT50 envs.env_num=50
 #
-# ``envs.task`` is MANDATORY: MT10 | MT25 | MT50.
-#
-# Examples:
-#   pixi run train envs=metaworld-mt envs.task=MT10
-#   pixi run train envs=metaworld-mt envs.task=MT50 envs.env_num=50
+# Constraint: env_num must be divisible by task_count (10 / 25 / 50).
+# Each env is pinned to one task type and emits a one-hot task_id observation.
 
-name: "metaworld"   # factory routing → env_name = metaworld:<task>
-task: ???           # MT10 | MT25 | MT50 (mandatory)
+defaults:
+  - metaworld
+  - _self_
 
-steps: 5050000
-env_num: 10         # MT10 default; set envs.env_num=25 / 50 for MT25 / MT50
+# Default multi-task benchmark.
+task: MT10
+
+# One env per task (MT10 → 10 envs, MT25 → 25, MT50 → 50).
+env_num: 10
+
+# Longer runs for the harder multi-task problem.
+steps: 5000000
+train_ratio: 1.0
+
+# Evaluate one episode per env slot (= one episode per task for MT10).
 eval_episode_num: 10
-action_repeat: 2
-train_ratio: 512
-time_limit: 500
 
-seed: ${seed}
-device: ${device}
-size: [64, 64]
-
-# Jerk penalty subtracted from reward each step — discourages bang-bang control
-# and encourages smooth, hardware-friendly motion for sim-to-real on YAM.
-action_rate_cost: 0.02
-
-# Camera name passed to the Meta-World MuJoCo renderer.
-camera: corner2
-wrist_camera: wrist     # second image stream; null to disable
-camera_jitter: 0.05     # per-episode scene-camera position jitter (m); 0 disables
-wrist_fisheye: 0.0      # barrel-distortion strength for wrist camera (0 disables)
-scene_randomize: true           # per-episode table/wall/floor texture + tint + light DR
-camera_pose_randomize: true     # per-episode scene-camera viewpoint (hemisphere behind arm)
-viewer: false
-
+# Include task_id one-hot in encoder / decoder.
 encoder:
-  # Vision + one-hot task conditioning + non-privileged proprioception
-  # (joint angles, gripper opening, TCP xyz).  The 39-dim `state` stays
-  # excluded — it bundles privileged object/goal coords.
   mlp_keys: "proprio|task_id"
-  cnn_keys: "scene|wrist_image"
+  cnn_keys: "scene"
+
 decoder:
   mlp_keys: "proprio|task_id"
-  cnn_keys: "scene|wrist_image"
+  cnn_keys: "scene"

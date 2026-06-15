@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import init as nn_init
+
+log = logging.getLogger(__name__)
 
 
 def weight_init_(m: nn.Module, fan_type: str = "in") -> None:
@@ -118,8 +121,13 @@ def build_module_tree(module: nn.Module, module_name: str = "") -> dict[str, Any
     return {"name": module_name, "params": params, "children": children, "total": total}
 
 
-def print_module_tree(info: dict[str, Any], parent_path: str = "", indent: int = 0) -> None:
-    """Pretty-print the tree from :func:`build_module_tree` sorted by param count."""
+def format_module_tree(info: dict[str, Any], parent_path: str = "", indent: int = 0) -> str:
+    """Render the tree from :func:`build_module_tree`, sorted by param count.
+
+    Returns the whole tree as one string so callers can emit it in a single log
+    record (``log.info("model parameters:\\n%s", format_module_tree(tree))``),
+    keeping the indentation intact instead of stamping every line.
+    """
     name = info["name"]
     if not parent_path:
         full_path = name
@@ -128,11 +136,17 @@ def print_module_tree(info: dict[str, Any], parent_path: str = "", indent: int =
     else:
         full_path = parent_path
 
-    print(" " * indent + f"{info['total']:11,d} {full_path}")
+    lines = [" " * indent + f"{info['total']:11,d} {full_path}"]
     param_nodes = [
         {"name": pn, "params": {}, "children": {}, "total": n} for pn, n in info["params"].items()
     ]
     combined = param_nodes + list(info["children"].values())
     combined.sort(key=lambda x: x["total"], reverse=True)
     for child in combined:
-        print_module_tree(child, full_path, indent + 2)
+        lines.append(format_module_tree(child, full_path, indent + 2))
+    return "\n".join(lines)
+
+
+def log_module_tree(info: dict[str, Any]) -> None:
+    """Log the parameter tree from :func:`build_module_tree` as one record."""
+    log.info("model parameters:\n%s", format_module_tree(info))

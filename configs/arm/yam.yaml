@@ -1,18 +1,16 @@
-# i2rt YAM arm configuration.
-# IK tuning and body/joint names live in envs/arms/yam.py (YAM_ARM); the values
-# below document the active defaults.
-
-name: "yam"
-
-# End-effector controller tuning (defaults from arms/yam.py):
-#   ee_step_m: 0.02          # EE displacement per controlled step (m)
-#   max_joint_step: 0.3      # hard ceiling on |dq_i| per control frame (rad);
-#                            # the DLS solution is scaled uniformly to respect it
+# YAM 6-DOF arm — DLS-IK control parameters.
 #
-# Damped-least-squares IK:
-#   ik_damping: 5e-3         # base damping λ
-#   ik_damping_max: 0.1      # extra λ ramped in near singularities (Nakamura)
-#   ik_damping_sigma0: 0.1   # sigma_min threshold where adaptive damping starts
-#
-# Orientation: tcp_approach_axis=0 regulates the gripper's local x-axis to
-# straight-down while leaving wrist roll free (keeps joint4/5 off their limits).
+# ee_step_m:       max end-effector translation per agent step [metres]
+# damping:         DLS regularisation λ; bounds ‖dq‖ at singularities
+# nullspace_gain:  strength of home-pose pull in the arm's nullspace
+# ori_gain:        orientation error weight relative to position error
+# joint_margin:    keep joints this far from their hard limits [rad]
+# settle_steps:    physics steps to servo to home pose at each reset
+
+name: yam
+ee_step_m: 0.05
+damping: 0.05
+nullspace_gain: 1.0
+ori_gain: 1.0
+joint_margin: 0.05
+settle_steps: 200

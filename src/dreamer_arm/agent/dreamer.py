@@ -269,7 +269,13 @@ class Dreamer(nn.Module):
             # train/eval action-distribution mismatch.  Clamp here so the env,
             # the replay buffer, and the RSSM's prev_action all condition on
             # the same executed action.
-            action = action.clamp(-1.0, 1.0)
+            #
+            # nan_to_num first: MPS occasionally produces a non-finite sample,
+            # and a single NaN action stored in the replay buffer NaNs every
+            # subsequent loss.  clamp alone leaves NaN as NaN, so scrub it
+            # before clamping — a non-finite value must never reach the env or
+            # the buffer.
+            action = torch.nan_to_num(action).clamp(-1.0, 1.0)
         return action, TensorDict(
             {"stoch": stoch, "deter": deter, "prev_action": action},
             batch_size=state.batch_size,
@@ -296,15 +302,28 @@ class Dreamer(nn.Module):
             mets["opt/grad_rms"] = compute_rms(grads)
 
         adaptive_grad_clip(params, self._agc_clip, self._agc_pmin)
-        scale_before = self._scaler.get_scale()
-        self._scaler.step(self._optimizer)
-        self._scaler.update()
-        # Only step scheduler when the optimizer actually ran (scale decrease means
-        # GradScaler skipped the step due to inf/nan gradients).
-        if self._scaler.get_scale() >= scale_before:
+
+        # Non-finite gradient guard.  A single NaN/inf gradient must never reach
+        # the optimizer: without GradScaler (CUDA-only here), a disabled scaler
+        # steps unconditionally, so one transient NaN (e.g. an MPS sampling
+        # glitch) would corrupt every weight permanently.  On CUDA the scaler
+        # already skips such steps and lowers its scale; off-CUDA we check the
+        # (already-unscaled) grads ourselves.
+        if self._amp_enabled:
+            scale_before = self._scaler.get_scale()
+            self._scaler.step(self._optimizer)
+            self._scaler.update()
+            stepped = self._scaler.get_scale() >= scale_before
+        else:
+            stepped = all(p.grad is None or torch.isfinite(p.grad).all() for p in params)
+            if stepped:
+                self._optimizer.step()
+        # Only advance the LR schedule when the optimizer actually ran.
+        if stepped:
             self._scheduler.step()
         self._optimizer.zero_grad(set_to_none=True)
 
+        mets["opt/grad_skipped"] = torch.tensor(0.0 if stepped else 1.0)
         mets["opt/lr"] = torch.tensor(self._scheduler.get_last_lr()[0])
         mets["opt/grad_scale"] = torch.tensor(self._scaler.get_scale())
         if self._log_grads:
@@ -312,7 +331,11 @@ class Dreamer(nn.Module):
             mets["opt/param_rms"] = compute_rms([p.data for p in params])
             mets["opt/update_rms"] = compute_rms(updates)
 
-        replay_buffer.update_initial_state(index, stoch.detach(), deter.detach())
+        # Don't persist latent initial states from a skipped (non-finite) step:
+        # they may be NaN and would re-poison every future sample of these
+        # slices, turning one transient glitch into a burst of skipped updates.
+        if stepped:
+            replay_buffer.update_initial_state(index, stoch.detach(), deter.detach())
         return mets
 
     # ------------------------------------------------------------------ losses

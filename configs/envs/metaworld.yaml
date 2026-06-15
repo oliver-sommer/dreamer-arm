@@ -1,45 +1,64 @@
-# Meta-World single-task (MT1) config.
+# Single-task Meta-World environment.
 #
-# ``envs.task`` is any MT1 task name (without -v3 suffix) and is MANDATORY:
-#   door-open, drawer-close, button-press-topdown, window-open, …
-#
-# Examples:
+# Usage:
 #   pixi run train envs=metaworld envs.task=door-open
-#   pixi run train envs=metaworld envs.task=drawer-close arm=yam
+#   pixi run train envs=metaworld envs.task=pick-place arm=yam
 
-name: "metaworld"
-task: ???   # MT1 task name without -v3 suffix (mandatory)
+name: metaworld
+# Specific task name (mandatory — must be a valid Meta-World env name).
+task: ???
 
-steps: 1010000
-env_num: 4
-eval_episode_num: 10
-action_repeat: 2
-train_ratio: 512
-time_limit: 500
+# Vectorised collection.
+env_num: 8
+seed: 0
 
-seed: ${seed}
-device: ${device}
+# Observation image size [height, width].
 size: [64, 64]
 
-# Jerk penalty subtracted from reward each step — discourages bang-bang control
-# and encourages smooth, hardware-friendly motion for sim-to-real on YAM.
-action_rate_cost: 0.02
+# Physics steps per agent step (reward is summed over repeats).
+action_repeat: 2
 
-# Camera name passed to the Meta-World MuJoCo renderer.
-camera: corner2
-wrist_camera: wrist     # second image stream; null to disable
-camera_jitter: 0.05     # per-episode scene-camera position jitter (m); 0 disables
-wrist_fisheye: 0.0      # barrel-distortion strength for wrist camera (0 disables)
-scene_randomize: true           # per-episode table/wall/floor texture + tint + light DR
-camera_pose_randomize: true     # per-episode scene-camera viewpoint (hemisphere behind arm)
+# Maximum agent steps per episode (Meta-World max_path_length=500 at frame_skip=5;
+# action_repeat=2 → 250 agent steps).  Set below MW's hard limit so the trainer
+# handles truncation rather than relying on MW's internal counter.
+time_limit: 250
+
+# Total post-repeat env steps to train for.
+steps: 1000000
+
+# Agent update calls per env step.
+train_ratio: 0.5
+
+# Eval episodes per eval pass (one full set covers all task variants).
+eval_episode_num: 10
+
+# Scene camera (see yam_xyz_base.xml for available names).
+camera: corner
+# Wrist camera (null to disable; set to "wrist" to enable the palm-facing cam).
+wrist_camera: null
+
+# Domain randomisation (all false = deterministic training, faster iteration).
+scene_randomize: false
+camera_pose_randomize: false
+camera_jitter: 0.0
+# Barrel distortion coefficient for wrist fisheye; 0.0 = no distortion.
+wrist_fisheye: 0.0
+
+# Reward shaping penalties (0.0 = disabled; useful for sim-to-real transfer).
+action_rate_cost: 0.0
+action_mag_cost: 0.0
+
+# Fraction of `info["success"]` required to count a step as a success.
+success_threshold: 1.0
+
+# Open a live MuJoCo viewer on env 0 (mjpython only; set via CLI, not here).
 viewer: false
 
+# Keys fed to the encoder / decoder (regex patterns matched by the agent).
 encoder:
-  # `proprio` carries only non-privileged signals (joint angles, gripper
-  # opening, TCP xyz — all available on the real robot).  The privileged
-  # 39-dim `state` (object/goal coords) stays excluded.
   mlp_keys: "proprio"
-  cnn_keys: "scene|wrist_image"
+  cnn_keys: "scene"
+
 decoder:
   mlp_keys: "proprio"
-  cnn_keys: "scene|wrist_image"
+  cnn_keys: "scene"

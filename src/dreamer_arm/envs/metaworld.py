@@ -1,854 +1,311 @@
-"""Meta-World MT1 → Gymnasium 1.x adapter for Dreamer.
+"""Gymnasium Dict-obs adapter wrapping a single Meta-World task env.
 
-Wraps any Meta-World v3 MT1 task as a single-instance Gymnasium env with a
-Dict observation space containing an ``image`` (uint8 RGB) and a ``state``
-(float32 proprioceptive vector).  The ``DreamerObsWrapper`` in ``wrappers.py``
-adds the ``is_first``/``is_last``/``is_terminal`` flags on top, so this class
-must not emit them.
+Converts Meta-World's 39-dim flat ``state`` observation into a Dict of
+non-privileged modalities that the Dreamer encoder can consume:
 
-Task names use the raw Meta-World convention without the ``-v3`` suffix
-(e.g. ``"door-open"``, ``"drawer-close"``).  The factory prepends
-the ``metaworld:`` suite prefix, which is stripped before passing to this class.
+  ``scene``      - uint8 RGB (H, W, 3) from our own ``mujoco.Renderer``
+  ``wrist_image``- uint8 RGB (H, W, 3) from the wrist camera (optional)
+  ``proprio``    - float32 (10,): arm joint angles (6), gripper opening (1),
+                   TCP xyz (3).  For Sawyer the joint-angle slots are zeroed.
+  ``task_id``    - float32 one-hot (num_tasks,) for multi-task runs (optional)
 
-Arm selection
--------------
-Pass ``arm="yam"`` to drive YAM's real actuated arm through the
-``EEController`` instead of Sawyer's mocap weld.  When ``arm="yam"``:
+The privileged ``state`` returned by ``env._get_obs()`` is **never** fed to
+the agent; it bundles object/goal coordinates unavailable on a real robot.
 
-1. ``metaworld.set_active_arm("yam")`` is called before building the env so
-   ``full_V3_path_for`` routes to the YAM task XML variants.
-2. After building the env, an ``EEController`` is wired in via the fork's
-   injectable ``_external_actuation`` and ``_external_reset_hand`` hooks.
-3. Gripper sign is negated: Meta-World action ``+1 = close`` whereas
-   ``EEController`` interprets ``+1 = open``.
-4. Action-scale: Meta-World's ``action_scale=1/100`` over ``frame_skip=5``
-   corresponds to a maximum displacement of ~1cm per controlled step.
-   The YAM controller uses ``ee_step_m=0.01`` to match this scale.
+Domain randomisation (all toggleable per episode via ``reset()``):
+  * Camera pose on a hemisphere behind the arm
+  * Small camera-position jitter
+  * Scene-lighting colour / intensity variation
+  * Wrist barrel distortion (via scipy; silently skipped if unavailable)
 
-Rendering
----------
-We bypass Meta-World's built-in ``mujoco_renderer`` and use ``mujoco.Renderer``
-directly (the same pattern as the manip env).  The Meta-World env is therefore
-constructed with ``render_mode=None`` so gymnasium does not create a second,
-unused renderer object.
-
-Success tracking
-----------------
-Meta-World does not terminate episodes on success; it signals success via
-``info["success"]``.  We maintain a sticky ``_success`` flag that is set True
-the first time ``info["success"]`` is truthy within an episode and remains True
-until the next ``reset()``.  The factory's ``SyncVectorEnv`` auto-reset logic
-reads ``final_info["success"]`` for logging (``trainer.py:176``), so the
-truncation step's info must reflect the entire episode's success, not just the
-last step's.
+Sticky success:  Meta-World never terminates on success, but signals
+``info["success"]`` (float 0/1) every step.  This adapter ORs the flag across
+the episode so the vector env's ``final_info["success"]`` reflects the whole
+episode.
 """
 
 from __future__ import annotations
 
-import dataclasses
-from typing import TYPE_CHECKING, Any, ClassVar
+import contextlib
+from typing import Any, ClassVar
 
-if TYPE_CHECKING:
-    import mujoco
-    import mujoco.viewer as _viewer_mod
-
-import gymnasium as gym
+import gymnasium
+import mujoco
 import numpy as np
+from gymnasium import spaces
 
-ObsDict = dict[str, np.ndarray]
+_ARM_JOINT_NAMES = [f"joint{i}" for i in range(1, 7)]
+_PROPRIO_DIM = 10  # 6 joint angles + 1 gripper open + 3 TCP xyz
 
-# ee_step_m for YAM in Meta-World context: action_scale=1/100, frame_skip=5
-# → max displacement ≈ 5 * (1/100) m = 0.05 m/step.  We use a per-substep
-# step of 0.01 m so the IK is called once per outer step (no inner loop);
-# the _apply_action hook handles the frame_skip loop.
-_YAM_MW_EE_STEP_M = 0.01
+# Hemisphere sampling for camera DR (world frame, z=up)
+_CAM_LOOKAT = np.array([0.0, 0.55, 0.15])
+_CAM_AZIMUTH_RANGE = (100.0, 200.0)  # degrees (behind arm)
+_CAM_ELEVATION_RANGE = (-50.0, -15.0)  # degrees
+_CAM_DISTANCE_RANGE = (0.85, 1.3)  # metres
 
-# Arm home for the MW-spliced YAM model (joint1..joint6).
-# j2=2.2, j3=1.7 → TCP ≈ (0, 0.601, 0.174): sigma_min ≈ 0.15 (singularity-free),
-# z=0.174 is at the center of the reach goal range [0.05, 0.30], and the arm
-# stays well clear of all joint limits throughout the workspace.
-_YAM_MW_HOME_QPOS = (0.0, 2.2, 1.7, 0.0, 0.0, 0.0)
-
-# World-frame TCP workspace box for the MW YAM arm ((xlo,ylo,zlo),(xhi,yhi,zhi)).
-# y floor 0.35 keeps the TCP in front of the base (mount at y=0.23) and clear of
-# the retract-fold swing-around to negative y, while still admitting door-open's
-# pull targets (y≈0.41).  z floor 0.02 keeps it above the table; the x/upper
-# bounds bracket the MT object+goal spawn ranges (objects y≤0.95, |x|≤0.5).
-# z ceiling 0.45 clears every MW object/goal (goals z≤0.30) while excluding the
-# near-vertical "candle" fold above the base that froze the arm at the old 0.6
-# ceiling (constant (0,-1,+1) commands parked the TCP at the (0.35, 0.6) corner
-# with sigma_min≈0.03 and zero motion).
-_YAM_MW_WORKSPACE_BOX = ((-0.55, 0.35, 0.02), (0.55, 1.0, 0.45))
-
-# World-frame TCP reach sphere ((cx,cy,cz), radius) for the MW YAM arm.
-# Center = link_2 (shoulder) origin at home, measured from the model.  Max
-# ||tcp - shoulder|| over the j2/j3 range grid is 0.743 m — the singular
-# straight-arm pose; radius 0.70 (~6% inside) keeps commanded targets off the
-# extension singularity that the box alone admits (its far corner sits 1.05 m
-# from the shoulder, 40% beyond physical reach, so the IK chased unreachable
-# targets until damping/backoff froze the arm).
-_YAM_MW_REACH_SPHERE = ((0.0, 0.25, 0.114), 0.70)
 
 # ---------------------------------------------------------------------------
-# Scene domain-randomization constants
+# Barrel distortion helper
 # ---------------------------------------------------------------------------
 
-# Texture-pool name prefixes used in basic_scene.xml (resolved by name at init).
-_DR_CUBE_POOL_PREFIX = "T_pool_"  # cube textures for table / retaining walls
-_DR_FLOOR_POOL_PREFIX = "T_floorpool_"  # 2d textures for the floor plane
-# RGBA channel jitter magnitude (applied independently per channel, clamped [0,1]).
-_SCENE_RGBA_JITTER = 0.3
-# Light-color jitter magnitude (headlight ambient + directional diffuse/specular).
-_SCENE_LIGHT_JITTER = 0.15
-# Light-direction jitter magnitude (added to each component before renorm).
-_SCENE_LIGHT_DIR_JITTER = 0.15
+
+def _apply_barrel_distortion(image: np.ndarray, k1: float) -> np.ndarray:
+    """Barrel (k1>0) / pincushion (k1<0) distortion for wrist fisheye."""
+    if abs(k1) < 1e-6:
+        return image
+    try:
+        from scipy.ndimage import map_coordinates  # type: ignore[import-not-found]
+    except ImportError:
+        return image
+
+    h, w, c = image.shape
+    cx, cy = w / 2.0, h / 2.0
+    y_idx, x_idx = np.mgrid[0:h, 0:w]
+    xn = (x_idx - cx) / cx
+    yn = (y_idx - cy) / cy
+    r2 = xn**2 + yn**2
+    factor = 1.0 + k1 * r2
+    xs = xn * factor * cx + cx
+    ys = yn * factor * cy + cy
+    out = np.empty_like(image)
+    for ch in range(c):
+        out[:, :, ch] = map_coordinates(
+            image[:, :, ch].astype(np.float32),
+            [ys, xs],
+            order=1,
+            mode="nearest",
+        )
+    return out.astype(np.uint8)
+
 
 # ---------------------------------------------------------------------------
-# Camera-pose domain-randomization constants
+# Adapter
 # ---------------------------------------------------------------------------
-# World layout (from the MetaWorld XMLs):
-#   arm base  ≈ (0, 0.23, 0.01)   — mounts at the near table edge
-#   table top ≈ x∈[-0.7,0.7], y∈[0.2,1.0], z≈0
-#   "behind arm" = open near side (y < 0.23), looking in +y toward the table.
-# Ranges are research-informed (robosuite / MV-MWM camera DR literature).
-_CAM_TARGET = (0.0, 0.6, 0.08)  # look-at point: table centre, slightly above top
-_CAM_TARGET_JITTER = 0.02  # ± m of noise on the look-at point per episode
-_CAM_AZIMUTH_DEG = 60.0  # half-width azimuth sweep (°) around directly-behind
-_CAM_ELEVATION_MIN_DEG = 20.0  # minimum elevation above table plane
-_CAM_ELEVATION_MAX_DEG = 60.0  # maximum elevation above table plane
-_CAM_DISTANCE_MIN_M = 0.6  # minimum camera-target distance (m)
-_CAM_DISTANCE_MAX_M = 1.1  # maximum camera-target distance (m)
 
 
-def _build_fisheye_map(h: int, w: int, strength: float) -> tuple[np.ndarray, np.ndarray]:
-    """Precompute barrel-distortion source coordinates for an h x w image.
+class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
+    """Dict-obs Gymnasium wrapper around a single Meta-World task env."""
 
-    Returns (y_src, x_src) float32 arrays of shape (h, w).  Each entry gives
-    the source pixel to sample for the corresponding output pixel.  Coordinates
-    outside [0, h/w) are clamped (boundary-fill) at sample time.
-
-    ``strength`` controls barrel intensity: 0 = identity, 0.5 = visible fisheye
-    (corners sample from ~50% beyond the image radius).
-    """
-    y_out, x_out = np.mgrid[0:h, 0:w].astype(np.float32)
-    cx, cy = w * 0.5, h * 0.5
-    xn = (x_out - cx) / cx
-    yn = (y_out - cy) / cy
-    r = np.hypot(xn, yn)
-    r_src = r * (1.0 + strength * r * r)
-    safe_r = np.where(r > 0, r, 1.0)
-    x_src = np.where(r > 0, xn / safe_r * r_src * cx + cx, cx).astype(np.float32)
-    y_src = np.where(r > 0, yn / safe_r * r_src * cy + cy, cy).astype(np.float32)
-    return y_src, x_src
-
-
-def _apply_fisheye(frame: np.ndarray, fisheye_map: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
-    """Remap an (H, W, 3) uint8 frame through precomputed fisheye coordinates."""
-    y_src, x_src = fisheye_map
-    h, w = frame.shape[:2]
-    x0 = np.floor(x_src).astype(np.int32)
-    y0 = np.floor(y_src).astype(np.int32)
-    dx = (x_src - x0)[..., None].astype(np.float32)
-    dy = (y_src - y0)[..., None].astype(np.float32)
-    x0c = np.clip(x0, 0, w - 1)
-    x1c = np.clip(x0 + 1, 0, w - 1)
-    y0c = np.clip(y0, 0, h - 1)
-    y1c = np.clip(y0 + 1, 0, h - 1)
-    result = (
-        frame[y0c, x0c].astype(np.float32) * (1 - dy) * (1 - dx)
-        + frame[y0c, x1c].astype(np.float32) * (1 - dy) * dx
-        + frame[y1c, x0c].astype(np.float32) * dy * (1 - dx)
-        + frame[y1c, x1c].astype(np.float32) * dy * dx
-    )
-    return result.astype(np.uint8)
-
-
-class MetaWorld(gym.Env):  # type: ignore[type-arg]
-    """Single Meta-World MT1 task as a Gymnasium env with a Dict obs space.
-
-    The obs dict carries ``scene`` (uint8 RGB at ``size``) and ``state``
-    (the raw proprioceptive vector from Meta-World's observation space).
-
-    Parameters
-    ----------
-    name:
-        MT1 task name without the ``-v3`` suffix, e.g. ``"door-open"``.
-    arm:
-        Arm identifier.  ``"sawyer"`` (default) uses the upstream Sawyer mocap
-        control; ``"yam"`` drives the YAM arm via ``EEController`` IK.
-    action_repeat:
-        Number of inner ``step()`` calls per outer ``step()``; reward summed.
-    size:
-        ``(height, width)`` of the rendered image in pixels.
-    camera:
-        MuJoCo camera name (e.g. ``"corner2"``).
-    wrist_camera:
-        Optional second MuJoCo camera name for a wrist-mounted view.
-    camera_jitter:
-        Per-episode Gaussian noise magnitude (m) added to the scene-camera
-        position.  ``0`` disables.  When ``camera_pose_randomize`` is also
-        enabled this noise is layered on top of the sampled pose.
-    scene_randomize:
-        When ``True``, each ``reset()`` randomly swaps the table, retaining-wall,
-        and floor textures from a pre-loaded pool and jitters RGBA tints and
-        lighting colours.  Requires the DR texture pool to be present in the
-        scene XML (``basic_scene.xml`` includes it by default).
-    camera_pose_randomize:
-        When ``True``, each ``reset()`` samples a new scene-camera pose on a
-        wide hemisphere **behind the arm** (azimuth +-60 deg, elevation 20-60 deg,
-        distance 0.6-1.1 m from the table centre), aimed at the table with a
-        computed look-at quaternion.  This is independent of ``camera_jitter``.
-    seed:
-        Used to seed the MT1 benchmark for reproducible task sampling.
-    viewer:
-        Open a passive MuJoCo viewer window (macOS + ``mjpython`` only).
-    task_idx, num_tasks:
-        Multi-task conditioning.  When ``num_tasks`` is set, the obs dict gains a
-        ``task_id`` key holding a one-hot of length ``num_tasks`` with a 1 at
-        ``task_idx``.  This is how a generalist policy is told which task it is
-        in; the factory pins one task per env (see ``_make_metaworld_mt``).  Left
-        ``None`` for ordinary single-task runs, in which case no ``task_id`` key
-        is emitted.
-    """
-
-    metadata: ClassVar[dict[str, list[str]]] = {"render_modes": ["rgb_array"]}  # type: ignore[misc]
+    metadata: ClassVar[dict[str, Any]] = {}
 
     def __init__(
         self,
-        name: str,
-        arm: str = "sawyer",
-        action_repeat: int = 1,
-        size: tuple[int, int] = (64, 64),
-        camera: str = "corner2",
+        env: Any,
+        task: Any,
+        arm: str,
+        size: tuple[int, int],
+        camera: str,
+        *,
         wrist_camera: str | None = None,
-        camera_jitter: float = 0.0,
         scene_randomize: bool = False,
         camera_pose_randomize: bool = False,
+        camera_jitter: float = 0.0,
         wrist_fisheye: float = 0.0,
-        seed: int = 0,
-        viewer: bool = False,
         task_idx: int | None = None,
         num_tasks: int | None = None,
+        success_threshold: float = 1.0,
+        viewer: bool = False,
     ) -> None:
-        import metaworld
-        import mujoco as _mj
-
-        self._name = name
+        super().__init__()
         self._arm = arm
-        self._action_repeat = int(action_repeat)
         self._size = size
         self._camera = camera
         self._wrist_camera = wrist_camera
-        self._camera_jitter = float(camera_jitter)
         self._scene_randomize = scene_randomize
         self._camera_pose_randomize = camera_pose_randomize
-        self._rng = np.random.default_rng(seed)
-
-        # One-hot task conditioning (multi-task runs only).  Constant per env
-        # because the factory pins a single task class to each env instance.
-        self._task_onehot: np.ndarray | None = None
-        if num_tasks is not None:
-            if task_idx is None or not 0 <= task_idx < num_tasks:
-                raise ValueError(
-                    f"task_idx must be in [0, {num_tasks}) when num_tasks is set; got {task_idx}"
-                )
-            self._task_onehot = np.eye(num_tasks, dtype=np.float32)[task_idx]
-
-        # Route asset paths for the YAM arm before building any env class.
-        if arm == "yam":
-            metaworld.set_active_arm("yam")
-        else:
-            metaworld.set_active_arm("sawyer")
-
-        mt1 = metaworld.MT1(name + "-v3", seed=seed)
-        # render_mode=None: we manage all rendering via our own mujoco.Renderer
-        # below; passing "rgb_array" would make gymnasium create a second,
-        # unused MujocoRenderer object.
-        env = mt1.train_classes[name + "-v3"](render_mode=None)
-        env.set_task(mt1.train_tasks[0])
-
-        # Adjust camera position for the corner2 view used in the paper.
-        if camera == "corner2":
-            env.model.cam_pos[2] = [0.75, 0.075, 0.7]
-
-        # Allow task randomisation across episodes.
-        env._freeze_rand_vec = False
+        self._camera_jitter = camera_jitter
+        self._wrist_fisheye = wrist_fisheye
+        self._task_idx = task_idx
+        self._num_tasks = num_tasks
+        self._success_threshold = success_threshold
 
         self._env = env
-        self._mt1 = mt1
-        self._success: bool = False
-        self._viewer_requested = viewer
-        self._passive_viewer: _viewer_mod.Handle | None = None
+        env.set_task(task)
+        self._task_name: str = str(task.env_name)
 
-        # Per-episode EEController diagnostics (YAM only).  Aggregated in
-        # step(), reset in reset(), and attached to info as "ctrl_diag" so the
-        # trainer can log the episode aggregate from final_info.
-        self._diag_n: int = 0
-        self._diag_sigma_sum: float = 0.0
-        self._diag_sigma_min: float = float("inf")
-        self._diag_near_singular: int = 0
-        self._diag_clip: int = 0
-        self._diag_backoff: int = 0
-        self._diag_ws_clamp: int = 0
-        self._diag_near_limit: int = 0
-        # Stuck detection: steps where the policy commands meaningful TCP motion
-        # but the arm achieves <25% of it (singularity / limit lock-up symptom).
-        self._diag_stuck: int = 0
-        self._diag_stuck_run: int = 0
-        self._diag_stuck_max_run: int = 0
-        self._diag_track_sum: float = 0.0
-        self._diag_track_n: int = 0
-        self._prev_tcp: np.ndarray | None = None
+        # Single renderer — one EGL context for both scene and wrist
+        self._renderer = mujoco.Renderer(env.model, height=size[0], width=size[1])
+        self._scene_cam: mujoco.MjvCamera | None = None  # set each reset
 
-        # Wire in the YAM IK controller via the fork's injectable hooks.
+        # Resolve joint addresses for proprio
+        m = env.model
         if arm == "yam":
-            self._setup_yam_control(env)
-
-        # Own renderer — gives us full control over camera and image format;
-        # Meta-World's internal mujoco_renderer is never initialised (render_mode=None).
-        self._renderer: mujoco.Renderer = _mj.Renderer(env.model, height=size[0], width=size[1])
-        cam_id = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_CAMERA, camera)
-        self._camera_id: int = int(cam_id) if cam_id >= 0 else 0
-        # Snapshot the (possibly overridden) base position for per-episode jitter.
-        self._cam_base_pos: np.ndarray = np.array(env.model.cam_pos[self._camera_id], copy=True)
-
-        # corner2's original euler produces an upside-down image; render() corrects
-        # it with a vertical flip.  When camera_pose_randomize computes an upright
-        # look-at quaternion directly, no flip is needed.
-        self._scene_flip: bool = (camera == "corner2") and not camera_pose_randomize
-
-        # Per-episode appearance DR state (populated lazily by _dr_init).
-        self._dr_cube_mat_ids: list[int] = []
-        self._dr_floor_mat_ids: list[int] = []
-        self._dr_mat_base_rgba: dict[int, np.ndarray] = {}
-        self._dr_cube_pool: list[int] = []
-        self._dr_floor_pool: list[int] = []
-        self._dr_headlight_ambient_base: np.ndarray | None = None
-        self._dr_light_diffuse_base: np.ndarray | None = None
-        self._dr_light_specular_base: np.ndarray | None = None
-        self._dr_light_dir_base: np.ndarray | None = None
-        if scene_randomize:
-            self._dr_init(env)
-
-        self._wrist_camera_id: int | None = None
-        if wrist_camera is not None:
-            wc_id = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_CAMERA, wrist_camera)
-            if wc_id < 0:
-                raise RuntimeError(
-                    f"Wrist camera {wrist_camera!r} not found in model. "
-                    "Check that yam_xyz_base.xml defines it."
-                )
-            self._wrist_camera_id = int(wc_id)
-
-        # Precompute barrel-distortion remap for the wrist camera once.
-        self._fisheye_map: tuple[np.ndarray, np.ndarray] | None = None
-        if wrist_fisheye > 0.0 and self._wrist_camera_id is not None:
-            self._fisheye_map = _build_fisheye_map(size[0], size[1], wrist_fisheye)
-
-        obs_spaces: dict[str, gym.spaces.Space] = {  # type: ignore[type-arg]
-            "scene": gym.spaces.Box(0, 255, (*size, 3), dtype=np.uint8),
-            "state": env.observation_space,
-        }
-        if self._wrist_camera_id is not None:
-            obs_spaces["wrist_image"] = gym.spaces.Box(0, 255, (*size, 3), dtype=np.uint8)
-        if arm == "yam":
-            # Non-privileged proprioception: 6 arm joint angles + gripper
-            # opening + TCP xyz.  Everything here is available from the real
-            # robot's encoders / forward kinematics — unlike `state`, which
-            # bundles privileged object and goal coordinates.
-            obs_spaces["proprio"] = gym.spaces.Box(-np.inf, np.inf, (10,), dtype=np.float32)
-        if self._task_onehot is not None:
-            obs_spaces["task_id"] = gym.spaces.Box(
-                0.0, 1.0, (self._task_onehot.shape[0],), dtype=np.float32
+            self._arm_qadr: np.ndarray | None = np.array(
+                [int(m.jnt_qposadr[m.joint(n).id]) for n in _ARM_JOINT_NAMES],
+                dtype=np.int32,
             )
-        self.observation_space: gym.spaces.Dict = gym.spaces.Dict(obs_spaces)
-        self.action_space: gym.spaces.Box = gym.spaces.Box(
-            env.action_space.low,
-            env.action_space.high,
-            dtype=np.float32,
-        )
-
-    # ---------------------------------------------------------------- DR helpers
-
-    def _dr_init(self, env: Any) -> None:
-        """Cache material IDs, texture pool IDs, and baseline values for DR.
-
-        Called once in ``__init__`` when ``scene_randomize=True``.  Safe to call
-        on scenes where the named pool textures are absent — the pools stay empty
-        and ``_apply_scene_dr`` skips texture-swapping for those surfaces.
-        """
-        import mujoco as _mj
-
-        model = env.model
-
-        # Material IDs and baseline RGBA for the three randomised surfaces.
-        for mat_name in ("table_wood", "wall_metal"):
-            mid = _mj.mj_name2id(model, _mj.mjtObj.mjOBJ_MATERIAL, mat_name)
-            if mid >= 0:
-                self._dr_cube_mat_ids.append(mid)
-                self._dr_mat_base_rgba[mid] = np.array(model.mat_rgba[mid], copy=True)
-        for mat_name in ("basic_floor",):
-            mid = _mj.mj_name2id(model, _mj.mjtObj.mjOBJ_MATERIAL, mat_name)
-            if mid >= 0:
-                self._dr_floor_mat_ids.append(mid)
-                self._dr_mat_base_rgba[mid] = np.array(model.mat_rgba[mid], copy=True)
-
-        # Collect named texture pools (T_pool_0, T_pool_1, … and T_floorpool_0, …).
-        for prefix, pool in (
-            (_DR_CUBE_POOL_PREFIX, self._dr_cube_pool),
-            (_DR_FLOOR_POOL_PREFIX, self._dr_floor_pool),
-        ):
-            i = 0
-            while True:
-                tid = _mj.mj_name2id(model, _mj.mjtObj.mjOBJ_TEXTURE, f"{prefix}{i}")
-                if tid < 0:
-                    break
-                pool.append(tid)
-                i += 1
-
-        # Also include each material's original texture so the default appearance
-        # is part of the random distribution (one-in-N chance per episode).
-        is_multi_role = model.mat_texid.ndim == 2  # MuJoCo ≥3 multi-role layout
-        for mat_ids, pool in (
-            (self._dr_cube_mat_ids, self._dr_cube_pool),
-            (self._dr_floor_mat_ids, self._dr_floor_pool),
-        ):
-            if not pool:
-                continue
-            for mid in mat_ids:
-                orig = int(model.mat_texid[mid, 0] if is_multi_role else model.mat_texid[mid])
-                if orig >= 0 and orig not in pool:
-                    pool.insert(0, orig)
-
-        # Snapshot baseline lighting for per-episode jitter.
-        self._dr_headlight_ambient_base = np.array(model.vis.headlight.ambient, copy=True)
-        self._dr_light_diffuse_base = np.array(model.light_diffuse, copy=True)
-        self._dr_light_specular_base = np.array(model.light_specular, copy=True)
-        self._dr_light_dir_base = np.array(model.light_dir, copy=True)
-
-    def _apply_scene_dr(self) -> None:
-        """Per-episode: swap textures, jitter RGBA tints, and jitter lighting."""
-        model = self._env.model
-        is_multi_role = model.mat_texid.ndim == 2  # MuJoCo ≥3 multi-role layout
-
-        def _write_texid(mat_id: int, tex_id: int) -> None:
-            if is_multi_role:
-                model.mat_texid[mat_id, 0] = tex_id  # role 0 = legacy/user texture
-            else:
-                model.mat_texid[mat_id] = tex_id
-
-        # Table + retaining walls: random cube texture + RGBA tint.
-        if self._dr_cube_pool:
-            for mid in self._dr_cube_mat_ids:
-                _write_texid(mid, int(self._rng.choice(self._dr_cube_pool)))
-                rgba = self._dr_mat_base_rgba[mid].copy()
-                rgba[:3] = np.clip(
-                    rgba[:3] + self._rng.uniform(-_SCENE_RGBA_JITTER, _SCENE_RGBA_JITTER, 3),
-                    0.0,
-                    1.0,
-                )
-                model.mat_rgba[mid] = rgba
-
-        # Floor: random 2d texture + RGBA tint.
-        if self._dr_floor_pool:
-            for mid in self._dr_floor_mat_ids:
-                _write_texid(mid, int(self._rng.choice(self._dr_floor_pool)))
-                rgba = self._dr_mat_base_rgba[mid].copy()
-                rgba[:3] = np.clip(
-                    rgba[:3] + self._rng.uniform(-_SCENE_RGBA_JITTER, _SCENE_RGBA_JITTER, 3),
-                    0.0,
-                    1.0,
-                )
-                model.mat_rgba[mid] = rgba
-
-        # Background: jitter headlight ambient and directional light colors.
-        if self._dr_headlight_ambient_base is not None:
-            model.vis.headlight.ambient[:] = np.clip(
-                self._dr_headlight_ambient_base
-                + self._rng.uniform(-_SCENE_LIGHT_JITTER, _SCENE_LIGHT_JITTER, 3),
-                0.0,
-                1.0,
-            )
-        if self._dr_light_diffuse_base is not None:
-            model.light_diffuse[:] = np.clip(
-                self._dr_light_diffuse_base
-                + self._rng.uniform(
-                    -_SCENE_LIGHT_JITTER,
-                    _SCENE_LIGHT_JITTER,
-                    self._dr_light_diffuse_base.shape,
-                ),
-                0.0,
-                1.0,
-            )
-            model.light_specular[:] = np.clip(
-                self._dr_light_specular_base  # type: ignore[operator]
-                + self._rng.uniform(
-                    -_SCENE_LIGHT_JITTER,
-                    _SCENE_LIGHT_JITTER,
-                    self._dr_light_specular_base.shape,  # type: ignore[union-attr]
-                ),
-                0.0,
-                1.0,
-            )
-        if self._dr_light_dir_base is not None:
-            noisy = self._dr_light_dir_base + self._rng.uniform(
-                -_SCENE_LIGHT_DIR_JITTER,
-                _SCENE_LIGHT_DIR_JITTER,
-                self._dr_light_dir_base.shape,
-            )
-            norms = np.linalg.norm(noisy, axis=-1, keepdims=True)
-            model.light_dir[:] = noisy / np.where(norms > 0, norms, 1.0)
-
-    def _sample_camera_pose(self) -> None:
-        """Per-episode: place the scene camera on the hemisphere behind the arm.
-
-        Samples azimuth, elevation, and distance uniformly within the ranges
-        defined by the module-level ``_CAM_*`` constants, then computes a
-        look-at quaternion so the camera frames the table centre.
-
-        MuJoCo cameras look along local **-z** with local **+y** as up.  We
-        build the rotation matrix from the sampled position to the look-at
-        target and convert it to a quaternion with ``mju_mat2Quat``.
-        """
-        import mujoco as _mj
-
-        target = np.array(_CAM_TARGET) + self._rng.uniform(
-            -_CAM_TARGET_JITTER, _CAM_TARGET_JITTER, 3
-        )
-        a = np.deg2rad(self._rng.uniform(-_CAM_AZIMUTH_DEG, _CAM_AZIMUTH_DEG))
-        e = np.deg2rad(self._rng.uniform(_CAM_ELEVATION_MIN_DEG, _CAM_ELEVATION_MAX_DEG))
-        d = self._rng.uniform(_CAM_DISTANCE_MIN_M, _CAM_DISTANCE_MAX_M)
-
-        # Camera sits on the open near side (-y), elevated by e, swept +-a left/right.
-        # a=0 -> directly behind the arm (world -y direction from table centre).
-        pos = target + d * np.array(
-            [
-                np.cos(e) * np.sin(a),
-                -np.cos(e) * np.cos(a),
-                np.sin(e),
-            ]
-        )
-
-        # Look-at quaternion: camera->world rotation with columns [x_cam, y_cam, z_cam].
-        #   z_cam  = -forward  (camera looks along local -z)
-        #   x_cam  = normalise(cross(world_up, z_cam))  (rightward)
-        #   y_cam  = cross(z_cam, x_cam)                (upward, orthogonalised)
-        forward = target - pos
-        forward /= np.linalg.norm(forward)
-        z_cam = -forward
-        world_up = np.array([0.0, 0.0, 1.0])
-        x_cam = np.cross(world_up, z_cam)
-        x_cam /= np.linalg.norm(x_cam)
-        y_cam = np.cross(z_cam, x_cam)
-
-        mat = np.array(
-            [
-                x_cam[0],
-                y_cam[0],
-                z_cam[0],
-                x_cam[1],
-                y_cam[1],
-                z_cam[1],
-                x_cam[2],
-                y_cam[2],
-                z_cam[2],
-            ]
-        )
-        quat = np.zeros(4)
-        _mj.mju_mat2Quat(quat, mat)
-
-        self._env.model.cam_pos[self._camera_id] = pos
-        self._env.model.cam_quat[self._camera_id] = quat
-
-    # ---------------------------------------------------------------- YAM control
-
-    def _setup_yam_control(self, env: Any) -> None:
-        """Wire the YAM EEController into the Meta-World env via hook injection.
-
-        Steps:
-        1. Build an EEController in down-axis orientation mode (YAM_ARM sets
-           tcp_approach_axis=0): the gripper's local x-axis is regulated to
-           straight-down each step while wrist roll stays free, which keeps the
-           wrist off its ±π/2 limits that previously locked the arm.
-        2. Inject _external_actuation: loops frame_skip IK steps per outer step,
-           negating the gripper channel (MW convention: +1=close; EE: +1=open).
-        3. Inject _external_reset_hand: resets arm to init_qpos, syncs ctrl,
-           settles physics, and sets init_tcp.
-        """
-        import mujoco as _mj
-
-        from dreamer_arm.envs.arms.yam import YAM_ARM
-        from dreamer_arm.envs.control import EEController
-
-        tcp_id = _mj.mj_name2id(env.model, _mj.mjtObj.mjOBJ_SITE, "grasp_site")
-        if tcp_id < 0:
-            raise RuntimeError(
-                "grasp_site not found in YAM Meta-World model.  "
-                "Check that yam_xyz_base.xml is included correctly."
-            )
-
-        # Build YAM_ARM variant with MW-specific settings.  Orientation is handled
-        # by down-axis regulation (YAM_ARM.tcp_approach_axis), so no fixed target
-        # quaternion is needed; only ee_step_m is scaled to MW's action_scale.
-        yam_arm_mw = dataclasses.replace(
-            YAM_ARM,
-            ee_step_m=_YAM_MW_EE_STEP_M,
-            workspace_box=_YAM_MW_WORKSPACE_BOX,
-            reach_sphere=_YAM_MW_REACH_SPHERE,
-        )
-        controller = EEController(yam_arm_mw, env.model)
-        # Orientation gain for the down-axis error (gentler than full-quat
-        # tracking): enough to hold the gripper within ~0.1° of vertical during
-        # motion without fighting the IK's position component.
-        controller._ori_gain = 0.3
-
-        # Re-pose the arm home to a well-conditioned configuration (see
-        # _YAM_MW_HOME_QPOS).  init_qpos is what _reset_hand restores each reset;
-        # we only touch the 6 arm-joint entries, leaving object/finger DOFs intact.
-        for adr, q in zip(controller._arm_qpos_adrs, _YAM_MW_HOME_QPOS, strict=True):
-            env.init_qpos[adr] = q
-
-        frame_skip: int = int(env.frame_skip)
-        timestep: float = float(env.model.opt.timestep)
-
-        def _apply_action(mw_env: Any, action: np.ndarray) -> None:
-            """IK-based actuation with velocity-consistent kinematic anchoring.
-
-            The arm joints are played back kinematically toward the IK target —
-            qpos interpolated across the frame_skip window with the *matching*
-            qvel — so tracking stays exact while contacts see real joint
-            velocities.  (A qpos teleport with qvel=0 moves the arm outside the
-            dynamics: friction can then never transport a grasped object, which
-            made lifting impossible.)
-
-            The fingers are NOT anchored: the gripper position actuator drives
-            left_finger and the equality constraint mirrors right_finger, so
-            closing on an object is compliant and produces a physical pinch
-            instead of teleporting through it.
-            Gripper sign negated: MW +1=close, EEController +1=open.
-            """
-            action_ee = np.array(action, dtype=np.float64)
-            action_ee[3] = -action_ee[3]  # negate gripper channel
-
-            # IK: compute new joint position targets → stored in data.ctrl.
-            controller.apply(action_ee, mw_env.model, mw_env.data)
-
-            # Cache targets (read once; don't re-run IK per substep).
-            q_tgt = np.array([mw_env.data.ctrl[aid] for aid in controller._arm_act_ids])
-            q_start = np.array([mw_env.data.qpos[adr] for adr in controller._arm_qpos_adrs])
-            dq_sub = (q_tgt - q_start) / frame_skip
-            qvel_sub = dq_sub / timestep
-
-            for i in range(frame_skip):
-                # Pin the interval *start* (q_start + i*dq) with the matching
-                # velocity; mj_step's integration then lands exactly on the
-                # interval end, so the window finishes precisely at q_tgt.
-                q_i = q_start + i * dq_sub
-                for k, (qpos_adr, dof_adr) in enumerate(
-                    zip(controller._arm_qpos_adrs, controller._arm_dof_adrs, strict=True)
-                ):
-                    mw_env.data.qpos[qpos_adr] = q_i[k]
-                    mw_env.data.qvel[dof_adr] = qvel_sub[k]
-                for k, aid in enumerate(controller._arm_act_ids):
-                    mw_env.data.ctrl[aid] = q_tgt[k]
-                _mj.mj_step(mw_env.model, mw_env.data)
-
-        def _reset_hand(mw_env: Any, steps: int = 50) -> None:
-            """Reset arm to home pose kinematically, then settle object physics."""
-            mw_env.set_state(mw_env.init_qpos, mw_env.init_qvel)
-            # Sync ctrl to qpos so actuators hold the pose between steps.
-            for i, aid in enumerate(controller._arm_act_ids):
-                mw_env.data.ctrl[aid] = mw_env.data.qpos[controller._arm_qpos_adrs[i]]
-            mw_env.data.ctrl[controller._gripper_act_id] = controller._g_lo
-            _mj.mj_forward(mw_env.model, mw_env.data)
-            for _ in range(steps):
-                _mj.mj_step(mw_env.model, mw_env.data)
-            mw_env.init_tcp = mw_env.tcp_center
-
-        env._external_actuation = _apply_action
-        env._external_reset_hand = _reset_hand
-        env._yam_controller = controller  # expose for tuning / testing
-
-    # ---------------------------------------------------------------- gym API
-
-    def _render_camera(self, cam_id: int, flip: bool) -> np.ndarray:
-        self._renderer.update_scene(self._env.data, camera=cam_id)
-        frame: np.ndarray = self._renderer.render()
-        return np.flip(frame, axis=0) if flip else frame
-
-    def _make_obs(self, state: np.ndarray) -> ObsDict:
-        """Build the Dreamer obs dict, adding the one-hot ``task_id`` if present."""
-        obs: ObsDict = {
-            "scene": self.render(),
-            "state": np.asarray(state, dtype=np.float32),
-        }
-        if self._wrist_camera_id is not None:
-            wrist = self._render_camera(self._wrist_camera_id, flip=False)
-            if self._fisheye_map is not None:
-                wrist = _apply_fisheye(wrist, self._fisheye_map)
-            obs["wrist_image"] = wrist
-        if self._arm == "yam":
-            ctrl = self._env._yam_controller
-            data = self._env.data
-            joints = [float(data.qpos[adr]) for adr in ctrl._arm_qpos_adrs]
-            obs["proprio"] = np.array(
-                [*joints, ctrl.gripper_opening(data), *ctrl.tcp_pos(data)],
-                dtype=np.float32,
-            )
-        if self._task_onehot is not None:
-            obs["task_id"] = self._task_onehot
-        return obs
-
-    def _info(self, **extra: Any) -> dict[str, Any]:
-        """Step/reset info, tagged with the task name for per-task logging."""
-        info: dict[str, Any] = {"task": self._name, **extra}
-        if self._arm == "yam" and self._diag_n > 0:
-            info["ctrl_diag"] = {
-                "sigma_min_mean": self._diag_sigma_sum / self._diag_n,
-                "sigma_min_min": self._diag_sigma_min,
-                "frac_near_singular": self._diag_near_singular / self._diag_n,
-                "frac_clip_active": self._diag_clip / self._diag_n,
-                "frac_backoff": self._diag_backoff / self._diag_n,
-                "frac_ws_clamp": self._diag_ws_clamp / self._diag_n,
-                "frac_near_joint_limit": self._diag_near_limit / self._diag_n,
-                "frac_stuck": (
-                    self._diag_stuck / self._diag_track_n if self._diag_track_n else 0.0
-                ),
-                "stuck_max_run": float(self._diag_stuck_max_run),
-                "track_ratio_mean": (
-                    self._diag_track_sum / self._diag_track_n if self._diag_track_n else 1.0
-                ),
-            }
-        return info
-
-    def _accumulate_ctrl_diag(self) -> None:
-        """Fold the controller's per-step diagnostics into episode aggregates."""
-        ctrl = self._env._yam_controller
-        diag = ctrl.last_diag
-        if not diag:
-            return
-        sigma = float(diag["sigma_min"])
-        self._diag_n += 1
-        self._diag_sigma_sum += sigma
-        self._diag_sigma_min = min(self._diag_sigma_min, sigma)
-        self._diag_near_singular += int(sigma < 0.03)
-        self._diag_clip += int(diag.get("clip_active", 0.0) > 0.0)
-        self._diag_backoff += int(diag.get("backoff_alpha", 1.0) < 1.0)
-        self._diag_ws_clamp += int(diag.get("ws_clamp_active", 0.0) > 0.0)
-        self._diag_near_limit += int(diag.get("near_limit", 0.0) > 0.0)
-
-        # Stuck detection: commanded TCP motion vs achieved TCP displacement.
-        # Only steps with a meaningful post-clamp command count (wall-riding at
-        # the workspace box clamps cmd_norm to ~0 and is tracked separately via
-        # frac_ws_clamp).  ratio < 0.25 → the arm is fighting a singularity,
-        # joint limit, or obstacle instead of moving.
-        tcp_now = ctrl.tcp_pos(self._env.data).astype(np.float64)
-        cmd_norm = float(diag.get("cmd_norm", 0.0))
-        if self._prev_tcp is not None and cmd_norm > 0.2 * ctrl._step_m:
-            ratio = float(np.linalg.norm(tcp_now - self._prev_tcp)) / cmd_norm
-            self._diag_track_sum += ratio
-            self._diag_track_n += 1
-            if ratio < 0.25:
-                self._diag_stuck += 1
-                self._diag_stuck_run += 1
-                self._diag_stuck_max_run = max(self._diag_stuck_max_run, self._diag_stuck_run)
-            else:
-                self._diag_stuck_run = 0
         else:
-            self._diag_stuck_run = 0
-        self._prev_tcp = tcp_now
+            self._arm_qadr = None  # Sawyer: zeros
+
+        self._episode_success: bool = False
+        self._rng = np.random.default_rng()
+
+        # Passive viewer (mjpython only; None when viewer=False)
+        self._mj_viewer: Any = None
+        if viewer:
+            import mujoco.viewer as _mjv
+
+            self._mj_viewer = _mjv.launch_passive(env.model, env.data)
+
+        # Observation & action spaces
+        H, W = size
+        obs_dict: dict[str, spaces.Space[Any]] = {
+            "scene": spaces.Box(0, 255, (H, W, 3), dtype=np.uint8),
+            "proprio": spaces.Box(-np.inf, np.inf, (_PROPRIO_DIM,), dtype=np.float32),
+        }
+        if wrist_camera is not None:
+            obs_dict["wrist_image"] = spaces.Box(0, 255, (H, W, 3), dtype=np.uint8)
+        if task_idx is not None and num_tasks is not None:
+            obs_dict["task_id"] = spaces.Box(0.0, 1.0, (num_tasks,), dtype=np.float32)
+        self.observation_space: spaces.Dict = spaces.Dict(obs_dict)
+        self.action_space: spaces.Box = spaces.Box(-1.0, 1.0, (4,), dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Gymnasium interface
+    # ------------------------------------------------------------------
 
     def reset(
         self,
         *,
         seed: int | None = None,
         options: dict[str, Any] | None = None,
-    ) -> tuple[ObsDict, dict[str, Any]]:
-        del options
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         if seed is not None:
-            import metaworld
+            self._rng = np.random.default_rng(seed)
 
-            mt1 = metaworld.MT1(self._name + "-v3", seed=seed)
-            self._env.set_task(mt1.train_tasks[0])
+        # Inner env reset (calls _reset_hand → YamArm.reset_hand → sets init_tcp)
+        self._env.reset()
+        self._episode_success = False
 
-        self._success = False
-        self._diag_n = 0
-        self._diag_sigma_sum = 0.0
-        self._diag_sigma_min = float("inf")
-        self._diag_near_singular = 0
-        self._diag_clip = 0
-        self._diag_backoff = 0
-        self._diag_ws_clamp = 0
-        self._diag_near_limit = 0
-        self._diag_stuck = 0
-        self._diag_stuck_run = 0
-        self._diag_stuck_max_run = 0
-        self._diag_track_sum = 0.0
-        self._diag_track_n = 0
-        self._prev_tcp = None
+        # Camera setup for this episode
+        if self._camera_pose_randomize or self._camera_jitter > 0.0:
+            self._scene_cam = self._make_free_camera()
+        else:
+            self._scene_cam = None  # use named camera string
 
-        # Camera randomization: full hemisphere pose OR small position jitter.
-        if self._camera_pose_randomize:
-            self._sample_camera_pose()
-            # camera_jitter stacks on top of the sampled pose as extra noise.
-            if self._camera_jitter > 0.0:
-                j = self._camera_jitter
-                self._env.model.cam_pos[self._camera_id] += self._rng.uniform(-j, j, 3)
-        elif self._camera_jitter > 0.0:
-            j = self._camera_jitter
-            self._env.model.cam_pos[self._camera_id] = self._cam_base_pos + self._rng.uniform(
-                -j, j, 3
-            )
-
-        # Appearance randomization: textures + RGBA tints + lighting.
         if self._scene_randomize:
-            self._apply_scene_dr()
+            self._randomise_lighting()
 
-        state, _ = self._env.reset()
-        if self._arm == "yam":
-            # Anchor for achieved-TCP-displacement (stuck) tracking.
-            self._prev_tcp = self._env._yam_controller.tcp_pos(self._env.data).astype(np.float64)
-        if self._viewer_requested:
-            import mujoco.viewer as _mv
+        obs = self._get_obs_dict()
+        info: dict[str, Any] = {"task_name": self._task_name, "success": False}
+        return obs, info
 
-            self._passive_viewer = _mv.launch_passive(self._env.model, self._env.data)
-            self._viewer_requested = False
-        self._sync_viewer()
-        return self._make_obs(state), self._info()
+    def step(
+        self, action: np.ndarray
+    ) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
+        action = np.asarray(action, dtype=np.float32)
+        try:
+            _, reward, terminated, truncated, inner_info = self._env.step(action)
+        except (ValueError, RuntimeError):
+            # Physics instability (NaN positions) propagated into reward computation.
+            # Treat as a terminal step with zero reward so the episode resets.
+            obs = self._get_obs_dict()
+            info: dict[str, Any] = {
+                "task_name": self._task_name,
+                "success": self._episode_success,
+            }
+            return obs, 0.0, True, False, info
 
-    def step(self, action: np.ndarray) -> tuple[ObsDict, float, bool, bool, dict[str, Any]]:
-        total_reward = 0.0
-        terminated = truncated = False
-        state = None
-        for _ in range(self._action_repeat):
-            state, reward, terminated, truncated, info = self._env.step(action)
-            total_reward += float(reward)
-            if self._arm == "yam":
-                self._accumulate_ctrl_diag()
-            if info.get("success", False):
-                self._success = True
-            if terminated or truncated:
-                break
+        if float(inner_info.get("success", 0.0)) >= self._success_threshold:
+            self._episode_success = True
 
-        assert state is not None
-        self._sync_viewer()
-        return (
-            self._make_obs(state),
-            total_reward,
-            terminated,
-            truncated,
-            self._info(success=self._success),
-        )
+        if self._mj_viewer is not None:
+            self._mj_viewer.sync()
 
-    def render(self) -> np.ndarray:
-        return self._render_camera(self._camera_id, flip=self._scene_flip)
-
-    def _sync_viewer(self) -> None:
-        if self._passive_viewer is not None and self._passive_viewer.is_running():
-            self._passive_viewer.sync()
+        obs = self._get_obs_dict()
+        info = {
+            "task_name": self._task_name,
+            "success": self._episode_success,
+        }
+        return obs, float(reward), bool(terminated), bool(truncated), info
 
     def close(self) -> None:
-        self._renderer.close()
-        if self._passive_viewer is not None:
-            self._passive_viewer.close()
-        self._env.close()
+        if self._mj_viewer is not None:
+            with contextlib.suppress(Exception):
+                self._mj_viewer.close()
+            self._mj_viewer = None
+        with contextlib.suppress(Exception):
+            self._renderer.close()
+        with contextlib.suppress(Exception):
+            self._env.close()
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self._renderer.close()
+
+    # ------------------------------------------------------------------
+    # Observation helpers
+    # ------------------------------------------------------------------
+
+    def _get_obs_dict(self) -> dict[str, np.ndarray]:
+        obs: dict[str, np.ndarray] = {
+            "scene": self._render_scene(),
+            "proprio": self._get_proprio(),
+        }
+        if self._wrist_camera is not None:
+            obs["wrist_image"] = self._render_wrist()
+        if self._task_idx is not None and self._num_tasks is not None:
+            one_hot = np.zeros(self._num_tasks, dtype=np.float32)
+            one_hot[self._task_idx] = 1.0
+            obs["task_id"] = one_hot
+        return obs
+
+    def _get_proprio(self) -> np.ndarray:
+        d = self._env.data
+        joints = (
+            d.qpos[self._arm_qadr].astype(np.float32)
+            if self._arm_qadr is not None
+            else np.zeros(6, dtype=np.float32)
+        )
+        lc = np.asarray(d.body("leftclaw").xpos)
+        rc = np.asarray(d.body("rightclaw").xpos)
+        gripper_open = np.array(
+            [float(np.clip(np.linalg.norm(rc - lc) / 0.1, 0.0, 1.0))],
+            dtype=np.float32,
+        )
+        tcp = np.asarray(d.body("hand").xpos, dtype=np.float32)
+        return np.concatenate([joints, gripper_open, tcp])
+
+    def _render_scene(self) -> np.ndarray:
+        if self._scene_cam is not None:
+            self._renderer.update_scene(self._env.data, camera=self._scene_cam)
+        else:
+            self._renderer.update_scene(self._env.data, camera=self._camera)
+        return self._renderer.render().copy()
+
+    def _render_wrist(self) -> np.ndarray:
+        self._renderer.update_scene(self._env.data, camera=self._wrist_camera)
+        frame = self._renderer.render().copy()
+        if self._wrist_fisheye != 0.0:
+            frame = _apply_barrel_distortion(frame, self._wrist_fisheye)
+        return frame
+
+    # ------------------------------------------------------------------
+    # Domain randomisation
+    # ------------------------------------------------------------------
+
+    def _make_free_camera(self) -> mujoco.MjvCamera:
+        cam = mujoco.MjvCamera()
+        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        if self._camera_pose_randomize:
+            cam.azimuth = float(self._rng.uniform(*_CAM_AZIMUTH_RANGE))
+            cam.elevation = float(self._rng.uniform(*_CAM_ELEVATION_RANGE))
+            cam.distance = float(self._rng.uniform(*_CAM_DISTANCE_RANGE))
+        else:
+            cam.azimuth = 150.0
+            cam.elevation = -35.0
+            cam.distance = 1.0
+        lookat = _CAM_LOOKAT.copy()
+        if self._camera_jitter > 0.0:
+            lookat += self._rng.normal(0.0, self._camera_jitter, 3)
+        cam.lookat[:] = lookat
+        return cam
+
+    def _randomise_lighting(self) -> None:
+        m = self._env.model
+        for li in range(m.nlight):
+            tint = self._rng.uniform(0.7, 1.0, 3).astype(np.float32)
+            m.light_diffuse[li] = np.clip(m.light_diffuse[li] * tint, 0.0, 1.0)
+            m.light_ambient[li] = np.clip(
+                m.light_ambient[li] * float(self._rng.uniform(0.5, 1.2)), 0.0, 1.0
+            )

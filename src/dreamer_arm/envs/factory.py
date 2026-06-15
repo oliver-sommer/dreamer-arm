@@ -1,170 +1,261 @@
-"""``make_env`` factory routing names to concrete env implementations.
+"""Environment factory for dreamer-arm.
 
-Naming convention:
+Parses the env_name string and returns a ``SyncVectorEnv`` ready for the
+online trainer.
 
-* ``"metaworld:<task>"``  → a single Meta-World MT1 task
-  (:class:`dreamer_arm.envs.metaworld.MetaWorld`).
-* ``"metaworld:MT10"`` / ``"MT25"`` / ``"MT50"``  → a multi-task generalist
-  batch: one env pinned per task, each emitting a one-hot ``task_id`` for the
-  policy to condition on.  Built by :func:`make_vector_env` →
-  :func:`_make_metaworld_mt`.
+Name format
+-----------
+``"metaworld:<task>"``   - single-task MT1 (all envs share the task type)
+``"metaworld:MT10"``     - multi-task MT10 (10 tasks, one pinned per env)
+``"metaworld:MT25"``     - multi-task MT25 (25 tasks)
+``"metaworld:MT50"``     - multi-task MT50 (50 tasks)
 
-All envs are wrapped with :class:`DreamerObsWrapper` so the obs dict gets
-``is_first``/``is_last``/``is_terminal`` flags, and (optionally) with
-:class:`TimeLimit` if ``time_limit`` is set.
+Multi-task constraint: ``env_num % task_count == 0``.
+
+Task pinning: env ``i`` is permanently assigned to task type
+``env_names[i % task_count]``.  Each env picks a fixed per-type task
+(deterministic w.r.t. seed) so the agent never sees a task switch mid-episode.
+
+The ``arm`` kwarg determines which arm plugin to install; ``set_active_arm``
+is called **once per process** before constructing any Meta-World task env.
 """
 
 from __future__ import annotations
 
+import collections
 from collections.abc import Callable
 from typing import Any
 
-import gymnasium as gym
+import metaworld
 
-from dreamer_arm.envs.wrappers import ActionRatePenalty, DreamerObsWrapper, SyncVectorEnv, TimeLimit
+from dreamer_arm.envs.arms import make_arm
+from dreamer_arm.envs.metaworld import MetaWorldEnv
+from dreamer_arm.envs.wrappers import ActionRatePenalty, SyncVectorEnv, TimeLimit
 
-# Meta-World multi-task benchmarks → their ordered task-name lists.  The
-# ``env_dict`` keys carry the ``-v3`` suffix; strip it to the bare task name
-# that :class:`MetaWorld` expects.  Imported lazily in :func:`_mt_task_names`
-# so importing this module does not pull in MuJoCo/Meta-World.
-_MT_BENCHMARKS = ("MT10", "MT25", "MT50")
+# Multi-task benchmark tags
+_MT_TAGS: set[str] = {"MT10", "MT25", "MT50"}
+
+# Map tag → metaworld benchmark class
+_BENCHMARK_CLS: dict[str, type] = {
+    "MT10": metaworld.MT10,
+    "MT25": metaworld.MT25,
+    "MT50": metaworld.MT50,
+}
 
 
-def _mt_task_names(benchmark: str) -> list[str]:
-    """Ordered bare task names (no ``-v3``) for an MT benchmark."""
-    from metaworld import env_dict
-
-    dicts = {
-        "MT10": env_dict.MT10_V3,
-        "MT25": env_dict.MT25_V3,
-        "MT50": env_dict.MT50_V3,
-    }
-    return [name.removesuffix("-v3") for name in dicts[benchmark]]
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def make_env(
-    name: str,
+    env_name: str,
+    seed: int,
+    size: tuple[int, int],
+    time_limit: int,
     *,
-    seed: int = 0,
-    time_limit: int | None = None,
-    size: tuple[int, int] = (64, 64),
-    action_repeat: int = 1,
-    viewer: bool = False,
+    arm: str = "yam",
+    camera: str = "corner",
+    wrist_camera: str | None = None,
+    camera_jitter: float = 0.0,
+    wrist_fisheye: float = 0.0,
+    scene_randomize: bool = False,
+    camera_pose_randomize: bool = False,
     action_rate_cost: float = 0.0,
     action_mag_cost: float = 0.0,
-    **kwargs: Any,
-) -> gym.Env:  # type: ignore[type-arg]
-    """Construct a single Dreamer-shaped env from a name.
+    success_threshold: float = 1.0,
+    # Multi-task pinning / viewer — set by make_vector_env
+    _task: Any = None,
+    _task_idx: int | None = None,
+    _num_tasks: int | None = None,
+    _env_cls: Any = None,
+    _arm_obj: Any = None,
+    _viewer: bool = False,
+) -> Any:
+    """Construct a single wrapped Meta-World Gymnasium env."""
+    protocol, task_tag = _parse_name(env_name)
+    assert protocol == "metaworld"
 
-    ``action_repeat`` is forwarded to the underlying env (which sums reward
-    across sub-steps); ``time_limit`` is applied *after* the env so it
-    counts wrapper-level steps, not physics sub-steps.
-
-    ``viewer`` opens a passive MuJoCo window (macOS + mjpython).
-    ``arm`` selects which arm a Meta-World env uses (``"sawyer"`` or ``"yam"``).
-    ``task_idx``/``num_tasks`` add a one-hot ``task_id`` obs key (multi-task).
-    ``action_rate_cost`` / ``action_mag_cost`` add a smoothness/jerk penalty
-    subtracted from the reward — recommended for YAM sim-to-real (~0.02).
-    Both default to 0.0 (disabled) so benchmark runs are unaffected.
-    """
-    if name.startswith("metaworld:"):
-        from dreamer_arm.envs.metaworld import MetaWorld
-
-        arm = kwargs.pop("arm", "sawyer")  # forward arm to MetaWorld for YAM support
-        env: gym.Env = MetaWorld(  # type: ignore[type-arg]
-            name=name.split(":", 1)[1],
-            arm=arm,
-            action_repeat=action_repeat,
-            size=size,
-            seed=seed,
-            viewer=viewer,
-            task_idx=kwargs.pop("task_idx", None),
-            num_tasks=kwargs.pop("num_tasks", None),
-            **kwargs,  # forwards camera= from the env config
-        )
+    # Determine the metaworld env class and task to use
+    if _env_cls is not None:
+        env_cls = _env_cls
+        task = _task
     else:
-        raise ValueError(f"unknown env name: {name!r}")
+        # MT1 single-task path
+        mt1 = metaworld.MT1(task_tag, seed=seed)
+        env_cls = next(iter(mt1.train_classes.values()))
+        task = mt1.train_tasks[0]
 
-    if action_rate_cost or action_mag_cost:
-        env = ActionRatePenalty(env, rate_cost=action_rate_cost, mag_cost=action_mag_cost)
-    env = DreamerObsWrapper(env)
-    if time_limit is not None:
-        env = TimeLimit(env, max_steps=time_limit)
-    return env
+    inner_env = env_cls(render_mode=None)
+
+    # Attach arm (installs hooks)
+    arm_obj = _arm_obj if _arm_obj is not None else make_arm(arm)
+    arm_obj.attach(inner_env)
+
+    wrapped = MetaWorldEnv(
+        env=inner_env,
+        task=task,
+        arm=arm,
+        size=size,
+        camera=camera,
+        wrist_camera=wrist_camera,
+        scene_randomize=scene_randomize,
+        camera_pose_randomize=camera_pose_randomize,
+        camera_jitter=camera_jitter,
+        wrist_fisheye=wrist_fisheye,
+        task_idx=_task_idx,
+        num_tasks=_num_tasks,
+        success_threshold=success_threshold,
+        viewer=_viewer,
+    )
+    wrapped = TimeLimit(wrapped, time_limit=time_limit)
+    if action_rate_cost > 0.0 or action_mag_cost > 0.0:
+        wrapped = ActionRatePenalty(
+            wrapped,
+            action_rate_cost=action_rate_cost,
+            action_mag_cost=action_mag_cost,
+        )
+    return wrapped
 
 
 def make_vector_env(
-    name: str,
+    env_name: str,
     num_envs: int,
-    *,
-    seed: int = 0,
+    seed: int,
+    size: tuple[int, int],
+    action_repeat: int,
+    time_limit: int,
     viewer: bool = False,
     **kwargs: Any,
 ) -> SyncVectorEnv:
-    """Build a synchronous batch of ``num_envs`` envs with offset seeds.
+    """Build a ``SyncVectorEnv`` with ``num_envs`` envs.
 
-    Async vectorisation is intentionally out of scope.
+    ``env_name`` format: ``"metaworld:<task>"`` or ``"metaworld:MT10/25/50"``.
 
-    For a Meta-World multi-task benchmark (``"metaworld:MT10"`` etc.) this pins
-    one task per env (env ``i`` → task ``i % num_tasks``) and tags each env with
-    a one-hot ``task_id`` — see :func:`_make_metaworld_mt`.
+    All ``kwargs`` are forwarded to ``make_env`` (camera, DR flags, costs, …).
+    The ``arm`` kwarg picks which arm plugin to use.
 
-    ``viewer=True`` opens a passive MuJoCo window on env 0 only.
+    Multi-task: each env is pinned to one task type; emits a one-hot
+    ``task_id`` observation; requires ``num_envs % task_count == 0``.
     """
-    if name.startswith("metaworld:") and name.split(":", 1)[1] in _MT_BENCHMARKS:
-        return _make_metaworld_mt(
-            name.split(":", 1)[1], num_envs, seed=seed, viewer=viewer, **kwargs
-        )
+    protocol, task_tag = _parse_name(env_name)
+    assert protocol == "metaworld", f"Unknown env protocol: {protocol!r}"
 
-    def _factory(s: int, env_idx: int) -> Callable[[], gym.Env]:  # type: ignore[type-arg]
-        def _make() -> gym.Env:  # type: ignore[type-arg]
-            return make_env(name, seed=s, viewer=(viewer and env_idx == 0), **kwargs)
+    arm_name: str = kwargs.pop("arm", "yam")
+    # set_active_arm is process-global; safe to call multiple times with same value
+    metaworld.set_active_arm(arm_name)
 
-        return _make
+    # Resolve per-env (env_cls, task, task_idx, num_tasks) assignments
+    assignments = _resolve_task_assignments(
+        task_tag=task_tag,
+        num_envs=num_envs,
+        seed=seed,
+    )
 
-    fns: list[Callable[[], gym.Env]] = [_factory(seed + i, i) for i in range(num_envs)]  # type: ignore[type-arg]
-    return SyncVectorEnv(fns)
+    # Build env_fns
+    env_fns: list[Callable[[], Any]] = []
+    for i, (env_cls, task, task_idx, _num_tasks) in enumerate(assignments):
+        env_seed = seed + i
 
-
-def _make_metaworld_mt(
-    benchmark: str,
-    num_envs: int,
-    *,
-    seed: int = 0,
-    viewer: bool = False,
-    **kwargs: Any,
-) -> SyncVectorEnv:
-    """Build a multi-task Meta-World batch: one task pinned per env.
-
-    Each env is a single-task :class:`MetaWorld` carrying a one-hot ``task_id``
-    of length ``num_tasks``.  Env ``i`` runs task ``i % num_tasks``, so every
-    gradient batch spans all tasks when ``num_envs`` is a multiple of the task
-    count (``num_envs == num_tasks`` recommended).
-    """
-    task_names = _mt_task_names(benchmark)
-    num_tasks = len(task_names)
-    if num_envs % num_tasks != 0:
-        raise ValueError(
-            f"{benchmark} has {num_tasks} tasks; set envs.env_num to a multiple of "
-            f"{num_tasks} (got {num_envs}) so each task is covered. "
-            f"Recommended: envs.env_num={num_tasks}."
-        )
-
-    def _factory(env_idx: int) -> Callable[[], gym.Env]:  # type: ignore[type-arg]
-        task_idx = env_idx % num_tasks
-        name = f"metaworld:{task_names[task_idx]}"
-
-        def _make() -> gym.Env:  # type: ignore[type-arg]
+        # Capture loop vars by value
+        def _make(
+            _i: int = i,
+            _env_cls: Any = env_cls,
+            _task: Any = task,
+            _task_idx: int | None = task_idx,
+            _num_tasks_: int | None = _num_tasks,
+            _env_seed: int = env_seed,
+        ) -> Any:
+            # One shared arm object per env so hooks don't cross-contaminate.
+            # Viewer is only attached to env 0 (one window regardless of num_envs).
+            arm_obj = make_arm(arm_name)
             return make_env(
-                name,
-                seed=seed + env_idx,
-                viewer=(viewer and env_idx == 0),
-                task_idx=task_idx,
-                num_tasks=num_tasks,
+                env_name=env_name,
+                seed=_env_seed,
+                size=size,
+                time_limit=time_limit,
+                arm=arm_name,
+                _task=_task,
+                _task_idx=_task_idx,
+                _num_tasks=_num_tasks_,
+                _env_cls=_env_cls,
+                _viewer=viewer and (_i == 0),
+                _arm_obj=arm_obj,
                 **kwargs,
             )
 
-        return _make
+        env_fns.append(_make)
 
-    fns: list[Callable[[], gym.Env]] = [_factory(i) for i in range(num_envs)]  # type: ignore[type-arg]
-    return SyncVectorEnv(fns)
+    return SyncVectorEnv(env_fns, action_repeat=action_repeat)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_name(env_name: str) -> tuple[str, str]:
+    """Split ``"metaworld:door-open"`` → ``("metaworld", "door-open")``."""
+    parts = env_name.split(":", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(
+            f"Invalid env_name {env_name!r}. "
+            "Expected 'metaworld:<task>' or 'metaworld:MT10|MT25|MT50'."
+        )
+    return parts[0], parts[1]
+
+
+def _resolve_task_assignments(
+    task_tag: str,
+    num_envs: int,
+    seed: int,
+) -> list[tuple[Any, Any, int | None, int | None]]:
+    """Return a list of (env_cls, task, task_idx, num_tasks) for each env.
+
+    For MT1: task_idx=None, num_tasks=None (no task_id obs key).
+    For MT*: task_idx ∈ [0, task_count), num_tasks = task_count.
+    """
+    if task_tag in _MT_TAGS:
+        bench_cls = _BENCHMARK_CLS[task_tag]
+        bench = bench_cls(seed=seed)  # type: ignore[call-arg]
+        train_classes: dict[str, Any] = dict(bench.train_classes)
+        train_tasks: list[Any] = bench.train_tasks
+
+        # Group tasks by env_name (preserving insertion order of train_classes)
+        task_names: list[str] = list(train_classes.keys())
+        task_count = len(task_names)
+
+        if num_envs % task_count != 0:
+            raise ValueError(
+                f"env_num={num_envs} must be divisible by task_count={task_count} "
+                f"for benchmark {task_tag}."
+            )
+
+        tasks_by_name: dict[str, list[Any]] = collections.defaultdict(list)
+        for t in train_tasks:
+            tasks_by_name[t.env_name].append(t)
+
+        assignments = []
+        for i in range(num_envs):
+            task_idx = i % task_count
+            t_name = task_names[task_idx]
+            env_cls = train_classes[t_name]
+            # Pick one task from this type (deterministic per env index)
+            avail = tasks_by_name[t_name]
+            task = avail[i // task_count % len(avail)]
+            assignments.append((env_cls, task, task_idx, task_count))
+        return assignments
+
+    else:
+        # Single-task (MT1) — auto-append -v3 if the user wrote "door-open"
+        if not task_tag.endswith("-v3"):
+            task_tag = task_tag + "-v3"
+        mt1 = metaworld.MT1(task_tag, seed=seed)
+        env_cls = next(iter(mt1.train_classes.values()))
+        # Distribute train_tasks round-robin across envs (up to 50 per type)
+        all_tasks = mt1.train_tasks
+        assignments = []
+        for i in range(num_envs):
+            task = all_tasks[i % len(all_tasks)]
+            assignments.append((env_cls, task, None, None))
+        return assignments
