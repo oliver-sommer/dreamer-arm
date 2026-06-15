@@ -7,9 +7,10 @@ bracketed date+time and level, e.g.::
 
 Metrics, videos and histograms still go to W&B via
 :class:`dreamer_arm.train.logger.WandbLogger`; this module only governs the
-console.  Hydra's own job logging is ``disabled`` in ``configs/config.yaml``,
-so the root logger starts with no handler and :func:`configure_logging` owns
-stdout outright.
+console.  Hydra's own job logging is ``disabled`` in ``configs/config.yaml``;
+that disabled config runs ``dictConfig(disable_existing_loggers=True)`` before
+``main()``, which marks every already-imported logger (ours included)
+``.disabled``, so :func:`configure_logging` re-enables them — see there.
 
 ``import logging`` inside this file resolves to the stdlib (Python 3 uses
 absolute imports), so the module name does not shadow it.
@@ -44,6 +45,16 @@ def configure_logging(level: int | str = logging.INFO) -> None:
 
     root = logging.getLogger()
     root.setLevel(level)
+
+    # Hydra's `disabled` job_logging runs dictConfig(disable_existing_loggers=
+    # True) before main(), which marks every logger created at import time
+    # (all of ours) `.disabled`, so their records never reach the handler below.
+    # Re-enable them so this function genuinely owns console output.
+    root.disabled = False
+    for existing in root.manager.loggerDict.values():
+        if isinstance(existing, logging.Logger):
+            existing.disabled = False
+
     for handler in list(root.handlers):
         root.removeHandler(handler)
     handler = logging.StreamHandler(sys.stdout)
