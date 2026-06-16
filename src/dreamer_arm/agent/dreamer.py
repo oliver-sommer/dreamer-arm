@@ -262,24 +262,31 @@ class Dreamer(nn.Module):
         feat = self._frozen_rssm.get_feat(stoch, deter)
         action_dist = self._frozen_actor(feat)
         action = action_dist.mode if eval_mode else action_dist.rsample()
-        if not self.act_discrete:
-            # bounded_normal bounds only the *mean* (tanh); samples are
-            # unbounded and reached ±4 in practice — 4x the EE controller's
-            # design velocity, 16x the jerk-penalty calibration, and a
-            # train/eval action-distribution mismatch.  Clamp here so the env,
-            # the replay buffer, and the RSSM's prev_action all condition on
-            # the same executed action.
-            #
-            # nan_to_num first: MPS occasionally produces a non-finite sample,
-            # and a single NaN action stored in the replay buffer NaNs every
-            # subsequent loss.  clamp alone leaves NaN as NaN, so scrub it
-            # before clamping — a non-finite value must never reach the env or
-            # the buffer.
-            action = torch.nan_to_num(action).clamp(-1.0, 1.0)
+        action = self._sanitize_action(action)
         return action, TensorDict(
             {"stoch": stoch, "deter": deter, "prev_action": action},
             batch_size=state.batch_size,
         )
+
+    def _sanitize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Scrub + clamp a continuous action to the space the env executes.
+
+        bounded_normal bounds only the *mean* (tanh); samples add Gaussian
+        noise and are unbounded — they reached ±4 in practice (4x the EE
+        controller's design velocity, 16x the jerk-penalty calibration).  The
+        env clamps to [-1, 1] on execution, so anything that conditions on an
+        action — the replay buffer, the RSSM's prev_action, and the imagination
+        rollout the actor/critic train on — must see the *same* clamped value,
+        or the policy is trained against a distribution the env never runs.
+
+        nan_to_num first: MPS occasionally produces a non-finite sample, and a
+        single NaN action NaNs every downstream latent and loss (this was the
+        source of the intermittent policy/value NaNs).  clamp alone leaves NaN
+        as NaN, so scrub before clamping.
+        """
+        if self.act_discrete:
+            return action
+        return torch.nan_to_num(action).clamp(-1.0, 1.0)
 
     # ------------------------------------------------------------------ training step
 
@@ -480,7 +487,7 @@ class Dreamer(nn.Module):
         stoch, deter = start
         for _ in range(imag_horizon):
             feat = self._frozen_rssm.get_feat(stoch, deter)
-            action = self._frozen_actor(feat).rsample()
+            action = self._sanitize_action(self._frozen_actor(feat).rsample())
             feats.append(feat)
             actions.append(action)
             stoch, deter = self._frozen_rssm.img_step(stoch, deter, action)
