@@ -301,10 +301,12 @@ class OnlineTrainer:
                     metrics = agent.update(self._buffer)
                     train_budget -= 1.0
                     updates += 1
-                    # Prefix the agent's "loss/*" keys with "train/"
-                    for k, v in metrics.items():
-                        key = f"train/{k}" if not k.startswith("train/") else k
-                        self._logger.scalar(key, v)
+                    # Prefix the agent's "loss/*" keys with "train/", one batched
+                    # call so the metrics' device->host sync happens once per
+                    # update rather than once per key (WandbLogger.scalars).
+                    self._logger.scalars(
+                        {(k if k.startswith("train/") else f"train/{k}"): v for k, v in metrics.items()}
+                    )
                     # Beat between updates too: one update can outlast the interval.
                     self._heartbeat(env_step, updates, prefill_min)
 

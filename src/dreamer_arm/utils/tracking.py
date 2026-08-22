@@ -145,8 +145,26 @@ class WandbLogger:
         self._scalars[name] = float(value)
 
     def scalars(self, values: Mapping[str, _Scalar | torch.Tensor]) -> None:
+        """Log a batch of scalars with at most one CUDA sync, not one per key.
+
+        A Dreamer update reports 15-20 metrics, and ``.item()`` blocks until
+        every kernel queued so far has finished -- called once per key, that
+        serialises the update loop into N host round-trips instead of the one
+        it needs.  ``torch.stack(...).tolist()`` still blocks, but only once,
+        for the whole batch: with the GPU otherwise saturated by many small
+        kernels (the common case for a small recurrent model like this), that
+        difference is the gap between a sync every update and twenty of them.
+        """
+        tensors = {k: v for k, v in values.items() if isinstance(v, torch.Tensor)}
+        if tensors:
+            # Every value here is a loss/metric mean -> single-element; reshape
+            # rather than stacking mismatched shapes if that invariant ever slips.
+            stacked = torch.stack([v.detach().reshape(()) for v in tensors.values()])
+            for k, val in zip(tensors, stacked.tolist(), strict=True):
+                self._scalars[k] = float(val)
         for k, v in values.items():
-            self.scalar(k, v)
+            if k not in tensors:
+                self.scalar(k, v)
 
     def video(self, name: str, frames: _Array, cols: int | None = None) -> None:
         self._videos[name] = _as_uint8_video(frames, cols=cols)
