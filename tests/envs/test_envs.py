@@ -568,3 +568,55 @@ def test_yam_tracks_commands_without_sticking() -> None:
         f"arm barely tracks commanded motion (mean achieved/commanded={mean_track:.3f}); likely stuck at a singularity"
     )
     assert mean_stuck <= 0.3, f"arm stuck (ratio<0.25) on {mean_stuck:.0%} of commanded steps"
+
+
+# ---------------------------------------------------------------------------
+# Camera orientation
+# ---------------------------------------------------------------------------
+
+
+def test_cameras_are_upright() -> None:
+    """Every camera must have a non-downward up-vector.
+
+    Upstream Meta-World declares the ``corner*`` cameras with up.z < 0, so a
+    correct renderer returns them upside down.  MW papers over that downstream
+    with an image flip, but a plain ``np.flipud`` is a *mirror*, not a rotation:
+    it reverses left/right chirality while looking plausible to the eye.  That
+    silently corrupts anything spatial and makes the scene disagree with the
+    wrist camera, which is declared correctly.
+
+    ``yam_xyz_base.xml`` therefore rolls each corner camera 180 deg about its own
+    view axis, and the render path applies no flip.  This test fails if either
+    half of that regresses.  It needs no GL context -- only the model.
+    """
+    import mujoco
+
+    inner, _, _ = _make_yam_inner()
+    data = mujoco.MjData(inner.model)
+    mujoco.mj_forward(inner.model, data)
+
+    inverted = []
+    for cam_id in range(inner.model.ncam):
+        name = mujoco.mj_id2name(inner.model, mujoco.mjtObj.mjOBJ_CAMERA, cam_id)
+        # cam_xmat columns are the camera axes in world coords; column 1 is "up".
+        up_z = float(np.asarray(data.cam_xmat[cam_id]).reshape(3, 3)[2, 1])
+        if up_z < -1e-6:
+            inverted.append((name, up_z))
+
+    assert not inverted, f"cameras with a downward up-vector: {inverted}"
+
+
+def test_render_path_applies_no_flip() -> None:
+    """``_grab_frame`` must return the renderer's pixels unmodified.
+
+    Orientation is a property of the camera declarations, not of a post-render
+    correction.  A backend-conditional flip here is what mirrored the scene on
+    macOS while leaving Linux upside down, so guard against it coming back.
+    """
+    import inspect
+
+    from dreamer_arm.envs.metaworld import MetaWorldEnv
+
+    src = inspect.getsource(MetaWorldEnv._grab_frame)
+    assert "flipud" not in src, "_grab_frame must not flip; fix the camera in the MJCF instead"
+    assert "fliplr" not in src, "_grab_frame must not mirror; fix the camera in the MJCF instead"

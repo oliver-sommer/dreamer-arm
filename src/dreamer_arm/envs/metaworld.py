@@ -127,13 +127,12 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         self._renderer = mujoco.Renderer(env.model, height=size[0], width=size[1])
         self._scene_cam: mujoco.MjvCamera | None = None  # set each reset
 
-        # mujoco.Renderer.render() flips the GL buffer assuming the EGL / GLFW /
-        # OSMesa convention (bottom-to-top), which is correct on the Linux/EGL
-        # training box.  The macOS CGL backend already returns pixels top-to-
-        # bottom, so that flip leaves CGL renders upside down.  Undo it *only*
-        # on CGL so output is upright on every backend.
-        gl_ctx = getattr(self._renderer, "_gl_context", None)
-        self._flip_vertical = type(gl_ctx).__module__.endswith(".cgl") if gl_ctx else False
+        # No post-render flip: mujoco.Renderer.render() normalises the GL buffer
+        # itself and returns upright pixels on every backend (verified on CGL and
+        # EGL with a known-geometry probe).  Orientation is now purely a property
+        # of the camera declarations in yam_xyz_base.xml, which are rolled so that
+        # every up-vector points up.  See the camera comment there for why an
+        # np.flipud "fix" was actively harmful.
 
         # Resolve joint addresses for proprio
         m = env.model
@@ -362,9 +361,8 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         return frame
 
     def _grab_frame(self) -> np.ndarray:
-        """Render the current scene, correcting the CGL vertical flip (see __init__)."""
-        frame = self._renderer.render()
-        return np.flipud(frame).copy() if self._flip_vertical else frame.copy()
+        """Render the scene currently loaded into the renderer."""
+        return self._renderer.render().copy()
 
     # ------------------------------------------------------------------
     # Domain randomisation
