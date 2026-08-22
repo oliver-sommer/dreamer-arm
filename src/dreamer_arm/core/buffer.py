@@ -22,6 +22,12 @@ from torchrl.data.replay_buffers import LazyTensorStorage
 from torchrl.data.replay_buffers import ReplayBuffer as _TorchRLBuffer
 from torchrl.data.replay_buffers.samplers import SliceSampler
 
+from dreamer_arm.utils.logging import adopt_logger
+
+# This import is what pulls torchrl in, so it is also where torchrl's
+# self-installed stdout handler has to be taken over.
+adopt_logger("torchrl")
+
 
 @dataclass(frozen=True)
 class BufferConfig:
@@ -88,9 +94,11 @@ class ReplayBuffer:
 
         Returns ``(data, index, initial)`` where:
 
-        * ``data`` is the ``(B, T)`` training window. ``data["action"]`` is
-          shifted one step back so that ``action[t]`` is the action that led
-          into ``data[t]`` (matching the RSSM step semantics).
+        * ``data`` is the ``(B, T)`` training window. ``data["action"]`` and
+          ``data["reward"]`` are shifted one step back so that ``action[t]``
+          is the action that led into ``data[t]`` and ``reward[t]`` is the
+          reward received on *arriving* there (matching the RSSM step
+          semantics and DreamerV3's λ-return convention).
         * ``index`` is the ``(time_idx, env_idx)`` pair of the training
           window — pass these straight back to
           :meth:`update_initial_state`.
@@ -105,11 +113,15 @@ class ReplayBuffer:
         sample_td = self._move_to_device(sample_td)
 
         initial = {key: sample_td[key][:, 0] for key in cache_keys}
+        # A stored row is (obs_t, action_t, reward_t): action/reward describe the
+        # transition *leaving* obs_t, so the arrival-indexed window takes both
+        # from the preceding row.  This is the alignment `losses.lambda_return`
+        # assumes; shifting only `action` offsets every value target by a step.
+        # clone(): the source overlaps the view being written.
+        shifted = {key: sample_td[key][:, :-1].clone() for key in ("action", "reward")}
         data = sample_td[:, 1:]
-        # action[t] is the action *taken at* t, so for the training window we
-        # want the action that produced data[t] -- i.e. action[t-1] in the raw
-        # slice, which is the prefix sample_td["action"][:, :-1].
-        data.set_("action", sample_td["action"][:, :-1])
+        for key, value in shifted.items():
+            data.set_(key, value)
         index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]
         # tensordict's stubs widen indexing results to TensorCollection | Tensor.
         return data, index, initial  # ty: ignore[invalid-return-type]

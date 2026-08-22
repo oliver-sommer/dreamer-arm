@@ -21,6 +21,7 @@ be reused without Hydra.
 
 from __future__ import annotations
 
+import copy
 import math
 import re
 from collections.abc import Callable
@@ -29,6 +30,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from omegaconf import OmegaConf
 from torch import nn
 
 from dreamer_arm.core import distributions as dists
@@ -294,7 +296,10 @@ class MultiDecoder(nn.Module):
             )
         if self._has_mlp:
             shape = (sum(sum(v) for v in self.mlp_shapes.values()),)
-            mlp_cfg = config.mlp
+            # Local copy: dispatch() marks the run config read-only, and
+            # deepcopy carries that flag over.
+            mlp_cfg = copy.deepcopy(config.mlp)
+            OmegaConf.set_readonly(mlp_cfg, False)
             mlp_cfg.shape = shape
             self.mlp = MLPHead(mlp_cfg, deter + flat_stoch)
             self._mlp_dist: Callable[[torch.Tensor], Any] = partial(

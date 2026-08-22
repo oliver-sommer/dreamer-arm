@@ -155,6 +155,9 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         self._episode_success: bool = False
         self._rng = np.random.default_rng()
 
+        self._light_diffuse0 = m.light_diffuse.copy()
+        self._light_ambient0 = m.light_ambient.copy()
+
         # Passive viewer (mjpython only; None when viewer=False)
         self._mj_viewer: Any = None
         if viewer:
@@ -385,8 +388,11 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         return cam
 
     def _randomise_lighting(self) -> None:
+        # Scale the captured baseline, never the current value: MjModel persists
+        # across resets, so compounding would fade the scene to black (both
+        # factors have mean < 1, ~0.85x per episode).
         m = self._env.model
         for li in range(m.nlight):
             tint = self._rng.uniform(0.7, 1.0, 3).astype(np.float32)
-            m.light_diffuse[li] = np.clip(m.light_diffuse[li] * tint, 0.0, 1.0)
-            m.light_ambient[li] = np.clip(m.light_ambient[li] * float(self._rng.uniform(0.5, 1.2)), 0.0, 1.0)
+            m.light_diffuse[li] = np.clip(self._light_diffuse0[li] * tint, 0.0, 1.0)
+            m.light_ambient[li] = np.clip(self._light_ambient0[li] * float(self._rng.uniform(0.5, 1.2)), 0.0, 1.0)

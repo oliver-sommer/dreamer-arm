@@ -111,3 +111,40 @@ def test_buffer_empty_cache_keys_is_a_noop() -> None:
     assert data.shape == torch.Size([2, 4])
     assert initial == {}
     buf.update_initial_state(index, {})
+
+
+def test_buffer_sample_alignment() -> None:
+    """obs/action/reward must line up on the *arrival* convention.
+
+    A stored row is ``(obs_t, action_t, reward_t)`` where action/reward
+    describe the transition leaving ``obs_t``.  The training window is indexed
+    by the state a transition arrives at, so ``data[t]`` must pair
+    ``obs_{t+1}`` with ``action_t`` and ``reward_t`` -- the alignment
+    ``losses.lambda_return`` assumes.  Shifting only ``action`` (the old
+    behaviour) left every value target offset by one step.
+    """
+    n_envs = 2
+    batch_length = 4
+    buf = _make_buf(batch_size=2, batch_length=batch_length)
+
+    # Tag every row with its own timestep so misalignment is visible directly.
+    for t in range(16):
+        buf.add_transition(
+            TensorDict(
+                {
+                    "obs": torch.full((n_envs, 1), float(t)),
+                    "action": torch.full((n_envs, 1), float(t)),
+                    "reward": torch.full((n_envs, 1), float(t)),
+                    "stoch": torch.zeros(n_envs, 2, 2),
+                    "deter": torch.zeros(n_envs, 4),
+                    "episode": torch.zeros(n_envs, dtype=torch.int32),
+                },
+                batch_size=(n_envs,),
+            )
+        )
+
+    data, _, _ = buf.sample(("stoch", "deter"))
+    obs, action, reward = data["obs"], data["action"], data["reward"]
+
+    assert torch.equal(action, obs - 1.0), f"action misaligned:\nobs={obs}\naction={action}"
+    assert torch.equal(reward, obs - 1.0), f"reward misaligned:\nobs={obs}\nreward={reward}"
