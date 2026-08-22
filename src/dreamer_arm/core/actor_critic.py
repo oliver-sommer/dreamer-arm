@@ -154,21 +154,27 @@ class ActorCritic(nn.Module):
 
     # ------------------------------------------------------------------ imagination
 
-    def _subsample_imag_starts(self, start: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Subsample imagination start states to ``self.imag_starts`` of them.
+    def _gather_imag_starts(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Flatten a ``(B, T, ...)`` posterior trajectory into imagination starts.
 
-        ``None`` (the RSSM default) keeps every ``B*T`` flattened posterior as
-        a start state, matching the original unconditional behaviour exactly
-        -- including RNG consumption, since no ``randperm`` is drawn. Token-
-        space world models (DINO-WM, Dreamer 4) make imagination far more
-        expensive per start and must subsample.
+        ``None`` (the RSSM default) keeps every ``B*T`` posterior, matching the
+        original unconditional behaviour exactly -- including RNG consumption,
+        since no ``randperm`` is drawn. Token-space world models (DINO-WM,
+        Dreamer 4) make imagination far more expensive per start and must
+        subsample.
+
+        Subsampling indexes the ``(b, t)`` pair directly rather than reshaping
+        first: a context-window world model's state is a strided view over its
+        token buffer, and reshaping that would copy every window when only
+        ``imag_starts`` of them are wanted.
         """
+        b, t = next(iter(state.values())).shape[:2]
         if self.imag_starts is None:
-            return start
-        n = next(iter(start.values())).shape[0]
-        k = min(self.imag_starts, n)
-        idx = torch.randperm(n, device=self.device)[:k]
-        return {key: v[idx] for key, v in start.items()}
+            return {key: v.reshape(-1, *v.shape[2:]).detach() for key, v in state.items()}
+        k = min(self.imag_starts, b * t)
+        flat = torch.randperm(b * t, device=self.device)[:k]
+        rows, cols = flat // t, flat % t
+        return {key: v[rows, cols].detach() for key, v in state.items()}
 
     @torch.no_grad()
     def _imagine(
@@ -211,8 +217,7 @@ class ActorCritic(nn.Module):
         losses["con"] = -self.cont(feat).log_prob(cont_target).mean()
 
         # --- imagination rollout for actor-critic ---
-        start = {k: v.reshape(-1, *v.shape[2:]).detach() for k, v in state.items()}
-        start = self._subsample_imag_starts(start)
+        start = self._gather_imag_starts(state)
         imag_feat, imag_action = self._imagine(frozen_wm, start, self.imag_horizon + 1)
         imag_feat = imag_feat.detach()
         imag_action = imag_action.detach()

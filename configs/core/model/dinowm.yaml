@@ -40,6 +40,14 @@ core:
       # Action embedding width, tiled per patch and concatenated only inside
       # the predictor (discarded from its output).
       action_dim_embed: 10
+      # Sliding windows batched into one predictor call during the world-model
+      # loss.  1 = one window per call.  Measured on MPS (interleaved, median
+      # of 5): 1 -> 4.95s, 8 -> 5.35s, so batching does not pay here and the
+      # default stays 1.  It is a knob for wide devices, where 61 launches of
+      # a 16x192-token sequence under-fills the GPU -- but it is a cliff, not a
+      # slope: once the backward's recompute stops fitting, the device pages
+      # and lands >20x worse than the loop.  Sweep it, don't assume.
+      window_chunk: 1
       # How the actor/critic pool the last frame's (P, tok) tokens into a
       # vector: "mean" (cheap, discards spatial detail) or "flatten" (tok * P wide).
       feat_pool: mean

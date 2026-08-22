@@ -55,15 +55,47 @@ def test_actor_critic_loss_shapes_and_gradient(tiny_actor_critic_cfg) -> None:  
 
 def test_imag_starts_none_keeps_every_start(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]
     ac = ActorCritic(tiny_actor_critic_cfg, 4, (2,), act_discrete=False, imag_starts=None, device=torch.device("cpu"))
-    start = {"feat": torch.randn(10, 4)}
-    assert ac._subsample_imag_starts(start) is start  # no randperm drawn, no copy
+    state = {"feat": torch.randn(2, 5, 4)}
+
+    torch.manual_seed(0)
+    out = ac._gather_imag_starts(state)
+    after = torch.rand(1)
+
+    assert torch.equal(out["feat"], state["feat"].reshape(10, 4))
+    torch.manual_seed(0)
+    assert torch.equal(after, torch.rand(1)), "imag_starts=None must not consume RNG"
 
 
 def test_imag_starts_subsamples_to_requested_count(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]
     ac = ActorCritic(tiny_actor_critic_cfg, 4, (2,), act_discrete=False, imag_starts=3, device=torch.device("cpu"))
-    start = {"feat": torch.randn(10, 4)}
-    sub = ac._subsample_imag_starts(start)
+    sub = ac._gather_imag_starts({"feat": torch.randn(2, 5, 4)})
     assert sub["feat"].shape == (3, 4)
+
+
+def test_imag_starts_pair_indexing_matches_flattening(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]
+    """(b, t) indexing must pick the same starts a flatten-then-index would.
+
+    The state can be a strided view (DINO-WM's sliding windows), so the pair is
+    indexed instead of reshaped -- that must not change *which* starts are used.
+    """
+    ac = ActorCritic(tiny_actor_critic_cfg, 4, (2,), act_discrete=False, imag_starts=3, device=torch.device("cpu"))
+    b, t = 2, 5
+    feat = torch.arange(b * t * 4, dtype=torch.float32).reshape(b, t, 4)
+
+    torch.manual_seed(0)
+    got = ac._gather_imag_starts({"feat": feat})["feat"]
+    torch.manual_seed(0)
+    expected = feat.reshape(-1, 4)[torch.randperm(b * t)[:3]]
+    assert torch.equal(got, expected)
+
+
+def test_imag_starts_accepts_a_non_contiguous_view(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]
+    """DINO-WM hands over `unfold` views; gathering must not require contiguity."""
+    ac = ActorCritic(tiny_actor_critic_cfg, 4, (2,), act_discrete=False, imag_starts=3, device=torch.device("cpu"))
+    windows = torch.randn(2, 8, 4).unfold(1, 3, 1).permute(0, 1, 3, 2)  # (2, 6, 3, 4), a view
+    assert not windows.is_contiguous()
+
+    assert ac._gather_imag_starts({"feat": windows})["feat"].shape == (3, 3, 4)
 
 
 def test_refresh_frozen_picks_up_new_weights(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]

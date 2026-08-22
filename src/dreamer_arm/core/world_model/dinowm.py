@@ -31,6 +31,7 @@ import timm
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from dreamer_arm.utils.modules import weight_init_
 from dreamer_arm.utils.tensor import rpad
@@ -199,6 +200,9 @@ class DinoWM(nn.Module):
 
         self.action_dim_embed = int(config.action_dim_embed)
         self.action_embed = Embedder(act_dim, self.action_dim_embed)
+        # Sliding windows per predictor call in `loss`; trades activation memory
+        # for GPU occupancy.  1 measured fastest on MPS -- see the config.
+        self.window_chunk = int(getattr(config, "window_chunk", 1))
 
         self.tok_dim = embed_dim + self.extra_dim
         predictor_dim = self.tok_dim + self.action_dim_embed
@@ -275,30 +279,41 @@ class DinoWM(nn.Module):
         action_embed = self.action_embed(action)  # (B, T, AE); action_embed[:, j] led INTO frame j
 
         num_windows = t - h
+        p = tokens.shape[-2]
+        # Windows are folded into the batch dim rather than run one at a time:
+        # a single window is (B, context) sequences, far too small to fill a
+        # GPU, and 61 of them at batch_length=64 is 61 launch rounds.  The
+        # chunk bounds peak activation memory, which is what forced the
+        # checkpointing below -- an unchunked pass holds every window's
+        # activations at once.
+        chunk = max(1, min(self.window_chunk, num_windows))
         preds: list[torch.Tensor] = []
-        targets: list[torch.Tensor] = []
-        state_tokens: list[torch.Tensor] = []
-        state_actions: list[torch.Tensor] = []
-        for i in range(num_windows):
-            ctx_tokens = tokens[:, i : i + h]  # (B, H, P, tok)
+        for start in range(0, num_windows, chunk):
+            stop = min(start + chunk, num_windows)
+            w = stop - start
+            ctx_tokens = torch.stack([tokens[:, i : i + h] for i in range(start, stop)], dim=1)
             # Action tag per context frame = the action that led *out* of it,
             # i.e. the action that produced the next frame: action[i+1:i+h+1].
-            ctx_actions = action_embed[:, i + 1 : i + h + 1]
-            pred_in = self.tile_and_cat(ctx_tokens, ctx_actions)
-            pred_out = self.predictor(pred_in)[:, -1, :, : self.tok_dim]
-            preds.append(pred_out)
-            targets.append(tokens[:, i + h].detach())
+            ctx_actions = torch.stack([action_embed[:, i + 1 : i + h + 1] for i in range(start, stop)], dim=1)
+            pred_in = self.tile_and_cat(ctx_tokens, ctx_actions).reshape(b * w, h, p, -1)
+            # Recompute this chunk's forward during backward rather than hold
+            # every chunk's internal activations live for the single combined
+            # backward in model.py::_cal_grad.
+            pred_out = checkpoint(self.predictor, pred_in, use_reentrant=False)
+            preds.append(pred_out[:, -1, :, : self.tok_dim].reshape(b, w, p, self.tok_dim))
 
-            state_tokens.append(tokens[:, i + 1 : i + h + 1].detach())
-            state_actions.append(action_embed[:, i + 2 : i + h + 1].detach())
-
-        pred = torch.stack(preds, dim=1)
-        target = torch.stack(targets, dim=1)
+        pred = torch.cat(preds, dim=1)
+        target = tokens[:, h:].detach()
         pred_loss = F.mse_loss(pred, target, reduction="none").mean(dim=(-1, -2))  # (B, num_windows)
 
+        # Strided views, not copies: `unfold` exposes every sliding window
+        # without materialising any of them.  ActorCritic reads only
+        # `imag_starts` of the B*W windows, and `get_feat` touches just each
+        # window's last frame, so stacking all of them allocated ~300MB per
+        # update at batch_length=64 to throw 93% of it away.
         state = {
-            "tokens": torch.stack(state_tokens, dim=1),
-            "actions_out": torch.stack(state_actions, dim=1),
+            "tokens": tokens[:, 1:].unfold(1, h, 1).permute(0, 1, 4, 2, 3).detach(),
+            "actions_out": action_embed[:, 2:].unfold(1, h - 1, 1).permute(0, 1, 3, 2).detach(),
         }
         return state, pred_loss
 

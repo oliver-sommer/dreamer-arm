@@ -84,3 +84,33 @@ def test_feat_pool_flatten_matches_expected_size(tiny_dinowm_cfg) -> None:  # ty
     state = dinowm.initial(2, torch.device("cpu"))
     feat = dinowm.get_feat(state)
     assert feat.shape == (2, dinowm.feat_size)
+
+
+def test_dinowm_loss_is_chunk_invariant(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]
+    """Batching windows into the predictor must not change what is computed.
+
+    `window_chunk` only trades activation memory for GPU occupancy, so
+    chunk=1 (one window per call, the original loop) and a chunk covering
+    every window must agree on the loss, the imagination states, and the
+    gradients.
+    """
+    torch.manual_seed(0)
+    dinowm = DinoWM(tiny_dinowm_cfg, _shapes(), act_dim=4, num_patches=4, embed_dim=384)
+    b, t = 2, 8
+    tokens = torch.randn(b, t, 4, dinowm.tok_dim)
+    action = torch.randn(b, t, 4)
+
+    results = []
+    for chunk in (1, 64):
+        dinowm.zero_grad(set_to_none=True)
+        dinowm.window_chunk = chunk
+        state, pred_loss = dinowm.loss(tokens, action)
+        pred_loss.mean().backward()
+        grad = torch.cat([p.grad.reshape(-1) for p in dinowm.predictor.parameters() if p.grad is not None])
+        results.append((pred_loss.detach(), state["tokens"], state["actions_out"], grad.clone()))
+
+    (loss_a, tok_a, act_a, grad_a), (loss_b, tok_b, act_b, grad_b) = results
+    assert torch.allclose(loss_a, loss_b, atol=1e-6), (loss_a, loss_b)
+    assert torch.equal(tok_a, tok_b)
+    assert torch.equal(act_a, act_b)
+    assert torch.allclose(grad_a, grad_b, atol=1e-5)
