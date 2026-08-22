@@ -6,7 +6,7 @@ bracketed date+time and level, e.g.::
     [2026-06-14 12:34:56] INFO  step     1000  fps  123.4  score 12.34
 
 Metrics, videos and histograms still go to W&B via
-:class:`dreamer_arm.train.logger.WandbLogger`; this module only governs the
+:class:`dreamer_arm.utils.tracking.WandbLogger`; this module only governs the
 console.  Hydra's own job logging is ``disabled`` in ``configs/config.yaml``;
 that disabled config runs ``dictConfig(disable_existing_loggers=True)`` before
 ``main()``, which marks every already-imported logger (ours included)

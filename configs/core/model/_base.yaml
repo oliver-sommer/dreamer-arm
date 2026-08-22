@@ -1,0 +1,152 @@
+# @package core.model
+# Shared model defaults. r2dreamer.yaml / dreamerv3.yaml override the
+# representation-loss switch and add their head-specific subsections.
+
+# Backbone capacity (size12M from the reference repo).
+deter: 2048
+hidden: 256
+discrete: 16
+depth: 16
+units: 256
+act: "SiLU"
+norm: true
+
+# World model: "rssm" (categorical RSSM) or "dinowm" (frozen-ViT token-space,
+# see configs/core/model/dinowm.yaml). "dreamer4" is reserved, not implemented.
+wm: rssm
+
+# RL hyperparameters.
+act_entropy: 3e-4
+kl_free: 1.0
+imag_horizon: 15
+horizon: 333
+lamb: 0.95
+# Subsample imagination start states to this many (from the flattened B*T
+# posterior). null = use every start, as today; token-space world models
+# make imagination far more expensive per start and must subsample.
+imag_starts: null
+log_grads: false
+compile: false  # opt in explicitly for long runs: model.compile=true
+device: ${device}
+
+# Optimiser.
+lr: 4e-5
+agc: 0.3
+pmin: 1e-3
+eps: 1e-20
+beta1: 0.9
+beta2: 0.999
+warmup: 1000
+slow_target_update: 1
+slow_target_fraction: 0.02
+
+# Loss weights — branch-specific weights are added in the variant files.
+loss_scales:
+  rew: 1.0
+  con: 1.0
+  dyn: 1.0
+  rep: 0.1
+  policy: 1.0
+  value: 1.0
+  repval: 0.3
+
+# RSSM.
+rssm:
+  stoch: 32
+  deter: ${core.model.deter}
+  hidden: ${core.model.hidden}
+  discrete: ${core.model.discrete}
+  img_layers: 2
+  obs_layers: 1
+  dyn_layers: 1
+  blocks: 8
+  act: ${core.model.act}
+  norm: ${core.model.norm}
+  unimix_ratio: 0.01
+  initial: "learned"
+  device: ${device}
+
+# Multi-modal encoder.
+encoder:
+  mlp_keys: ${envs.encoder.mlp_keys}
+  cnn_keys: ${envs.encoder.cnn_keys}
+  mlp:
+    shape: null
+    layers: 3
+    units: ${core.model.units}
+    act: ${core.model.act}
+    norm: ${core.model.norm}
+    device: ${device}
+    outscale: null
+    symlog_inputs: true
+    name: "mlp_encoder"
+  cnn:
+    act: ${core.model.act}
+    norm: ${core.model.norm}
+    kernel_size: 5
+    minres: 4
+    depth: ${core.model.depth}
+    mults: [2, 3, 4, 4]
+
+# Reward / continue heads.
+reward:
+  shape: [255]
+  layers: 1
+  units: ${core.model.units}
+  act: ${core.model.act}
+  norm: ${core.model.norm}
+  dist:
+    name: "symexp_twohot"
+    bin_num: 255
+  outscale: 0.0
+  device: ${device}
+  symlog_inputs: false
+  name: "reward"
+
+cont:
+  shape: [1]
+  layers: 1
+  units: ${core.model.units}
+  act: ${core.model.act}
+  norm: ${core.model.norm}
+  dist:
+    name: "binary"
+  outscale: 1.0
+  device: ${device}
+  symlog_inputs: false
+  name: "cont"
+
+# Actor + critic. The agent picks `dist.disc` vs `dist.cont` at build time
+# from the gymnasium action space.
+actor:
+  shape: null  # overwritten by the agent from act_space
+  layers: 3
+  units: ${core.model.units}
+  act: ${core.model.act}
+  norm: ${core.model.norm}
+  device: ${device}
+  dist:
+    cont:
+      name: "bounded_normal"
+      min_std: 0.1
+      max_std: 1.0
+    disc:
+      name: "onehot"
+      unimix_ratio: 0.01
+  outscale: 0.01
+  symlog_inputs: false
+  name: "actor"
+
+critic:
+  shape: [255]
+  layers: 3
+  units: ${core.model.units}
+  act: ${core.model.act}
+  norm: ${core.model.norm}
+  device: ${device}
+  dist:
+    name: "symexp_twohot"
+    bin_num: 255
+  outscale: 0.0
+  symlog_inputs: false
+  name: "value"

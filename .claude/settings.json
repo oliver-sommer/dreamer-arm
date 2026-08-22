@@ -1,5 +1,3 @@
 {
-  "permissions": {
-    "deny": ["Read(./do-not-touch/**)"]
-  }
+  "permissions": {}
 }

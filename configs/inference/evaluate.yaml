@@ -1,0 +1,36 @@
+# @package _global_
+# Standalone evaluation of a saved checkpoint.
+#
+#   pixi run inference checkpoint=logs/<date>/<time>/checkpoint.pt envs.task=MT10
+#   pixi run inference checkpoint=<path> envs=metaworld envs.task=door-open
+#   pixi run inference checkpoint=<path> core/model=dinowm envs.task=door-open  # DINO-WM checkpoint
+#
+# Model and env groups must match those the checkpoint was trained with,
+# otherwise the weights will not load into the constructed agent.
+
+defaults:
+  - /envs: metaworld-mt
+  # Listed after /envs -- see the matching comment in training/dreamer.yaml.
+  - /core/model: r2dreamer
+  - /utils/logging: default
+  - _self_
+
+entrypoint:
+  _target_: dreamer_arm.inference.evaluate._run
+
+# Path to the checkpoint.pt to evaluate (mandatory).
+checkpoint: ???
+
+seed: 0
+device: ${auto_device:}
+
+logdir: logs/eval/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+eval:
+  # Minimum episodes to complete; rounded up to whole rounds across env_num.
+  episodes: ${envs.eval_episode_num}
+
+logging:
+  wandb:
+    # Standalone eval prints to the console by default; opt in to W&B.
+    mode: disabled

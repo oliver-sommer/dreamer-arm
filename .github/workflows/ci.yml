@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: prefix-dev/setup-pixi@v0.10.0
+        with:
+          cache: true
+          environments: dev
+      - run: pixi lock --check
+      # MuJoCo has no display on CI runners; osmesa is the software fallback.
+      - run: pixi run -e dev --platform linux-64 check
+        env:
+          MUJOCO_GL: osmesa
+      - name: Build wheel and verify installed config discovery
+        run: |
+          pixi run -e dev python -m pip wheel --no-deps --wheel-dir dist .
+          pixi run -e dev python -m venv --system-site-packages /tmp/dreamer-arm-wheel-smoke
+          /tmp/dreamer-arm-wheel-smoke/bin/pip install --no-deps dist/dreamer_arm-*.whl
+          cd /tmp
+          /tmp/dreamer-arm-wheel-smoke/bin/python -c "from dreamer_arm.utils.config import get_config_root; assert get_config_root().is_dir()"

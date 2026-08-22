@@ -124,9 +124,25 @@ class YamArm:
             nullspace_gain=cfg.nullspace_gain,
             ori_gain=cfg.ori_gain,
             joint_margin=cfg.joint_margin,
+            max_joint_step=cfg.max_joint_step,
         )
         e_pos = a[:3] * cfg.ee_step_m
         e_ori = cfg.ori_gain * quat_log_error(d.site_xmat[self._grasp_site_id], self._quat_home)
+
+        # Cap the orientation term relative to the commanded translation.  The
+        # full-quaternion error can reach ‖e_ori‖≈2 (a 180° wrist offset) while
+        # the translation command is ‖e_pos‖≤ee_step·√3 (~0.087 at ee_step=0.05)
+        # — a ~20x scale mismatch.  Uncapped, the 6-D DLS solve spends almost all
+        # of dq chasing an orientation the wrist often *cannot* reach (its joints
+        # are limited to ±π/2) and starves the position command, dragging the TCP
+        # off target and freezing the arm.  Capping orientation to the
+        # translation budget (floored at 0.3·ee_step so regulation stays alive
+        # for near-zero commands) guarantees position tracking always wins.
+        ori_cap = max(float(np.linalg.norm(e_pos)), 0.3 * cfg.ee_step_m)
+        ori_norm = float(np.linalg.norm(e_ori))
+        ori_capped = ori_norm > ori_cap
+        if ori_capped and ori_norm > 0.0:
+            e_ori = e_ori * (ori_cap / ori_norm)
         e = np.concatenate([e_pos, e_ori])
 
         # --- Jacobian at grasp_site ---
@@ -144,7 +160,20 @@ class YamArm:
             mujoco.mj_forward(m, d)
             return
 
-        q_target = solve_dls(J, e, q, self._q_home, self._jnt_range, ik_cfg)
+        # Per-step controller diagnostics (read by MetaWorldEnv into info so the
+        # trainer can log episode aggregates: singularity, orientation fighting,
+        # joint-velocity saturation, commanded vs achieved TCP motion).
+        diag: dict[str, float] = {
+            "cmd_norm": float(np.linalg.norm(e_pos)),
+            "ori_capped": float(ori_capped),
+        }
+        try:
+            diag["sigma_min"] = float(np.linalg.svd(J, compute_uv=False).min())
+        except np.linalg.LinAlgError:
+            diag["sigma_min"] = 0.0
+        env._ctrl_diag = diag
+
+        q_target = solve_dls(J, e, q, self._q_home, self._jnt_range, ik_cfg, diag=diag)
 
         # Guard: DLS result should be finite (bounded by joint clamp + λ).
         if not np.all(np.isfinite(q_target)):

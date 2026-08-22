@@ -1,8 +1,13 @@
+# @package envs
 # Single-task Meta-World environment.
 #
 # Usage:
-#   pixi run train envs=metaworld envs.task=door-open
-#   pixi run train envs=metaworld envs.task=pick-place arm=yam
+#   pixi run training envs=metaworld envs.task=door-open
+#   pixi run training envs=metaworld envs.task=pick-place envs/arm=sawyer
+
+defaults:
+  - arm: yam
+  - _self_
 
 name: metaworld
 # Specific task name (mandatory — must be a valid Meta-World env name).

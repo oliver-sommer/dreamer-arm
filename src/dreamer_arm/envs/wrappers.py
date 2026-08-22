@@ -23,7 +23,7 @@ so the env is not stepped after done (Meta-World raises if you do).
 from __future__ import annotations
 
 import contextlib
-from typing import Any
+from typing import Any, SupportsFloat, cast
 
 import gymnasium
 import numpy as np
@@ -35,21 +35,28 @@ from gymnasium import spaces
 
 
 class TimeLimit(gymnasium.Wrapper):  # type: ignore[misc]
-    """Truncate an episode after ``time_limit`` steps (counting agent steps)."""
+    """Truncate an episode after ``time_limit`` *agent* steps.
 
-    def __init__(self, env: gymnasium.Env, time_limit: int) -> None:  # type: ignore[misc]
+    ``SyncVectorEnv`` calls this wrapper's ``step`` ``action_repeat`` times per
+    agent step, so the truncation threshold is ``time_limit * action_repeat``
+    inner ``env.step`` calls.  With ``action_repeat=1`` this reduces to
+    ``time_limit`` steps.  (Previously this counted inner steps directly, which
+    silently truncated episodes at ``time_limit / action_repeat`` agent steps.)
+    """
+
+    def __init__(self, env: gymnasium.Env, time_limit: int, action_repeat: int = 1) -> None:  # type: ignore[misc]
         super().__init__(env)
-        self._time_limit = time_limit
+        self._max_inner = time_limit * action_repeat
         self._step_count = 0
 
     def reset(self, **kwargs: Any) -> tuple[Any, dict[str, Any]]:
         self._step_count = 0
         return self.env.reset(**kwargs)
 
-    def step(self, action: Any) -> tuple[Any, float, bool, bool, dict[str, Any]]:
+    def step(self, action: Any) -> tuple[Any, SupportsFloat, bool, bool, dict[str, Any]]:
         obs, rew, terminated, truncated, info = self.env.step(action)
         self._step_count += 1
-        if self._step_count >= self._time_limit:
+        if self._step_count >= self._max_inner:
             truncated = True
         return obs, rew, terminated, truncated, info
 
@@ -141,7 +148,8 @@ class SyncVectorEnv:
 
     @property
     def action_space(self) -> spaces.Box:
-        return self._action_space  # type: ignore[return-value]
+        # make_vector_env always builds a Box action space for these envs.
+        return cast(spaces.Box, self._action_space)
 
     @property
     def num_envs(self) -> int:

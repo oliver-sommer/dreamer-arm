@@ -1,0 +1,19 @@
+# @package core.buffer
+# Trajectory replay buffer sizing and device placement.
+#
+# Slices are (batch_size, batch_length + 1): the extra step seeds the RSSM
+# initial state, the rest is the training window.  See core/buffer.py.
+#
+# `max_size` targets a fixed ~6.1 GB of stored uint8 RGB frames regardless of
+# render resolution -- 500,000 slots at the RSSM default's 64x64x3, 125,000 at
+# DINO-WM's 128x128x3 (4x the bytes/frame). No per-world-model buffer variant
+# needed as a result: `core/model=dinowm` alone (which also bumps `envs.size`)
+# is enough, matching `core/model=dreamerv3` already being enough for RSSM.
+max_size: ${buffer_max_size:${envs.size},6144000000}
+batch_size: ${batch_size}
+batch_length: ${batch_length}
+
+# Sampling target: batches are moved here before the update.
+device: ${device}
+# Storage lives on the CPU; the grid is far too large for VRAM.
+storage_device: cpu

@@ -42,6 +42,10 @@ class ArmConfig:
     joint_margin: float = 0.05
     """Soft joint-limit margin (rad)."""
 
+    max_joint_step: float = 0.15
+    """Per-step cap on max |dq_i| (rad); preserves IK direction, prevents
+    near-singular / orientation-dominated steps from slamming joints to limits."""
+
     settle_steps: int = 200
     """Physics sub-steps used to settle the arm during ``reset_hand``."""
 

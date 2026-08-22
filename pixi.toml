@@ -1,14 +1,11 @@
 [workspace]
 authors = ["Oliver SOMMER <63651102+oliver-sommer@users.noreply.github.com>"]
-channels = ["conda-forge", "pytorch", "nvidia"]
+channels = ["https://prefix.dev/conda-forge"]
 name = "dreamer-arm"
-platforms = ["osx-arm64", "linux-64"]
-version = "0.1.0"
-
-# Apple-Silicon wheels for tensordict / torchrl ≥0.12 are tagged
+# Apple-Silicon wheels for tensordict / torchrl >=0.12 are tagged
 # macosx_14_0_arm64; raise the deployment target so pixi picks them.
-[system-requirements]
-macos = "14.0"
+platforms = [{ platform = "osx-arm64", macos = "14.0" }, "linux-64"]
+version = "0.1.0"
 
 [dependencies]
 python = "3.13.*"
@@ -17,9 +14,7 @@ numpy = ">=2.4"
 # removed; pin mujoco below 3.9 until dm-control catches up.
 mujoco = ">=3.2,<3.9"
 dm-control = ">=1.0.41"
-einops = ">=0.8.2"
 hydra-core = ">=1.3.2"
-"ruamel.yaml" = ">=0.19"
 pyyaml = ">=6.0.3"
 pillow = ">=9.2,<12"
 imageio = ">=2.37"
@@ -37,45 +32,67 @@ index-strategy = "first-index"
 
 [pypi-dependencies]
 dreamer-arm = { path = ".", editable = true }
+hatchling = ">=1.31"
+omegaconf = ">=2.3"
 # torch installed via pip so we can target a CUDA 12.6 build on Linux.
 torch = ">=2.7,<2.8"
 torchrl = ">=0.12"
 tensordict = ">=0.12"
 gymnasium = ">=1.3"
 moviepy = ">=2.0"
+# DINO-WM's frozen ViT backbone (vit_small_patch16_dinov3.lvd1689m) — timm's
+# mirror is ungated, unlike facebook/dinov3-* on the HF hub directly.
+timm = ">=1.0.20"
 # TODO(opt-A): replace with `metaworld = { git = "https://github.com/oliver-sommer/YAMetaworld.git" }`
 #              once everything is stable — that removes the submodule and makes `pixi install` self-contained.
-metaworld = { path = "third_party/metaworld", editable = true }
+metaworld = { path = "thirdparty/metaworld", editable = true }
 
 
 
-[feature.dev.dependencies]
-pytest = ">=9"
+[feature.dev.pypi-dependencies]
+copier = ">=9.17"
+prek = ">=0.4.11"
+pytest = ">=9.1.1"
 pytest-cov = ">=7"
-ruff = ">=0.15"
-mypy = ">=2.1"
-pre-commit = ">=4.6"
+pytest-timeout = ">=2.3"
+pytest-xdist = ">=3.8"
+ruff = ">=0.16"
+ty = ">=0.0.64"
+
+[feature.dev.tasks]
+typecheck = "ty check src tests"
+lint = "ruff check src tests"
+format = "ruff format src tests"
+format-check = "ruff format --check src tests"
+# torch and MuJoCo each ship an OpenMP runtime; without this the loader aborts
+# (SIGABRT) the moment both are imported.  MUJOCO_GL is handled in envs/__init__.py.
+test = { cmd = "pytest", env = { KMP_DUPLICATE_LIB_OK = "TRUE" } }
+hooks = "prek install"
+# One command for everything CI runs.
+check = { depends-on = ["format-check", "lint", "typecheck", "test"] }
+# Pull template changes: `pixi run -e dev template-update`
+template-update = "copier update --trust --answers-file configs/.copier-template.yaml"
 
 [environments]
 default = { features = [], solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 
 [tasks]
-lint = "ruff check src tests"
-fmt = "ruff format src tests"
-typecheck = "mypy src"
-test = "pytest"
 # Training. The env group + task are specified via Hydra overrides, e.g.:
-#   pixi run train envs=metaworld-mt envs.task=MT10            # generalist (default group)
-#   pixi run train envs=metaworld-mt envs.task=MT50 envs.env_num=50
-#   pixi run train envs=metaworld    envs.task=door-open arm=yam   # single task
+#   pixi run training envs=metaworld-mt envs.task=MT10            # generalist (default group)
+#   pixi run training envs=metaworld-mt envs.task=MT50 envs.env_num=50
+#   pixi run training envs=metaworld    envs.task=door-open            # single task
+#   pixi run training envs=metaworld    envs.task=door-open envs/arm=sawyer
 # TORCHINDUCTOR_CACHE_DIR persists torch.compile kernels across runs so only
 # the very first run pays the compilation cost (~30s); subsequent runs start fast.
 # PYTHONFAULTHANDLER prints a Python-level stack if native code segfaults (a
 # 12h MT50 run died to a bare SIGSEGV with zero context otherwise).
-train = { cmd = "python -m dreamer_arm", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE", PYTHONFAULTHANDLER = "1" } }
+training = { cmd = "python -m dreamer_arm.training", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE", PYTHONFAULTHANDLER = "1" } }
+# Standalone evaluation of a saved checkpoint:
+#   pixi run inference checkpoint=logs/<date>/<time>/checkpoint.pt envs.task=MT10
+inference = { cmd = "python -m dreamer_arm.inference.evaluate", env = { KMP_DUPLICATE_LIB_OK = "TRUE" } }
 # Live MuJoCo viewer window (macOS + mjpython only).
 # Works with any task / benchmark — the viewer attaches to env 0.
-#   pixi run train-view envs.task=door-open          # single task
-#   pixi run train-view envs.task=MT10               # MT10, viewer on task 0
-train-view = { cmd = "mjpython -m dreamer_arm envs.viewer=true wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE" } }
+#   pixi run training-view envs.task=door-open          # single task
+#   pixi run training-view envs.task=MT10               # MT10, viewer on task 0
+training-view = { cmd = "mjpython -m dreamer_arm.training envs.viewer=true logging.wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE" } }

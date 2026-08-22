@@ -137,9 +137,7 @@ def format_module_tree(info: dict[str, Any], parent_path: str = "", indent: int 
         full_path = parent_path
 
     lines = [" " * indent + f"{info['total']:11,d} {full_path}"]
-    param_nodes = [
-        {"name": pn, "params": {}, "children": {}, "total": n} for pn, n in info["params"].items()
-    ]
+    param_nodes = [{"name": pn, "params": {}, "children": {}, "total": n} for pn, n in info["params"].items()]
     combined = param_nodes + list(info["children"].values())
     combined.sort(key=lambda x: x["total"], reverse=True)
     for child in combined:
