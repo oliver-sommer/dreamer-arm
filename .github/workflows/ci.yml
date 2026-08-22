@@ -16,6 +16,13 @@ jobs:
           cache: true
           environments: dev
       - run: pixi lock --check
+      # MuJoCo's osmesa backend loads libOSMesa through PyOpenGL, and neither
+      # conda-forge mujoco nor dm-control pulls it in.  It is needed even for
+      # tests that never render: torchrl imports mujoco, and with MUJOCO_GL set
+      # `import mujoco` resolves the GL backend eagerly, so without this every
+      # test module dies at collection -- the pure-optimiser ones included.
+      - name: Install OSMesa (headless software GL)
+        run: sudo apt-get update && sudo apt-get install -y libosmesa6
       # MuJoCo has no display on CI runners; osmesa is the software fallback.
       - run: pixi run -e dev --platform linux-64 check
         env:
