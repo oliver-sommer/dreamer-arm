@@ -28,8 +28,11 @@ jobs:
         env:
           MUJOCO_GL: osmesa
       - name: Build wheel and verify installed config discovery
+        # Built with hatchling (already the declared build backend) rather than
+        # `pip wheel`: pixi installs PyPI dependencies with uv, so the
+        # environment has no pip.  The venv below gets its own via ensurepip.
         run: |
-          pixi run -e dev python -m pip wheel --no-deps --wheel-dir dist .
+          pixi run -e dev python -m hatchling build -t wheel
           pixi run -e dev python -m venv --system-site-packages /tmp/dreamer-arm-wheel-smoke
           /tmp/dreamer-arm-wheel-smoke/bin/pip install --no-deps dist/dreamer_arm-*.whl
           cd /tmp
