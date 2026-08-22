@@ -620,3 +620,80 @@ def test_render_path_applies_no_flip() -> None:
     src = inspect.getsource(MetaWorldEnv._grab_frame)
     assert "flipud" not in src, "_grab_frame must not flip; fix the camera in the MJCF instead"
     assert "fliplr" not in src, "_grab_frame must not mirror; fix the camera in the MJCF instead"
+
+
+# ---------------------------------------------------------------------------
+# GL backend selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("preset", [None, "", "  "])
+def test_gl_backend_set_before_mujoco_is_imported(preset: str | None) -> None:
+    """MUJOCO_GL must already be set at the instant mujoco is first imported.
+
+    mujoco chooses its GL backend once, at import, and never revisits it.  The
+    trap is that dreamer_arm.core.buffer imports torchrl.data, which transitively
+    imports mujoco -- so setting MUJOCO_GL inside dreamer_arm.envs was too late.
+    On Linux an unset variable resolves to glfw, which needs an X display and
+    dies at mjr_makeContext on a headless training box.
+
+    Asserting on the *resolved backend* would not catch this on macOS, where both
+    orderings land on cgl -- which is exactly why the bug stayed invisible in
+    local dev.  So assert the ordering invariant directly: hook __import__,
+    record MUJOCO_GL at the moment mujoco first appears, and require it to be
+    already populated.  That fails on every platform if the ordering regresses.
+
+    Blank counts as unset: mujoco accepts "" and falls through to glfw.
+    """
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    if preset is None:
+        env.pop("MUJOCO_GL", None)
+    else:
+        env["MUJOCO_GL"] = preset
+
+    code = (
+        "import builtins, os\n"
+        "_real, seen = builtins.__import__, {}\n"
+        "def spy(name, *a, **k):\n"
+        "    if name.split('.')[0] == 'mujoco' and 'v' not in seen:\n"
+        "        seen['v'] = os.environ.get('MUJOCO_GL', '')\n"
+        "    return _real(name, *a, **k)\n"
+        "builtins.__import__ = spy\n"
+        "import dreamer_arm.core.buffer\n"  # the module that pulls torchrl -> mujoco
+        "builtins.__import__ = _real\n"
+        "print(repr(seen.get('v', '<never-imported>')))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0, out.stderr[-2000:]
+    at_import = out.stdout.strip()
+
+    expected = "'egl'" if sys.platform == "linux" else "'cgl'"
+    if at_import == "'<never-imported>'":
+        pytest.skip("torchrl no longer imports mujoco; ordering trap cannot fire via this path")
+    assert at_import == expected, (
+        f"MUJOCO_GL was {at_import} when mujoco was first imported, want {expected}. "
+        "Something now imports mujoco before dreamer_arm/__init__.py runs."
+    )
+
+
+def test_explicit_gl_backend_is_respected() -> None:
+    """An explicit MUJOCO_GL must win -- CPU-only boxes need osmesa."""
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ, MUJOCO_GL="osmesa" if sys.platform == "linux" else "cgl")
+    want = "osmesa" if sys.platform == "linux" else "cgl"
+    out = subprocess.run(
+        [sys.executable, "-c", "import dreamer_arm; import os; print(os.environ['MUJOCO_GL'])"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip() == want

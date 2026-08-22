@@ -1,24 +1,20 @@
 """Environment factory and wrappers for dreamer-arm.
 
-Also owns the two pieces of process-level MuJoCo setup that must happen before
-any model is loaded: choosing the GL backend, and capturing engine warnings.
+Owns the capture of MuJoCo engine warnings.  The other piece of process-level
+setup, choosing the GL backend, lives in dreamer_arm/__init__.py -- it has to
+run before torchrl drags mujoco in, which happens before this module loads.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
-import sys
 
-# Must be set before any MuJoCo context is created, and importing the factory
-# below pulls in metaworld -> mujoco.  On headless Linux servers MuJoCo defaults
-# to GLFW, which needs an X display; EGL is the right backend for GPU servers.
-# On CPU-only machines export MUJOCO_GL=osmesa before launching.  setdefault
-# preserves any user override.
-os.environ.setdefault("MUJOCO_GL", "egl" if sys.platform == "linux" else "cgl")
-
-import mujoco  # noqa: E402
+# MUJOCO_GL is set in dreamer_arm/__init__.py, not here: by the time this module
+# runs, torchrl (via dreamer_arm.core.buffer) has usually imported mujoco
+# already, and the backend is chosen at that first import.  See the comment
+# there.  On CPU-only machines export MUJOCO_GL=osmesa before launching.
+import mujoco
 
 log = logging.getLogger(__name__)
 
