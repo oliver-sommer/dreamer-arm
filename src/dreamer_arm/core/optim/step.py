@@ -24,6 +24,7 @@ class OptimStep:
 
     def __init__(self, named_params: dict[str, nn.Parameter], config: Any, device: torch.device) -> None:
         self._named_params = named_params
+        self.device = device
         self._optimizer = LaProp(
             list(named_params.values()),
             lr=float(config.lr),
@@ -82,9 +83,13 @@ class OptimStep:
         self._optimizer.zero_grad(set_to_none=True)
         self.stepped = stepped
 
-        mets["opt/grad_skipped"] = torch.tensor(0.0 if stepped else 1.0)
-        mets["opt/lr"] = torch.tensor(self._scheduler.get_last_lr()[0])
-        mets["opt/grad_scale"] = torch.tensor(self._scaler.get_scale())
+        # device= matters, not just style: these land in the same metrics dict
+        # as the wm/ac losses (computed on `device`), and WandbLogger.scalars()
+        # stacks every tensor value in one call -- a bare torch.tensor(x) here
+        # defaults to CPU and torch.stack refuses to mix devices.
+        mets["opt/grad_skipped"] = torch.tensor(0.0 if stepped else 1.0, device=self.device)
+        mets["opt/lr"] = torch.tensor(self._scheduler.get_last_lr()[0], device=self.device)
+        mets["opt/grad_scale"] = torch.tensor(self._scaler.get_scale(), device=self.device)
         if self._log_grads:
             updates = [(p.data - old) for p, old in zip(params, old_params, strict=True)]
             mets["opt/param_rms"] = compute_rms([p.data for p in params])

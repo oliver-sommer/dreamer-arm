@@ -145,22 +145,32 @@ class WandbLogger:
         self._scalars[name] = float(value)
 
     def scalars(self, values: Mapping[str, _Scalar | torch.Tensor]) -> None:
-        """Log a batch of scalars with at most one CUDA sync, not one per key.
+        """Log a batch of scalars with at most one CUDA sync per device, not one per key.
 
         A Dreamer update reports 15-20 metrics, and ``.item()`` blocks until
         every kernel queued so far has finished -- called once per key, that
         serialises the update loop into N host round-trips instead of the one
-        it needs.  ``torch.stack(...).tolist()`` still blocks, but only once,
-        for the whole batch: with the GPU otherwise saturated by many small
-        kernels (the common case for a small recurrent model like this), that
+        it needs.  ``torch.stack(...).tolist()`` still blocks, but only once
+        per device: with the GPU otherwise saturated by many small kernels
+        (the common case for a small recurrent model like this), that
         difference is the gap between a sync every update and twenty of them.
+
+        Grouped by device rather than stacked in one call: a metrics dict that
+        mixes a stray CPU-default ``torch.tensor(x)`` in with the rest (an easy
+        slip -- it happened once already, see optim/step.py's history) would
+        make a single ungrouped stack crash with a device-mismatch error that
+        only a CUDA/MPS host would ever hit, since a CPU-only dev box has
+        nothing to mismatch against.
         """
         tensors = {k: v for k, v in values.items() if isinstance(v, torch.Tensor)}
-        if tensors:
+        by_device: dict[torch.device, list[str]] = {}
+        for k, v in tensors.items():
+            by_device.setdefault(v.device, []).append(k)
+        for _device, keys in by_device.items():
             # Every value here is a loss/metric mean -> single-element; reshape
             # rather than stacking mismatched shapes if that invariant ever slips.
-            stacked = torch.stack([v.detach().reshape(()) for v in tensors.values()])
-            for k, val in zip(tensors, stacked.tolist(), strict=True):
+            stacked = torch.stack([tensors[k].detach().reshape(()) for k in keys])
+            for k, val in zip(keys, stacked.tolist(), strict=True):
                 self._scalars[k] = float(val)
         for k, v in values.items():
             if k not in tensors:
