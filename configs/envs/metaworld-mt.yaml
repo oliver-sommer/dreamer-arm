@@ -1,9 +1,10 @@
+# @package envs
 # Multi-task Meta-World (MT10 / MT25 / MT50).
 #
 # Usage:
-#   pixi run train                                         # default: MT10, 10 envs
-#   pixi run train envs.task=MT25 envs.env_num=25
-#   pixi run train envs.task=MT50 envs.env_num=50
+#   pixi run training                                         # default: MT10, 10 envs
+#   pixi run training envs.task=MT25 envs.env_num=25
+#   pixi run training envs.task=MT50 envs.env_num=50
 #
 # Constraint: env_num must be divisible by task_count (10 / 25 / 50).
 # Each env is pinned to one task type and emits a one-hot task_id observation.

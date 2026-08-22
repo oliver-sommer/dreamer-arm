@@ -1,0 +1,64 @@
+# @package _global_
+# Online Dreamer training.
+#
+# `pixi run training` with no overrides trains MT10 (the metaworld-mt default).
+# The single-task group leaves envs.task mandatory, so `envs=metaworld` must be
+# paired with an explicit task.  Override from the CLI:
+#   pixi run training envs=metaworld-mt envs.task=MT10                   # generalist (default)
+#   pixi run training envs=metaworld-mt envs.task=MT50 envs.env_num=50
+#   pixi run training envs=metaworld    envs.task=door-open              # single task
+#   pixi run training envs=metaworld    envs.task=door-open envs/arm=sawyer
+#   pixi run training core/model=dreamerv3                               # swap world model (RSSM variant)
+#   pixi run training core/model=dinowm envs.task=door-open              # swap world model (DINO-WM)
+
+defaults:
+  - /core/buffer
+  - /envs: metaworld-mt
+  # Listed after /envs: dinowm.yaml's `@package _global_` override of
+  # `envs.size` (needed so the ViT backbone's patch grid matches the
+  # rendered resolution) must be applied after /envs's own default, or the
+  # later group would clobber it back to 64x64.
+  - /core/model: r2dreamer
+  - /utils/logging: default
+  - _self_
+
+entrypoint:
+  _target_: dreamer_arm.training.dreamer._run
+
+seed: 0
+device: ${auto_device:}
+deterministic_run: false
+
+logdir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+# Path to a checkpoint.pt from a previous run to resume from (weights,
+# optimiser, and step counter; the replay buffer refills from scratch):
+#   pixi run training envs.task=MT50 envs.env_num=50 resume=logs/<date>/<time>/checkpoint.pt
+resume: null
+
+batch_size: 16
+batch_length: 64
+
+trainer:
+  steps: ${envs.steps}
+  pretrain: 0
+  # Eval is expensive with shared train/eval envs: each eval steps the envs
+  # for a full episode (time_limit/action_repeat × env_num global steps —
+  # 25000 for MT50), so eval_every must be several times that or most env
+  # compute goes to eval.  The trainer additionally defers shared-env eval to
+  # episode boundaries so training episodes are never truncated.
+  eval_every: 25000
+  eval_episode_num: ${envs.eval_episode_num}
+  # Agent checkpoint cadence (env steps; 0 disables).  One file, atomically
+  # replaced at <logdir>/checkpoint.pt (~a few hundred MB: weights+optimiser).
+  checkpoint_every: 50000
+  batch_size: ${batch_size}
+  batch_length: ${batch_length}
+  train_ratio: ${envs.train_ratio}
+
+  update_log_every: 1000
+  # Wall-clock console liveness line (seconds; 0 disables).  `update_log_every`
+  # is a step cadence, so on a slow world model the first step-line can be 20+
+  # minutes out.
+  heartbeat_secs: 30.0
+  action_repeat: ${envs.action_repeat}

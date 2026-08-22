@@ -1,2 +1,2 @@
-# SCM syntax highlighting & preventing 3-way merges
-pixi.lock merge=binary linguist-language=YAML linguist-generated=true -diff
+# Generated lockfile: preserve readable diffs but prevent automatic merges.
+pixi.lock merge=binary linguist-language=YAML linguist-generated=true

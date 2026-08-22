@@ -41,6 +41,12 @@ class IKConfig:
     joint_margin: float = 0.05
     """Soft-limit margin (rad) kept inside each joint limit."""
 
+    max_joint_step: float = 0.15
+    """Per-step cap on ``max|dq_i|`` (rad).  ``dq`` is scaled down uniformly when
+    it exceeds this, preserving the IK direction while preventing a near-singular
+    or orientation-dominated solve from slamming joints into their limits in a
+    single control step.  ``0`` disables the clamp."""
+
 
 # ---------------------------------------------------------------------------
 # Quaternion helpers (pure numpy, [w, x, y, z] convention)
@@ -133,6 +139,7 @@ def solve_dls(
     q_home: np.ndarray,
     jnt_range: np.ndarray,
     cfg: IKConfig,
+    diag: dict[str, float] | None = None,
 ) -> np.ndarray:
     """Damped-least-squares IK step with nullspace posture bias.
 
@@ -143,6 +150,8 @@ def solve_dls(
         q_home:    (n_arm,) home configuration to pull toward.
         jnt_range: (n_arm, 2) joint limits [[lo, hi], ...].
         cfg:       IK tuning config.
+        diag:      Optional dict; when given, populated with ``dq_max`` and
+                   ``dq_clamped`` for per-step controller diagnostics.
 
     Returns:
         (n_arm,) joint angle targets (already clamped to soft limits).
@@ -162,10 +171,27 @@ def solve_dls(
     # Posture bias: pull toward home pose
     dq = dq + N @ (cfg.nullspace_gain * (q_home - q))
 
+    # Per-step joint-velocity clamp: scale dq uniformly so max|dq_i| ≤
+    # max_joint_step.  Constant-λ DLS already bounds ‖dq‖, but the bound scales
+    # with ‖e‖; an orientation-dominated or near-singular step can still command
+    # a multi-radian joint jump that saturates against the limit clamp below and
+    # parks the arm there.  Clamping dq direction-preservingly turns those into
+    # bounded, smooth steps.
+    dq_clamped = False
+    if cfg.max_joint_step > 0.0:
+        dq_peak = float(np.abs(dq).max())
+        if dq_peak > cfg.max_joint_step:
+            dq = dq * (cfg.max_joint_step / dq_peak)
+            dq_clamped = True
+
     # Soft-limit clamping: clamp the commanded target, not the velocity
     q_target = np.clip(
         q + dq,
         jnt_range[:, 0] + cfg.joint_margin,
         jnt_range[:, 1] - cfg.joint_margin,
     )
+
+    if diag is not None:
+        diag["dq_max"] = float(np.abs(dq).max())
+        diag["dq_clamped"] = float(dq_clamped)
     return q_target

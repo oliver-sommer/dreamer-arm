@@ -1,0 +1,10 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY.
+_commit: v0.1.0
+_src_path: https://github.com/oliver-sommer/pytorch-template.git
+author_name: Oliver SOMMER
+description: Dreamer (R2-Dreamer / DreamerV3) implementation for the i2rt YAM robotic
+  arm in MuJoCo.
+package_name: dreamer_arm
+project_name: dreamer-arm
+python_version: '3.13'
+repo_name: dreamer-arm

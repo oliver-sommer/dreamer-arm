@@ -53,6 +53,7 @@ def make_env(
     seed: int,
     size: tuple[int, int],
     time_limit: int,
+    action_repeat: int = 1,
     *,
     arm: str = "yam",
     camera: str = "corner",
@@ -108,7 +109,7 @@ def make_env(
         success_threshold=success_threshold,
         viewer=_viewer,
     )
-    wrapped = TimeLimit(wrapped, time_limit=time_limit)
+    wrapped = TimeLimit(wrapped, time_limit=time_limit, action_repeat=action_repeat)
     if action_rate_cost > 0.0 or action_mag_cost > 0.0:
         wrapped = ActionRatePenalty(
             wrapped,
@@ -174,6 +175,7 @@ def make_vector_env(
                 seed=_env_seed,
                 size=size,
                 time_limit=time_limit,
+                action_repeat=action_repeat,
                 arm=arm_name,
                 _task=_task,
                 _task_idx=_task_idx,
@@ -198,10 +200,7 @@ def _parse_name(env_name: str) -> tuple[str, str]:
     """Split ``"metaworld:door-open"`` → ``("metaworld", "door-open")``."""
     parts = env_name.split(":", 1)
     if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise ValueError(
-            f"Invalid env_name {env_name!r}. "
-            "Expected 'metaworld:<task>' or 'metaworld:MT10|MT25|MT50'."
-        )
+        raise ValueError(f"Invalid env_name {env_name!r}. Expected 'metaworld:<task>' or 'metaworld:MT10|MT25|MT50'.")
     return parts[0], parts[1]
 
 
@@ -227,8 +226,7 @@ def _resolve_task_assignments(
 
         if num_envs % task_count != 0:
             raise ValueError(
-                f"env_num={num_envs} must be divisible by task_count={task_count} "
-                f"for benchmark {task_tag}."
+                f"env_num={num_envs} must be divisible by task_count={task_count} for benchmark {task_tag}."
             )
 
         tasks_by_name: dict[str, list[Any]] = collections.defaultdict(list)
@@ -259,3 +257,48 @@ def _resolve_task_assignments(
             task = all_tasks[i % len(all_tasks)]
             assignments.append((env_cls, task, None, None))
         return assignments
+
+
+# Optional env kwargs, keyed by the config field that supplies them.  Only
+# fields actually present in the active env group are forwarded, so each env
+# config declares exactly the knobs it supports.
+_OPTIONAL_ENV_FIELDS: dict[str, Callable[[Any], Any]] = {
+    "success_threshold": float,
+    "camera": str,
+    "wrist_camera": str,
+    "camera_jitter": float,
+    "wrist_fisheye": float,
+    "scene_randomize": bool,
+    "camera_pose_randomize": bool,
+    "action_rate_cost": float,
+    "action_mag_cost": float,
+}
+
+
+def build_from_config(cfg: Any, *, viewer: bool = False) -> SyncVectorEnv:
+    """Build a ``SyncVectorEnv`` from a resolved Hydra config.
+
+    Shared by training and standalone evaluation so both construct envs the
+    same way.  ``cfg`` is the *root* config: ``cfg.envs`` supplies the env
+    group and the optional ``cfg.envs.arm`` group selects the arm plugin.
+    """
+    envs_cfg = cfg.envs
+    extra: dict[str, Any] = {
+        field: convert(envs_cfg[field])
+        for field, convert in _OPTIONAL_ENV_FIELDS.items()
+        if field in envs_cfg and envs_cfg[field] is not None
+    }
+    arm_cfg = envs_cfg.get("arm") if hasattr(envs_cfg, "get") else None
+    if arm_cfg is not None:
+        extra["arm"] = str(arm_cfg.name)
+
+    return make_vector_env(
+        f"{envs_cfg.name}:{envs_cfg.task}",
+        num_envs=int(envs_cfg.env_num),
+        seed=int(envs_cfg.seed),
+        size=tuple(envs_cfg.size),
+        action_repeat=int(envs_cfg.action_repeat),
+        time_limit=int(envs_cfg.time_limit),
+        viewer=viewer,
+        **extra,
+    )

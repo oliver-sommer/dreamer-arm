@@ -127,6 +127,14 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         self._renderer = mujoco.Renderer(env.model, height=size[0], width=size[1])
         self._scene_cam: mujoco.MjvCamera | None = None  # set each reset
 
+        # mujoco.Renderer.render() flips the GL buffer assuming the EGL / GLFW /
+        # OSMesa convention (bottom-to-top), which is correct on the Linux/EGL
+        # training box.  The macOS CGL backend already returns pixels top-to-
+        # bottom, so that flip leaves CGL renders upside down.  Undo it *only*
+        # on CGL so output is upright on every backend.
+        gl_ctx = getattr(self._renderer, "_gl_context", None)
+        self._flip_vertical = type(gl_ctx).__module__.endswith(".cgl") if gl_ctx else False
+
         # Resolve joint addresses for proprio
         m = env.model
         if arm == "yam":
@@ -137,8 +145,18 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         else:
             self._arm_qadr = None  # Sawyer: zeros
 
+        # Controller diagnostics (YAM only): grasp_site is the IK-controlled
+        # point, used to measure achieved-vs-commanded TCP motion (the stuck
+        # signal).  Aggregates are reset each episode in reset().
+        self._is_yam = arm == "yam"
+        self._grasp_site_id = int(mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "grasp_site")) if self._is_yam else -1
+        self._reset_ctrl_diag()
+
         self._episode_success: bool = False
         self._rng = np.random.default_rng()
+
+        self._light_diffuse0 = m.light_diffuse.copy()
+        self._light_ambient0 = m.light_ambient.copy()
 
         # Passive viewer (mjpython only; None when viewer=False)
         self._mj_viewer: Any = None
@@ -176,6 +194,9 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         # Inner env reset (calls _reset_hand → YamArm.reset_hand → sets init_tcp)
         self._env.reset()
         self._episode_success = False
+        self._reset_ctrl_diag()
+        if self._is_yam:
+            self._prev_tcp = np.asarray(self._env.data.site_xpos[self._grasp_site_id], dtype=np.float64).copy()
 
         # Camera setup for this episode
         if self._camera_pose_randomize or self._camera_jitter > 0.0:
@@ -187,24 +208,23 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
             self._randomise_lighting()
 
         obs = self._get_obs_dict()
-        info: dict[str, Any] = {"task_name": self._task_name, "success": False}
+        info = self._build_info()
         return obs, info
 
-    def step(
-        self, action: np.ndarray
-    ) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
+    def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         action = np.asarray(action, dtype=np.float32)
         try:
             _, reward, terminated, truncated, inner_info = self._env.step(action)
         except (ValueError, RuntimeError):
             # Physics instability (NaN positions) propagated into reward computation.
-            # Treat as a terminal step with zero reward so the episode resets.
+            # This is not an MDP terminal state, so flag it as a *truncation* (not
+            # terminated) — otherwise the critic learns these glitch states have
+            # zero future value. Zero reward, and the episode resets.
             obs = self._get_obs_dict()
-            info: dict[str, Any] = {
-                "task_name": self._task_name,
-                "success": self._episode_success,
-            }
-            return obs, 0.0, True, False, info
+            return obs, 0.0, False, True, self._build_info()
+
+        if self._is_yam:
+            self._accumulate_ctrl_diag()
 
         if float(inner_info.get("success", 0.0)) >= self._success_threshold:
             self._episode_success = True
@@ -213,11 +233,7 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
             self._mj_viewer.sync()
 
         obs = self._get_obs_dict()
-        info = {
-            "task_name": self._task_name,
-            "success": self._episode_success,
-        }
-        return obs, float(reward), bool(terminated), bool(truncated), info
+        return obs, float(reward), bool(terminated), bool(truncated), self._build_info()
 
     def close(self) -> None:
         if self._mj_viewer is not None:
@@ -232,6 +248,73 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
             self._renderer.close()
+
+    # ------------------------------------------------------------------
+    # Controller diagnostics (YAM)
+    # ------------------------------------------------------------------
+
+    def _reset_ctrl_diag(self) -> None:
+        """Zero the per-episode EEController diagnostic aggregates."""
+        self._cd_n = 0
+        self._cd_sigma_sum = 0.0
+        self._cd_sigma_min = float("inf")
+        self._cd_ori_capped = 0
+        self._cd_dq_clamped = 0
+        self._cd_track_sum = 0.0
+        self._cd_track_n = 0
+        self._cd_stuck = 0
+        self._prev_tcp: np.ndarray | None = None
+
+    def _accumulate_ctrl_diag(self) -> None:
+        """Fold the controller's last per-step diagnostics into episode aggregates.
+
+        ``YamArm.actuate`` stashes its per-step diag on ``env._ctrl_diag``; here
+        we read it after the inner step and also measure the *achieved* TCP
+        displacement (at the IK-controlled ``grasp_site``) against the commanded
+        step.  A persistently low achieved/commanded ratio is the stuck signal.
+        """
+        diag = getattr(self._env, "_ctrl_diag", None)
+        if not diag:
+            return
+        self._cd_n += 1
+        sigma = float(diag.get("sigma_min", 0.0))
+        self._cd_sigma_sum += sigma
+        self._cd_sigma_min = min(self._cd_sigma_min, sigma)
+        self._cd_ori_capped += int(diag.get("ori_capped", 0.0) > 0.0)
+        self._cd_dq_clamped += int(diag.get("dq_clamped", 0.0) > 0.0)
+
+        tcp = np.asarray(self._env.data.site_xpos[self._grasp_site_id], dtype=np.float64)
+        cmd = float(diag.get("cmd_norm", 0.0))
+        # Only count steps that actually commanded motion (cmd ~ 0 → ratio is
+        # meaningless and would falsely read as "stuck").
+        if self._prev_tcp is not None and cmd > 1e-4:
+            ratio = float(np.linalg.norm(tcp - self._prev_tcp)) / cmd
+            self._cd_track_sum += ratio
+            self._cd_track_n += 1
+            if ratio < 0.25:
+                self._cd_stuck += 1
+        self._prev_tcp = tcp
+
+    def _ctrl_diag_summary(self) -> dict[str, float] | None:
+        """Episode-aggregate controller diagnostics, or ``None`` if unavailable."""
+        if not self._is_yam or self._cd_n == 0:
+            return None
+        return {
+            "sigma_min_mean": self._cd_sigma_sum / self._cd_n,
+            "sigma_min_min": self._cd_sigma_min,
+            "frac_ori_capped": self._cd_ori_capped / self._cd_n,
+            "frac_dq_clamped": self._cd_dq_clamped / self._cd_n,
+            "track_ratio_mean": (self._cd_track_sum / self._cd_track_n if self._cd_track_n else 1.0),
+            "frac_stuck": (self._cd_stuck / self._cd_track_n if self._cd_track_n else 0.0),
+        }
+
+    def _build_info(self) -> dict[str, Any]:
+        """Step/reset info dict, tagged with task name, success, and ctrl_diag."""
+        info: dict[str, Any] = {"task_name": self._task_name, "success": self._episode_success}
+        summary = self._ctrl_diag_summary()
+        if summary is not None:
+            info["ctrl_diag"] = summary
+        return info
 
     # ------------------------------------------------------------------
     # Observation helpers
@@ -253,9 +336,7 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
     def _get_proprio(self) -> np.ndarray:
         d = self._env.data
         joints = (
-            d.qpos[self._arm_qadr].astype(np.float32)
-            if self._arm_qadr is not None
-            else np.zeros(6, dtype=np.float32)
+            d.qpos[self._arm_qadr].astype(np.float32) if self._arm_qadr is not None else np.zeros(6, dtype=np.float32)
         )
         lc = np.asarray(d.body("leftclaw").xpos)
         rc = np.asarray(d.body("rightclaw").xpos)
@@ -271,14 +352,19 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
             self._renderer.update_scene(self._env.data, camera=self._scene_cam)
         else:
             self._renderer.update_scene(self._env.data, camera=self._camera)
-        return self._renderer.render().copy()
+        return self._grab_frame()
 
     def _render_wrist(self) -> np.ndarray:
         self._renderer.update_scene(self._env.data, camera=self._wrist_camera)
-        frame = self._renderer.render().copy()
+        frame = self._grab_frame()
         if self._wrist_fisheye != 0.0:
             frame = _apply_barrel_distortion(frame, self._wrist_fisheye)
         return frame
+
+    def _grab_frame(self) -> np.ndarray:
+        """Render the current scene, correcting the CGL vertical flip (see __init__)."""
+        frame = self._renderer.render()
+        return np.flipud(frame).copy() if self._flip_vertical else frame.copy()
 
     # ------------------------------------------------------------------
     # Domain randomisation
@@ -302,10 +388,11 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         return cam
 
     def _randomise_lighting(self) -> None:
+        # Scale the captured baseline, never the current value: MjModel persists
+        # across resets, so compounding would fade the scene to black (both
+        # factors have mean < 1, ~0.85x per episode).
         m = self._env.model
         for li in range(m.nlight):
             tint = self._rng.uniform(0.7, 1.0, 3).astype(np.float32)
-            m.light_diffuse[li] = np.clip(m.light_diffuse[li] * tint, 0.0, 1.0)
-            m.light_ambient[li] = np.clip(
-                m.light_ambient[li] * float(self._rng.uniform(0.5, 1.2)), 0.0, 1.0
-            )
+            m.light_diffuse[li] = np.clip(self._light_diffuse0[li] * tint, 0.0, 1.0)
+            m.light_ambient[li] = np.clip(self._light_ambient0[li] * float(self._rng.uniform(0.5, 1.2)), 0.0, 1.0)

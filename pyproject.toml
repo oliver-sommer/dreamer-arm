@@ -1,124 +1,85 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [project]
 name = "dreamer-arm"
 version = "0.1.0"
 description = "Dreamer (R2-Dreamer / DreamerV3) implementation for the i2rt YAM robotic arm in MuJoCo."
 readme = "README.md"
 requires-python = ">=3.13"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Oliver Sommer" }]
-classifiers = [
-    "Programming Language :: Python :: 3.13",
-    "License :: OSI Approved :: MIT License",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
-# Runtime dependencies are managed through pixi.toml. We list a minimal set
-# here so the wheel is still installable directly from PyPI / pip.
-dependencies = [
-    "torch>=2.7,<2.8",
-    "numpy>=2.4",
-    "einops>=0.8.2",
-    "hydra-core>=1.3.2",
-    "gymnasium>=1.3",
-    "tensordict>=0.12",
-    "torchrl>=0.12",
-    "wandb>=0.26",
-    "pyyaml>=6.0.3",
-    "mujoco>=3.2,<3.9",
-    "dm-control>=1.0.41",
-]
+
+# Runtime dependencies are managed entirely through pixi.toml -- this project
+# is only ever installed via `pixi install`, never `pip install dreamer-arm`
+# (the pypi index doesn't carry a CUDA 12.6 torch build pixi.toml pins against
+# on Linux, nor the editable `thirdparty/metaworld` submodule path).
 
 [project.scripts]
-dreamer-arm = "dreamer_arm.__main__:main"
+dreamer-arm-train = "dreamer_arm.training.__main__:run"
+dreamer-arm-eval = "dreamer_arm.inference.evaluate:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dreamer_arm"]
 
+[tool.hatch.build.targets.wheel.shared-data]
+"configs" = "share/dreamer-arm/configs"
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/dreamer_arm", "/configs", "/tests", "/README.md", "/LICENSE", "/pyproject.toml", "/pixi.toml"]
+
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py313"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "PTH", "BLE", "T10", "RUF001", "RUF002", "RUF003"]
 ignore = [
-    "E501",   # let ruff format own line length
-    "B008",   # function call in default arg (common for torch defaults)
-    "N812",   # allow `import torch.nn.functional as F`
-    "N806",   # allow ML-style local variable names
-    "N803",   # allow ML-style argument names
-    "SIM108", # ternary readability is judgement call
+  "E741",  # ambiguous variable names (l, I, O) are idiomatic in tensor code
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["B011", "N802"]
+"__init__.py" = ["F401"]  # re-exports
+"tests/*" = ["B011"]
 
 [tool.ruff.format]
 docstring-code-format = true
 
-[tool.mypy]
-python_version = "3.13"
-strict = true
-warn_unused_ignores = true
-# torch ops are heavily typed as Any in stubs; strict warn_return_any creates
-# noise without catching real bugs in tensor-manipulation code.
-warn_return_any = false
-disallow_untyped_defs = true
-files = ["src/dreamer_arm"]
-plugins = []
+[tool.ty.environment]
+# metaworld is an editable path dependency (thirdparty/metaworld); ty does not
+# follow the .pth file the editable install leaves behind, so point at it here.
+extra-paths = ["thirdparty/metaworld"]
 
-[[tool.mypy.overrides]]
-module = [
-    "torchrl.*",
-    "tensordict.*",
-    "dm_control.*",
-    "mujoco.*",
-    "metaworld.*",
-    "wandb.*",
-    "einops.*",
-    "gymnasium.*",
-    "hydra.*",
-    "omegaconf.*",
-    "imageio.*",
-]
-ignore_missing_imports = true
-
-# nn.Module attribute access is typed as `Tensor | Module` by torch, which
-# breaks calls and attribute lookups on submodules. We disable the affected
-# error codes for our torch-heavy modules rather than scattering ignores.
-# ``unused-ignore`` is disabled too: the pre-push hook pins a different mypy
-# version than the dev env, and the two disagree on which ``# type: ignore``
-# comments are needed, so flagging unused ones produces version-dependent noise.
-[[tool.mypy.overrides]]
-module = [
-    "dreamer_arm.agent.*",
-    "dreamer_arm.architecture.*",
-    "dreamer_arm.optim.*",
-    "dreamer_arm.utils.modules",
-]
-disable_error_code = [
-    "operator", "union-attr", "index", "no-untyped-call", "arg-type", "unused-ignore",
-]
-
-# env / trainer modules interact extensively with MuJoCo / gymnasium Any interfaces,
-# which are largely untyped: gym base classes need explicit generic args, wrappers
-# rebind the wrapped-env variable, and scipy ships no stubs.  Suppress the same
-# error codes used for the agent stack plus the gym/interface-typing ones.
-[[tool.mypy.overrides]]
-module = [
-    "dreamer_arm.envs.*",
-    "dreamer_arm.train.trainer",
-]
-disable_error_code = [
-    "operator", "union-attr", "index", "no-untyped-call", "arg-type", "misc",
-    "type-arg", "unused-ignore", "import-untyped", "return-value", "assignment",
-]
+# torch types submodule attributes as `Tensor | Module` and gymnasium/tensordict
+# ship loose stubs, so attribute access, calls and subscripts on them are flagged
+# throughout the model and env stacks.  These are the same families of diagnostic
+# the previous mypy config disabled per-module; several sites still carry the
+# `# type: ignore[override]` comments mypy wanted.  Suppressed globally rather
+# than per-file because the noise is spread across core/, envs/ and utils/.
+[tool.ty.rules]
+unresolved-attribute = "ignore"
+call-non-callable = "ignore"
+not-subscriptable = "ignore"
+invalid-argument-type = "ignore"
+no-matching-overload = "ignore"
+# Deliberate signature variance from torch base classes: Distribution.sample /
+# rsample take a temperature, Optimizer.step returns None, Conv2dSamePad narrows
+# Conv2d.forward.
+invalid-method-override = "ignore"
+# gymnasium declares Env.metadata as an instance attribute; MetaWorldEnv makes it
+# a ClassVar, which is the conventional gym pattern.
+invalid-attribute-override = "ignore"
+# torch.compile(self._method) rebinds a bound method to a plain callable, which
+# ty reads as an arity change at the call site.  Correct at runtime.
+invalid-assignment = "ignore"
+missing-argument = "ignore"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+timeout = 120
 addopts = ["-ra", "--strict-markers", "-m", "not slow"]
 markers = [
     "slow: long-running tests skipped by default",

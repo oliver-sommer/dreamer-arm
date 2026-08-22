@@ -1,0 +1,16 @@
+# @package logging
+# Console verbosity plus the Weights & Biases metric sink (utils/tracking.py).
+
+level: INFO
+
+wandb:
+  project: dreamer-arm
+  entity: null
+  # On vast.ai, pass logging.wandb.mode=offline: a TLS hiccup permanently kills
+  # the online stream (run shows "crashed" while training continues).  In
+  # offline mode the logger uploads the run itself via `wandb sync --append`
+  # every sync_interval seconds (0 disables), so the website still updates.
+  mode: online
+  sync_interval: 600
+  tags: []
+  name: null
