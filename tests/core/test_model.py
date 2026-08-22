@@ -136,3 +136,36 @@ def test_to_and_checkpoint_round_trip_preserve_frozen_views() -> None:
     agent2.load_checkpoint_state(ckpt)
     for p in agent2.frozen_wm.rssm.parameters():  # type: ignore[attr-defined]
         assert torch.allclose(p, torch.full_like(p, 0.05))
+
+
+def test_compile_raises_recursion_limit() -> None:
+    """Enabling compile must lift the recursion limit before inductor runs.
+
+    Inductor's fusion pass walks the fused-node ancestor graph with a recursive
+    DFS (``found_path`` inside ``Scheduler.will_fusion_create_cycle``).  One
+    Dreamer update compiles as a single region deep enough to exceed CPython's
+    default 1000 frames, and it fails *during compilation* with a bare
+    RecursionError that names no dreamer_arm frame.
+
+    Compile only runs on CUDA (``auto_compile``), so this cannot be reached by
+    exercising the agent on a CPU/MPS test host; assert on the helper directly.
+    """
+    import sys
+
+    from dreamer_arm.core.model import (
+        _INDUCTOR_RECURSION_LIMIT,
+        _raise_recursion_limit_for_inductor,
+    )
+
+    original = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(1000)
+        _raise_recursion_limit_for_inductor()
+        assert sys.getrecursionlimit() == _INDUCTOR_RECURSION_LIMIT
+
+        # Must never lower a limit a caller deliberately set higher.
+        sys.setrecursionlimit(_INDUCTOR_RECURSION_LIMIT + 5000)
+        _raise_recursion_limit_for_inductor()
+        assert sys.getrecursionlimit() == _INDUCTOR_RECURSION_LIMIT + 5000
+    finally:
+        sys.setrecursionlimit(original)

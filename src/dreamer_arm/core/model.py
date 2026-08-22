@@ -22,6 +22,7 @@ world model.
 
 from __future__ import annotations
 
+import sys
 from collections import OrderedDict
 from collections.abc import Mapping
 from typing import Any
@@ -35,6 +36,23 @@ from dreamer_arm.core.actor_critic import ActorCritic
 from dreamer_arm.core.optim.step import OptimStep
 from dreamer_arm.core.world_model import WorldModel, build_world_model
 from dreamer_arm.utils.tensor import to_f32
+
+#: Python's default 1000 frames is not enough for inductor's fusion pass on a
+#: graph this size.  Scheduler.will_fusion_create_cycle explores the fused-node
+#: ancestor graph with a recursive DFS (found_path in _inductor/scheduler.py),
+#: and one Dreamer update -- world model plus actor-critic over the imagination
+#: horizon -- compiles as a single region deep enough to blow the limit with
+#: "RecursionError: maximum recursion depth exceeded" *during compilation*.
+#:
+#: The frames are small and this runs on the main thread's 8 MB stack, so the
+#: headroom is cheap.  Only ever raise the limit: never lower a caller's.
+_INDUCTOR_RECURSION_LIMIT = 20_000
+
+
+def _raise_recursion_limit_for_inductor() -> None:
+    """Give inductor's fusion DFS enough stack to schedule the update graph."""
+    if sys.getrecursionlimit() < _INDUCTOR_RECURSION_LIMIT:
+        sys.setrecursionlimit(_INDUCTOR_RECURSION_LIMIT)
 
 
 class Dreamer(nn.Module):
@@ -82,6 +100,7 @@ class Dreamer(nn.Module):
         self.train()
 
         if bool(config.compile):
+            _raise_recursion_limit_for_inductor()
             # "default" compiles in seconds; "reduce-overhead" (CUDA graphs) can
             # take 5-10 min on first run before any progress shows in the logs.
             self._cal_grad = torch.compile(self._cal_grad, mode="default")  # type: ignore[method-assign]
