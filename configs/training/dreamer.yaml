@@ -31,9 +31,12 @@ deterministic_run: false
 
 logdir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
-# Path to a checkpoint.pt from a previous run to resume from (weights,
-# optimiser, and step counter; the replay buffer refills from scratch):
-#   pixi run training envs.task=MT50 envs.env_num=50 resume=logs/<date>/<time>/checkpoint.pt
+# Path to a checkpoint from a previous run to resume from (weights, optimiser,
+# step counter, episode-id counter, and best eval score).  Resuming from
+# latest.pt also restores the replay buffer from the latest_buffer/ dir beside
+# it; best.pt and the archives under checkpoints/ carry no buffer, so those
+# resume onto an empty one.
+#   pixi run training envs.task=MT50 envs.env_num=50 resume=logs/<date>/<time>/latest.pt
 resume: null
 
 batch_size: 16
@@ -49,9 +52,20 @@ trainer:
   # episode boundaries so training episodes are never truncated.
   eval_every: 25000
   eval_episode_num: ${envs.eval_episode_num}
-  # Agent checkpoint cadence (env steps; 0 disables).  One file, atomically
-  # replaced at <logdir>/checkpoint.pt (~a few hundred MB: weights+optimiser).
+  # Agent checkpoint cadence (env steps).  Refreshes <logdir>/latest.pt
+  # (~a few hundred MB: weights+optimiser), atomically replaced each time.
   checkpoint_every: 50000
+  # Every checkpoint on this coarser grid is also copied to
+  # <logdir>/checkpoints/step_<N>.pt and kept, so there is a history to roll
+  # back to; the ones in between are only ever seen as latest.pt.  Must be a
+  # multiple of checkpoint_every to fire (150k = every 3rd).  0 = no archives.
+  checkpoint_keep_every: 150000
+  # Dump the replay buffer beside latest.pt so `resume` restarts warm instead of
+  # refilling from empty.  Costs a full rewrite of the buffer's *allocation*
+  # (LazyTensorStorage preallocates max_size for every key -- ~9-10 GB at
+  # 64x64/500k slots) on every checkpoint, so turn it off if the run stalls
+  # periodically or disk is tight.  best.pt and the archives never carry one.
+  checkpoint_buffer: true
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   train_ratio: ${envs.train_ratio}

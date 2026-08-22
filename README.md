@@ -35,7 +35,7 @@ pixi run training envs=metaworld envs.task=door-open envs/arm=sawyer
 pixi run training core/model=dreamerv3
 
 # evaluate a saved checkpoint
-pixi run inference checkpoint=logs/<date>/<time>/checkpoint.pt envs.task=MT10
+pixi run inference checkpoint=logs/<date>/<time>/best.pt envs.task=MT10
 ```
 
 All runs log to Weights & Biases. Set `WANDB_API_KEY` (and optionally

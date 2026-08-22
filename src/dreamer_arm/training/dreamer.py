@@ -36,6 +36,28 @@ def _log_run_shape(env_name: str, cfg: DictConfig, envs: Any, agent: Any) -> Non
     log.info("agent %s parameters", f"{sum(p.numel() for p in agent.parameters()):,}")
 
 
+def _restore_buffer(checkpoint: Path, buffer: Any) -> None:
+    """Load the replay buffer saved beside ``checkpoint``, if there is one.
+
+    The trainer writes the dump as ``<stem>_buffer`` next to the file it
+    accompanies, and only ever for ``latest.pt``.  Resolving by that convention
+    means ``best.pt`` and the archives -- which carry no buffer -- simply find
+    nothing and start cold, with no extra config to get wrong.
+
+    A buffer that fails to load is not fatal: the run continues on an empty one,
+    which is exactly the old behaviour.
+    """
+    path = checkpoint.with_name(f"{checkpoint.stem}_buffer")
+    if not path.is_dir():
+        log.info("no replay buffer beside %s; starting with an empty buffer", checkpoint.name)
+        return
+    try:
+        buffer.load(path)
+        log.info("restored replay buffer from %s (%d transitions)", path, len(buffer))
+    except Exception:  # noqa: BLE001 - a bad dump must not block a resume
+        log.exception("replay buffer restore failed (%s); starting with an empty buffer", path)
+
+
 def _run(cfg: DictConfig) -> None:
     """Build the full Dreamer stack from ``cfg`` and run the online loop."""
     set_seed_everywhere(int(cfg.seed))
@@ -82,23 +104,27 @@ def _run(cfg: DictConfig) -> None:
         eval_episode_num=int(cfg.trainer.eval_episode_num),
         update_log_every=int(cfg.trainer.update_log_every),
         checkpoint_every=int(cfg.trainer.checkpoint_every),
-        checkpoint_path=str(Path(cfg.logdir) / "checkpoint.pt"),
+        checkpoint_dir=str(cfg.logdir),
+        checkpoint_keep_every=int(cfg.trainer.checkpoint_keep_every),
+        checkpoint_buffer=bool(cfg.trainer.checkpoint_buffer),
         heartbeat_secs=float(cfg.trainer.heartbeat_secs),
     )
 
-    # Crash-resume: restore agent weights/optimiser and continue the step
-    # counter.  The replay buffer is not part of the checkpoint; it refills
-    # from scratch (model updates pause until the warmup minimum is met).
+    # Crash-resume: restore agent weights/optimiser, the step counter, and the
+    # trainer's own counters (episode ids, best eval score).
     start_step = 0
+    trainer_state: dict[str, Any] = {}
     if cfg.resume is not None:
         ckpt = torch.load(str(cfg.resume), map_location=cfg.device, weights_only=False)
         agent.load_checkpoint_state(ckpt["agent"])
         start_step = int(ckpt["step"])
+        trainer_state = dict(ckpt.get("trainer", {}))
         log.info("resumed from %s at step %d", cfg.resume, start_step)
+        _restore_buffer(Path(str(cfg.resume)), buffer)
 
     try:
         trainer = OnlineTrainer(trainer_cfg, buffer, logger, train_envs, eval_envs)
-        trainer.begin(agent, start_step=start_step)
+        trainer.begin(agent, start_step=start_step, trainer_state=trainer_state)
     finally:
         logger.finish()
         train_envs.close()

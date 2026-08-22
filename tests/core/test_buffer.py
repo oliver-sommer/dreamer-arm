@@ -6,6 +6,8 @@ that :meth:`update_initial_state` writes back to the same slots.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from tensordict import TensorDict
 
@@ -148,3 +150,41 @@ def test_buffer_sample_alignment() -> None:
 
     assert torch.equal(action, obs - 1.0), f"action misaligned:\nobs={obs}\naction={action}"
     assert torch.equal(reward, obs - 1.0), f"reward misaligned:\nobs={obs}\nreward={reward}"
+
+
+def test_buffer_save_load_round_trip(tmp_path: Any) -> None:
+    """save() -> fresh buffer -> load() preserves length and sample shape."""
+    n_envs = 2
+    stoch_shape = (4, 4)
+    deter_dim = 8
+    src = _make_buf(batch_size=2, batch_length=4)
+    for t in range(16):
+        td = TensorDict(
+            {
+                "scene": torch.zeros(n_envs, 8, 8, 3, dtype=torch.uint8),
+                "action": torch.zeros(n_envs, 3),
+                "reward": torch.zeros(n_envs, 1),
+                "is_first": torch.tensor([t == 0] * n_envs),
+                "is_last": torch.tensor([False] * n_envs),
+                "is_terminal": torch.tensor([False] * n_envs),
+                "stoch": torch.full((n_envs, *stoch_shape), float(t)),
+                "deter": torch.full((n_envs, deter_dim), float(t)),
+                "episode": torch.zeros(n_envs, dtype=torch.int32),
+            },
+            batch_size=(n_envs,),
+        )
+        src.add_transition(td)
+
+    path = tmp_path / "buffer_dump"
+    src.save(path)
+    assert path.is_dir()
+
+    # A fresh buffer, same config, starts empty.
+    dst = _make_buf(batch_size=2, batch_length=4)
+    assert len(dst) == 0
+    dst.load(path)
+
+    assert len(dst) == len(src)
+    data, _, initial = dst.sample(("stoch", "deter"))
+    assert data.shape == torch.Size([2, 4])
+    assert initial["stoch"].shape == (2, *stoch_shape)

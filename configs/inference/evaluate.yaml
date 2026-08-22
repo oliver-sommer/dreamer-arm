@@ -1,7 +1,7 @@
 # @package _global_
 # Standalone evaluation of a saved checkpoint.
 #
-#   pixi run inference checkpoint=logs/<date>/<time>/checkpoint.pt envs.task=MT10
+#   pixi run inference checkpoint=logs/<date>/<time>/best.pt envs.task=MT10
 #   pixi run inference checkpoint=<path> envs=metaworld envs.task=door-open
 #   pixi run inference checkpoint=<path> core/model=dinowm envs.task=door-open  # DINO-WM checkpoint
 #
@@ -18,7 +18,8 @@ defaults:
 entrypoint:
   _target_: dreamer_arm.inference.evaluate._run
 
-# Path to the checkpoint.pt to evaluate (mandatory).
+# Checkpoint to evaluate (mandatory).  Any of a run's checkpoints works:
+# best.pt (highest eval/success_mean), latest.pt, or checkpoints/step_<N>.pt.
 checkpoint: ???
 
 seed: 0

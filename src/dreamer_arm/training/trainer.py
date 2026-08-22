@@ -15,15 +15,29 @@ Design notes
   multiple of ``eval_every``, then deferred until an env is at an episode
   boundary (``is_first.any()``).  The rollout itself lives in
   :mod:`dreamer_arm.inference.evaluate`.
-* Episode ids are monotonically-increasing per-process int32 counters shared
-  across all envs; the SliceSampler uses them to avoid splicing across resets.
-* Checkpoints are atomic: ``torch.save`` to ``.tmp``, then ``os.replace``.
+* Episode ids are monotonically-increasing int32 counters shared across all
+  envs; the SliceSampler uses them to avoid splicing across resets.  The counter
+  lives on the trainer and is checkpointed, so a run resumed onto a restored
+  replay buffer continues past the ids already stored rather than reusing them.
+* Checkpoints are atomic: ``torch.save`` to ``.tmp``, then ``os.replace``.  Three
+  kinds land under ``checkpoint_dir``:
+
+  - ``latest.pt`` -- refreshed every ``checkpoint_every`` steps, and the only one
+    accompanied by a replay-buffer dump (``latest_buffer/``) when
+    ``checkpoint_buffer`` is set, so resuming from it starts warm.
+  - ``checkpoints/step_<N>.pt`` -- archived on the coarser
+    ``checkpoint_keep_every`` grid, giving a history to roll back to.
+  - ``best.pt`` -- highest ``eval/success_mean`` so far, written from the eval
+    path rather than the checkpoint cadence.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import shutil
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,8 +65,10 @@ class TrainerConfig:
     eval_every: int  # eval after this many env steps
     eval_episode_num: int  # episodes to collect during each eval pass
     update_log_every: int  # write logger scalars every N env steps
-    checkpoint_every: int  # save checkpoint every N env steps
-    checkpoint_path: str  # path for the checkpoint file
+    checkpoint_every: int  # refresh latest.pt every N env steps
+    checkpoint_dir: str  # directory holding latest.pt / best.pt / checkpoints/
+    checkpoint_keep_every: int = 0  # also archive on this grid (0 = no archives)
+    checkpoint_buffer: bool = False  # persist the replay buffer beside latest.pt
     heartbeat_secs: float = 30.0  # console liveness line cadence (0 disables)
 
 
@@ -84,20 +100,34 @@ class OnlineTrainer:
         self._hb_time = time.time()
         self._hb_step = 0
         self._hb_updates = 0
+        # Best eval score seen so far, and the next unused episode id. Both are
+        # carried in the checkpoint: see begin() and _save_checkpoint().
+        self._best_success = -math.inf
+        self._next_ep_id = 0
 
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
-    def begin(self, agent: Any, start_step: int = 0) -> None:
+    def begin(self, agent: Any, start_step: int = 0, trainer_state: Mapping[str, Any] | None = None) -> None:
         """Run the training loop.
 
         Args:
-            agent:      Dreamer agent with ``get_initial_state``, ``act``,
-                        ``update``, ``checkpoint_state``.
-            start_step: Resume from this env-step count (crash recovery).
+            agent:         Dreamer agent with ``get_initial_state``, ``act``,
+                           ``update``, ``checkpoint_state``.
+            start_step:    Resume from this env-step count (crash recovery).
+            trainer_state: The ``"trainer"`` block of a checkpoint, restoring the
+                           episode-id counter and best eval score.  Required for
+                           correctness when resuming onto a restored replay
+                           buffer -- see ``_next_ep_id`` below.
         """
         set_phase("train")
+        if trainer_state:
+            # Episode ids must continue past anything already in the buffer.
+            # Restarting them at N would make SliceSampler treat old and new
+            # transitions as one trajectory and splice across the join.
+            self._next_ep_id = int(trainer_state.get("next_ep_id", self._next_ep_id))
+            self._best_success = float(trainer_state.get("best_success", self._best_success))
         cfg = self._cfg
         N = self._N
         device = agent.device
@@ -117,9 +147,10 @@ class OnlineTrainer:
         # is_first flags: first obs after reset is the start of episode
         is_first = np.ones(N, dtype=bool)
 
-        # Monotonically-increasing episode ids (unique across process lifetime)
-        episode_ids = np.arange(N, dtype=np.int32)
-        _next_ep_id = N
+        # Monotonically-increasing episode ids, allocated from the instance
+        # counter so a resumed run continues past the ids already in the buffer.
+        episode_ids = np.arange(self._next_ep_id, self._next_ep_id + N, dtype=np.int32)
+        self._next_ep_id += N
 
         # Per-env running stats
         ep_return = np.zeros(N, dtype=np.float32)
@@ -139,6 +170,11 @@ class OnlineTrainer:
         # Checkpoint / log watermarks
         _last_ckpt = (start_step // cfg.checkpoint_every) * cfg.checkpoint_every
         _last_log = (start_step // cfg.update_log_every) * cfg.update_log_every
+        # Archives ride a coarser grid than latest.pt.  Watermarked, not
+        # `env_step % keep_every == 0`: env_step advances by N per iteration and
+        # only lands on exact multiples when N divides the interval.
+        _keep_every = cfg.checkpoint_keep_every
+        _last_archive = (start_step // _keep_every) * _keep_every if _keep_every > 0 else 0
 
         # Liveness markers: collection runs fast, but once training updates
         # start fps drops sharply, so the first periodic step-line can be minutes
@@ -176,8 +212,8 @@ class OnlineTrainer:
                 cache_zeros = {k: torch.zeros_like(state[k]) for k in cache_keys}
                 is_first = np.ones(N, dtype=bool)
                 # Bump episode ids for all envs after eval
-                episode_ids = np.arange(_next_ep_id, _next_ep_id + N, dtype=np.int32)
-                _next_ep_id += N
+                episode_ids = np.arange(self._next_ep_id, self._next_ep_id + N, dtype=np.int32)
+                self._next_ep_id += N
                 # The in-flight episodes were abandoned mid-way; carrying their
                 # partial totals over would inflate the next episode's score.
                 ep_return[:] = 0.0
@@ -243,8 +279,8 @@ class OnlineTrainer:
                 state["prev_action"][done_t] = 0.0
                 for i in range(N):
                     if done[i]:
-                        episode_ids[i] = _next_ep_id
-                        _next_ep_id += 1
+                        episode_ids[i] = self._next_ep_id
+                        self._next_ep_id += 1
 
             cache_zeros = {k: torch.zeros_like(state[k]) for k in cache_keys}
             obs_np = obs_next_np
@@ -289,7 +325,10 @@ class OnlineTrainer:
             # ---- checkpoint ----
             if env_step - _last_ckpt >= cfg.checkpoint_every:
                 _last_ckpt = (env_step // cfg.checkpoint_every) * cfg.checkpoint_every
-                self._save_checkpoint(agent, env_step)
+                archive = _keep_every > 0 and env_step - _last_archive >= _keep_every
+                if archive:
+                    _last_archive = (env_step // _keep_every) * _keep_every
+                self._save_checkpoint(agent, env_step, archive=archive)
 
             self._heartbeat(env_step, updates, prefill_min)
             self._logger.keepalive(env_step)
@@ -359,15 +398,75 @@ class OnlineTrainer:
             self._logger.scalars(result.metrics)
             self._logger.write(env_step, fps=False)
 
+            # best.pt is promoted here, not on the checkpoint cadence: eval is
+            # the only success signal and it runs more often than checkpointing,
+            # so a peak between two checkpoints would otherwise be lost.
+            # `evaluate` omits the key entirely when no episode completed.
+            success = result.metrics.get("eval/success_mean")
+            if success is not None and success > self._best_success:
+                self._best_success = float(success)
+                self._save_best(agent, env_step, self._best_success)
+
     # ------------------------------------------------------------------
     # Checkpoint
     # ------------------------------------------------------------------
 
-    def _save_checkpoint(self, agent: Any, env_step: int) -> None:
-        """Atomically save ``{agent: ..., step: env_step}`` to disk."""
-        path = Path(self._cfg.checkpoint_path)
-        tmp = path.with_suffix(".tmp")
+    def _payload(self, agent: Any, env_step: int) -> dict[str, Any]:
+        """Everything needed to resume: agent state plus trainer-owned counters."""
+        return {
+            "agent": agent.checkpoint_state(),
+            "step": env_step,
+            "trainer": {
+                "next_ep_id": int(self._next_ep_id),
+                "best_success": float(self._best_success),
+            },
+        }
+
+    def _write(self, payload: dict[str, Any], path: Path) -> None:
+        """Write ``payload`` to ``path`` atomically (``.tmp`` then ``os.replace``)."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"agent": agent.checkpoint_state(), "step": env_step}, tmp)
+        tmp = path.with_suffix(".tmp")
+        torch.save(payload, tmp)
         tmp.replace(path)
-        log.info("checkpoint saved at step %d → %s", env_step, path)
+
+    def _save_checkpoint(self, agent: Any, env_step: int, archive: bool = False) -> None:
+        """Refresh ``latest.pt``, optionally archiving a copy under ``checkpoints/``.
+
+        The archive is a byte copy of the file just written rather than a second
+        ``torch.save``, so the two cannot drift.
+        """
+        root = Path(self._cfg.checkpoint_dir)
+        latest = root / "latest.pt"
+        self._write(self._payload(agent, env_step), latest)
+        log.info("checkpoint saved at step %d → %s", env_step, latest)
+
+        if archive:
+            kept = root / "checkpoints" / f"step_{env_step:09d}.pt"
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(latest, kept)
+            log.info("archived checkpoint → %s", kept)
+
+        if self._cfg.checkpoint_buffer:
+            self._save_buffer(latest)
+
+    def _save_buffer(self, latest: Path) -> None:
+        """Persist the replay buffer beside ``latest.pt`` so resume starts warm.
+
+        Named by convention (``<stem>_buffer``) so the resume path can find it
+        without extra config, and so ``best.pt`` / archives -- which carry no
+        buffer -- simply find nothing and start cold.
+
+        Best-effort: a failed buffer dump must not lose the agent checkpoint that
+        was just written successfully.
+        """
+        target = latest.with_name(f"{latest.stem}_buffer")
+        try:
+            self._buffer.save(target)
+        except Exception:  # noqa: BLE001 - never let this kill a training run
+            log.exception("replay buffer save failed (%s); continuing without it", target)
+
+    def _save_best(self, agent: Any, env_step: int, success: float) -> None:
+        """Record a new best-scoring policy (weights only, no replay buffer)."""
+        path = Path(self._cfg.checkpoint_dir) / "best.pt"
+        self._write(self._payload(agent, env_step), path)
+        log.info("new best eval/success_mean %.4f at step %d → %s", success, env_step, path)

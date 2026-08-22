@@ -32,6 +32,20 @@ pixi run -e dev check # format-check + lint + typecheck + test
 `pixi run -e dev test` must keep `KMP_DUPLICATE_LIB_OK=TRUE`: torch and MuJoCo
 each ship an OpenMP runtime and the loader aborts without it.
 
+## Run artefacts
+
+A training run writes into `logs/<date>/<time>/`:
+
+```
+latest.pt          every trainer.checkpoint_every steps
+latest_buffer/     replay buffer, only beside latest.pt (checkpoint_buffer)
+best.pt            highest eval/success_mean, written from the eval path
+checkpoints/       archives on the coarser checkpoint_keep_every grid
+```
+
+`resume=` takes any of them, but only `latest.pt` restores the replay buffer —
+the others resume onto an empty one.
+
 ## Template
 
 Generated from `pytorch-template` and tracked with Copier; answers live in

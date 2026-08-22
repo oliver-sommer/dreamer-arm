@@ -140,7 +140,7 @@ def _run(cfg: DictConfig) -> EvalResult:
     from dreamer_arm.utils.seed import set_seed_everywhere
 
     if cfg.checkpoint is None:
-        raise ValueError("inference requires a checkpoint: pass checkpoint=<path/to/checkpoint.pt>")
+        raise ValueError("inference requires a checkpoint: pass checkpoint=<path/to/best.pt>")
 
     set_seed_everywhere(int(cfg.seed))
     envs = build_from_config(cfg, viewer=bool(cfg.envs.get("viewer", False)))

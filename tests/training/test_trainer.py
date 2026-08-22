@@ -6,6 +6,7 @@ Uses lightweight mock objects so no MuJoCo or GPU is required.
 from __future__ import annotations
 
 import itertools
+import math
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,9 @@ def _make_trainer_cfg(**overrides: Any) -> TrainerConfig:
         eval_episode_num=0,  # disable eval
         update_log_every=9999,
         checkpoint_every=9999,
-        checkpoint_path="/tmp/test_checkpoint.pt",
+        # Writable but shared: tests that assert on checkpoint contents pass
+        # their own tmp_path.  Only created if a test actually writes.
+        checkpoint_dir=str(Path(tempfile.gettempdir()) / "dreamer-arm-test-checkpoints"),
     )
     defaults.update(overrides)
     return TrainerConfig(**defaults)
@@ -288,33 +291,29 @@ def test_episode_score_logged() -> None:
     assert len(score_logs) >= 1, "Expected at least one episode/score log"
 
 
-def test_checkpoint_round_trip() -> None:
+def test_checkpoint_round_trip(tmp_path: Path) -> None:
     """Save a checkpoint and verify the envelope has the expected keys."""
-    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-        ckpt_path = f.name
+    N = 1
+    envs = _MockVectorEnv(num_envs=N, done_every=99)
+    buffer = _MockBuffer()
+    logger = _MockLogger()
+    agent = _MockAgent(num_envs=N)
 
-    try:
-        N = 1
-        envs = _MockVectorEnv(num_envs=N, done_every=99)
-        buffer = _MockBuffer()
-        logger = _MockLogger()
-        agent = _MockAgent(num_envs=N)
+    cfg = _make_trainer_cfg(steps=3, checkpoint_every=2, checkpoint_dir=str(tmp_path))
+    trainer = OnlineTrainer(cfg, buffer, logger, envs, eval_envs=None)
+    trainer.begin(agent)
 
-        cfg = _make_trainer_cfg(
-            steps=3,
-            checkpoint_every=2,
-            checkpoint_path=ckpt_path,
-        )
-        trainer = OnlineTrainer(cfg, buffer, logger, envs, eval_envs=None)
-        trainer.begin(agent)
-
-        assert Path(ckpt_path).exists(), "Checkpoint file should exist"
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        assert "agent" in ckpt, "Checkpoint missing 'agent' key"
-        assert "step" in ckpt, "Checkpoint missing 'step' key"
-        assert isinstance(ckpt["step"], int)
-    finally:
-        Path(ckpt_path).unlink()
+    latest = tmp_path / "latest.pt"
+    assert latest.exists(), "latest.pt should exist"
+    ckpt = torch.load(latest, map_location="cpu", weights_only=False)
+    assert "agent" in ckpt, "Checkpoint missing 'agent' key"
+    assert "step" in ckpt, "Checkpoint missing 'step' key"
+    assert isinstance(ckpt["step"], int)
+    # Trainer-owned counters ride along so a resume can restore them.
+    assert ckpt["trainer"]["next_ep_id"] >= N
+    assert "best_success" in ckpt["trainer"]
+    # No .tmp left behind by the atomic write.
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_train_ratio_accumulation() -> None:
@@ -505,3 +504,157 @@ def test_pretrain_runs_once_after_prefill() -> None:
     trainer.begin(agent)
 
     assert len(update_calls) == 5, f"expected 5 pretrain updates, got {len(update_calls)}"
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint layout: archives, best.pt, resume state
+# ---------------------------------------------------------------------------
+
+
+def test_archives_only_on_keep_every_grid(tmp_path: Path) -> None:
+    """latest.pt refreshes every checkpoint_every steps; checkpoints/ only every keep_every."""
+    N = 1
+    envs = _MockVectorEnv(num_envs=N, done_every=99)
+    agent = _MockAgent(num_envs=N)
+
+    cfg = _make_trainer_cfg(
+        steps=12,
+        checkpoint_every=2,
+        checkpoint_keep_every=6,
+        checkpoint_dir=str(tmp_path),
+    )
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, eval_envs=None)
+    trainer.begin(agent)
+
+    assert (tmp_path / "latest.pt").exists()
+    archived = sorted(p.name for p in (tmp_path / "checkpoints").glob("step_*.pt"))
+    # checkpoint_every=2 crosses the keep_every=6 watermark at steps 6 and 12.
+    assert archived == ["step_000000006.pt", "step_000000012.pt"], archived
+
+
+def test_no_archives_when_keep_every_zero(tmp_path: Path) -> None:
+    N = 1
+    envs = _MockVectorEnv(num_envs=N, done_every=99)
+    agent = _MockAgent(num_envs=N)
+
+    cfg = _make_trainer_cfg(
+        steps=12,
+        checkpoint_every=2,
+        checkpoint_keep_every=0,
+        checkpoint_dir=str(tmp_path),
+    )
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, eval_envs=None)
+    trainer.begin(agent)
+
+    assert (tmp_path / "latest.pt").exists()
+    assert not (tmp_path / "checkpoints").exists()
+
+
+def test_archive_grid_survives_uneven_env_count(tmp_path: Path) -> None:
+    """The keep_every grid is a watermark, not step % keep_every == 0.
+
+    env_step advances by N per iteration, so it only lands exactly on a
+    multiple of keep_every when N divides the interval.  With N=3 and
+    keep_every=10 it never will; the watermark must still fire once per
+    crossing rather than never firing (or firing every iteration).
+    """
+    N = 3
+    envs = _MockVectorEnv(num_envs=N, done_every=99)
+    agent = _MockAgent(num_envs=N)
+
+    cfg = _make_trainer_cfg(
+        steps=33,  # env_step visits 3, 6, ..., 33 -- crosses 10 and 20 and 30
+        checkpoint_every=3,
+        checkpoint_keep_every=10,
+        checkpoint_dir=str(tmp_path),
+    )
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, eval_envs=None)
+    trainer.begin(agent)
+
+    archived = sorted(p.name for p in (tmp_path / "checkpoints").glob("step_*.pt"))
+    assert len(archived) == 3, archived  # one per watermark crossing, not one per checkpoint
+
+
+class _ScriptedSuccessEnv(_MockVectorEnv):
+    """Reports a caller-controlled success value on every episode completion."""
+
+    success: bool = False
+
+    def step(self, actions: np.ndarray) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray, Any]:
+        obs, rewards, terms, truncs, info = super().step(actions)
+        for fin in info["final_info"]:
+            if fin is not None:
+                fin["success"] = self.success
+        return obs, rewards, terms, truncs, info
+
+
+def test_best_checkpoint_written_on_improvement_only(tmp_path: Path) -> None:
+    envs = _ScriptedSuccessEnv(num_envs=2, done_every=3)
+    cfg = _make_trainer_cfg(eval_episode_num=2, checkpoint_dir=str(tmp_path))
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
+    agent = _MockAgent(num_envs=2)
+
+    envs.success = True
+    trainer._run_eval(agent, env_step=100)
+    assert (tmp_path / "best.pt").exists()
+    first_mtime = (tmp_path / "best.pt").stat().st_mtime_ns
+    assert trainer._best_success == 1.0
+
+    # A worse eval must not overwrite best.pt.
+    envs.success = False
+    trainer._run_eval(agent, env_step=200)
+    assert trainer._best_success == 1.0
+    assert (tmp_path / "best.pt").stat().st_mtime_ns == first_mtime
+
+
+def test_best_checkpoint_survives_missing_success_key(monkeypatch: Any, tmp_path: Path) -> None:
+    """evaluate() omits eval/success_mean entirely when no episode completed.
+
+    _run_eval must not crash on the missing key, and must not write best.pt.
+    Stubs evaluate() directly rather than driving an env loop, since the real
+    evaluate() cannot return early without at least one completed episode.
+    """
+    from dreamer_arm.inference.evaluate import EvalResult
+
+    envs = _MockVectorEnv(num_envs=2, done_every=3)
+    cfg = _make_trainer_cfg(eval_episode_num=2, checkpoint_dir=str(tmp_path))
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
+    agent = _MockAgent(num_envs=2)
+
+    monkeypatch.setattr(
+        "dreamer_arm.training.trainer.evaluate",
+        lambda *a, **k: EvalResult(metrics={"eval/ctrl_singularity": 0.1}, video=None),
+    )
+    trainer._run_eval(agent, env_step=100)
+
+    assert not (tmp_path / "best.pt").exists()
+    assert trainer._best_success == -math.inf
+
+
+def test_trainer_state_round_trips_through_resume(tmp_path: Path) -> None:
+    """next_ep_id and best_success survive a checkpoint save/restore cycle.
+
+    Ids must continue past what the first run already allocated -- restarting
+    at N would make SliceSampler treat old and new transitions (sharing an id)
+    as one trajectory and splice across the join.
+    """
+    N = 2
+    envs = _MockVectorEnv(num_envs=N, done_every=2)  # forces episode-id churn
+    agent = _MockAgent(num_envs=N)
+
+    cfg = _make_trainer_cfg(steps=20, checkpoint_every=20, checkpoint_dir=str(tmp_path))
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, eval_envs=None)
+    trainer._best_success = 0.75  # simulate an eval having already run
+    trainer.begin(agent)
+
+    ckpt = torch.load(tmp_path / "latest.pt", map_location="cpu", weights_only=False)
+    saved_next_id = ckpt["trainer"]["next_ep_id"]
+    assert saved_next_id > N  # episodes actually turned over during the run
+    assert ckpt["trainer"]["best_success"] == 0.75
+
+    # A fresh trainer (new process, in effect) resuming with that state must
+    # not reissue any id the first run already used.
+    resumed = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, eval_envs=None)
+    resumed.begin(agent, start_step=20, trainer_state=ckpt["trainer"])
+    assert resumed._next_ep_id >= saved_next_id
+    assert resumed._best_success == 0.75

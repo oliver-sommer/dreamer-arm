@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from tensordict import TensorDict
@@ -143,6 +144,32 @@ class ReplayBuffer:
         # Storage layout is (time, env); SliceSampler hands us indices in
         # (env_idx, time_idx) order, so swap.
         self._buffer[flat_index[1], flat_index[0]] = TensorDict(flat_state, batch_size=(n,))
+
+    # ------------------------------------------------------------------ persist
+
+    def save(self, path: str | Path) -> None:
+        """Write the buffer to ``path`` so a resumed run starts warm.
+
+        ``path`` is a *directory*: TorchRL writes the storage as memory-mapped
+        tensors plus sampler metadata, not a single file.
+
+        The whole allocation is written, not just the filled part --
+        ``LazyTensorStorage`` preallocates ``max_size`` slots for every key, so
+        the size on disk is set by ``max_size`` and the observation keys rather
+        than by how far the run has got.
+        """
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        self._buffer.dumps(path)
+
+    def load(self, path: str | Path) -> None:
+        """Restore a buffer written by :meth:`save`.
+
+        The buffer must be constructed with the same ``BufferConfig`` that wrote
+        it: TorchRL restores into the existing storage, so a changed ``max_size``
+        or observation shape will not line up.
+        """
+        self._buffer.loads(Path(path))
 
     # ---------------------------------------------------------------- introspect
 
