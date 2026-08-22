@@ -164,3 +164,46 @@ def test_validate_config_rejects(override: str, match: str) -> None:
 
 def test_validate_config_accepts_the_defaults() -> None:
     validate_config(_compose("training/dreamer", ["envs.task=MT10"]))
+
+
+# ---------------------------------------------------------------------------
+# pixi task environment
+# ---------------------------------------------------------------------------
+
+
+def test_inductor_cache_dir_is_absolute() -> None:
+    """TORCHINDUCTOR_CACHE_DIR must not be a relative path.
+
+    Inductor stores the value verbatim and later shells out to g++ with cwd set
+    to a scratch build dir (_inductor/cpp_builder.py builds with
+    ``run_compile_cmd(..., cwd=_build_tmp_dir)``).  A relative cache dir then
+    resolves against that scratch dir, and the compile fails with "No such file
+    or directory" naming its own generated .cpp.  torch's own default cache dir
+    is absolute for this reason.
+
+    Only CUDA hosts compile at all (``auto_compile`` is
+    ``torch.cuda.is_available()``), so a regression here is invisible on macOS
+    and only explodes on the training box -- worth pinning in config.
+    """
+    import re
+    import tomllib
+    from pathlib import Path
+
+    pixi_toml = Path(__file__).resolve().parents[2] / "pixi.toml"
+    config = tomllib.loads(pixi_toml.read_text())
+
+    found = 0
+    for name, task in config.get("tasks", {}).items():
+        if not isinstance(task, dict):
+            continue
+        value = task.get("env", {}).get("TORCHINDUCTOR_CACHE_DIR")
+        if value is None:
+            continue
+        found += 1
+        # Either a literal absolute path, or rooted at a pixi-expanded variable.
+        assert value.startswith("/") or re.match(r"^\$[A-Z_]*(ROOT|DIR)\b", value), (
+            f"task {name!r} sets a relative TORCHINDUCTOR_CACHE_DIR={value!r}; "
+            "inductor compiles from a different cwd and will not find it"
+        )
+
+    assert found, "no task sets TORCHINDUCTOR_CACHE_DIR — did the tasks get renamed?"

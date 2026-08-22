@@ -94,9 +94,15 @@ dev = { features = ["dev"], solve-group = "default" }
 #   pixi run training envs=metaworld    envs.task=door-open envs/arm=sawyer
 # TORCHINDUCTOR_CACHE_DIR persists torch.compile kernels across runs so only
 # the very first run pays the compilation cost (~30s); subsequent runs start fast.
+# It MUST be absolute.  Inductor stores the path verbatim, then runs g++ with
+# cwd set to a scratch dir (_inductor/cpp_builder.py: run_compile_cmd(...,
+# cwd=_build_tmp_dir)), so a relative path resolves against the wrong directory
+# and the compile dies with "No such file or directory" on its own source file.
+# torch's own default is absolute for exactly this reason.  Only CUDA compiles
+# (auto_compile = torch.cuda.is_available()), so this can only bite on Linux.
 # PYTHONFAULTHANDLER prints a Python-level stack if native code segfaults (a
 # 12h MT50 run died to a bare SIGSEGV with zero context otherwise).
-training = { cmd = "python -m dreamer_arm.training", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE", PYTHONFAULTHANDLER = "1" } }
+training = { cmd = "python -m dreamer_arm.training", env = { TORCHINDUCTOR_CACHE_DIR = "$PIXI_PROJECT_ROOT/.torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE", PYTHONFAULTHANDLER = "1" } }
 # Standalone evaluation of a saved checkpoint:
 #   pixi run inference checkpoint=logs/<date>/<time>/checkpoint.pt envs.task=MT10
 inference = { cmd = "python -m dreamer_arm.inference.evaluate", env = { KMP_DUPLICATE_LIB_OK = "TRUE" } }
@@ -104,4 +110,4 @@ inference = { cmd = "python -m dreamer_arm.inference.evaluate", env = { KMP_DUPL
 # Works with any task / benchmark — the viewer attaches to env 0.
 #   pixi run training-view envs.task=door-open          # single task
 #   pixi run training-view envs.task=MT10               # MT10, viewer on task 0
-training-view = { cmd = "mjpython -m dreamer_arm.training envs.viewer=true logging.wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = ".torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE" } }
+training-view = { cmd = "mjpython -m dreamer_arm.training envs.viewer=true logging.wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = "$PIXI_PROJECT_ROOT/.torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE" } }
