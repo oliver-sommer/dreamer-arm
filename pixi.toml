@@ -21,20 +21,21 @@ imageio = ">=2.37"
 imageio-ffmpeg = ">=0.6"
 wandb = ">=0.26"
 
-# cu126 is the primary index so Linux gets CUDA torch; macOS gets a 404 from
-# cu126 (no arm64 wheels) and falls back to PyPI for the MPS build.
-# first-index avoids querying cu126 for every package in parallel, which caused
-# EADDRNOTAVAIL connection errors on macOS with unsafe-best-match.
+# Plain PyPI for everything.  The CUDA build of torch is pinned per-platform
+# below, on the dependency itself, rather than by pointing this whole table at
+# download.pytorch.org: with index-strategy = "first-index" that global setting
+# silently never took effect -- every lock resolved torch from PyPI anyway (grep
+# the lock for download.pytorch.org: zero wheels).  Pinning the index on the one
+# package that needs it is both narrower and actually honoured.
 [pypi-options]
-index-url = "https://download.pytorch.org/whl/cu126"
-extra-index-urls = ["https://pypi.org/simple/"]
 index-strategy = "first-index"
 
 [pypi-dependencies]
 dreamer-arm = { path = ".", editable = true }
 hatchling = ">=1.31"
 omegaconf = ">=2.3"
-# torch installed via pip so we can target a CUDA 12.6 build on Linux.
+# torch comes from PyPI here, which is the MPS build on macOS.  Linux overrides
+# it below with a CUDA build; see [target.linux-64.pypi-dependencies].
 torch = ">=2.7,<2.8"
 torchrl = ">=0.12"
 tensordict = ">=0.12"
@@ -49,6 +50,14 @@ metaworld = { path = "thirdparty/metaworld", editable = true }
 
 
 
+# PyPI's linux torch is built against CUDA 12.6, whose kernels stop at sm_90.
+# The RTX 5070 Ti training box is Blackwell (sm_120), so that build imports
+# fine, sees the GPU, then dies on the first allocation with "no kernel image is
+# available for execution on the device".  CUDA 12.8 is the first toolkit with
+# sm_120, so Linux takes torch from the cu128 index explicitly.
+# Verify after install: torch.cuda.get_arch_list() must contain sm_120.
+[target.linux-64.pypi-dependencies]
+torch = { version = ">=2.7,<2.8", index = "https://download.pytorch.org/whl/cu128" }
 [feature.dev.pypi-dependencies]
 copier = ">=9.17"
 prek = ">=0.4.11"
