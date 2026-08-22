@@ -658,3 +658,101 @@ def test_trainer_state_round_trips_through_resume(tmp_path: Path) -> None:
     resumed.begin(agent, start_step=20, trainer_state=ckpt["trainer"])
     assert resumed._next_ep_id >= saved_next_id
     assert resumed._best_success == 0.75
+
+
+# ---------------------------------------------------------------------------
+# eval_at_start
+# ---------------------------------------------------------------------------
+
+
+def test_eval_at_start_runs_before_any_collection(monkeypatch: Any) -> None:
+    """With eval_at_start, the first eval must happen before any transition
+    is stored -- a baseline read on the policy exactly as begin() received it.
+    """
+    from dreamer_arm.inference.evaluate import EvalResult
+
+    call_order: list[str] = []
+
+    def fake_evaluate(agent: Any, envs: Any, episodes: int) -> Any:
+        call_order.append("eval")
+        return EvalResult(metrics={"eval/success_mean": 0.0}, video=None)
+
+    monkeypatch.setattr("dreamer_arm.training.trainer.evaluate", fake_evaluate)
+
+    class _TrackingBuffer(_MockBuffer):
+        def add_transition(self, data: TensorDict) -> None:
+            call_order.append("transition")
+            super().add_transition(data)
+
+    N = 2
+    envs = _MockVectorEnv(num_envs=N, done_every=99)
+    buffer = _TrackingBuffer()
+    agent = _MockAgent(num_envs=N)
+
+    cfg = _make_trainer_cfg(
+        steps=4 * N,
+        eval_episode_num=2,
+        eval_every=9999,  # would not otherwise fire within this short run
+        eval_at_start=True,
+    )
+    trainer = OnlineTrainer(cfg, buffer, _MockLogger(), envs, envs)
+    trainer.begin(agent)
+
+    assert call_order[0] == "eval", call_order
+    assert "transition" in call_order
+    assert call_order.index("eval") < call_order.index("transition")
+
+
+def test_eval_at_start_false_waits_for_normal_cadence(monkeypatch: Any) -> None:
+    from dreamer_arm.inference.evaluate import EvalResult
+
+    eval_calls = 0
+
+    def fake_evaluate(agent: Any, envs: Any, episodes: int) -> Any:
+        nonlocal eval_calls
+        eval_calls += 1
+        return EvalResult(metrics={"eval/success_mean": 0.0}, video=None)
+
+    monkeypatch.setattr("dreamer_arm.training.trainer.evaluate", fake_evaluate)
+
+    N = 2
+    envs = _MockVectorEnv(num_envs=N, done_every=99)
+    agent = _MockAgent(num_envs=N)
+    cfg = _make_trainer_cfg(
+        steps=4 * N,
+        eval_episode_num=2,
+        eval_every=9999,  # never crossed within this short run
+        eval_at_start=False,
+    )
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
+    trainer.begin(agent)
+
+    assert eval_calls == 0
+
+
+def test_eval_at_start_is_a_noop_when_eval_disabled(monkeypatch: Any) -> None:
+    """eval_at_start must respect the same gate as the periodic trigger."""
+    called = False
+
+    def fail_if_called(*args: Any, **kwargs: Any) -> Any:
+        nonlocal called
+        called = True
+        raise AssertionError("evaluate() should never be called")
+
+    monkeypatch.setattr("dreamer_arm.training.trainer.evaluate", fail_if_called)
+
+    N = 2
+    envs = _MockVectorEnv(num_envs=N, done_every=99)
+    agent = _MockAgent(num_envs=N)
+
+    # eval_episode_num=0 disables eval outright.
+    cfg = _make_trainer_cfg(steps=4 * N, eval_episode_num=0, eval_at_start=True)
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
+    trainer.begin(agent)
+    assert not called
+
+    # eval_envs=None disables eval outright, even with eval_episode_num > 0.
+    cfg2 = _make_trainer_cfg(steps=4 * N, eval_episode_num=2, eval_at_start=True)
+    trainer2 = OnlineTrainer(cfg2, _MockBuffer(), _MockLogger(), envs, eval_envs=None)
+    trainer2.begin(agent)
+    assert not called

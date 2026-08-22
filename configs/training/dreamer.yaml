@@ -52,6 +52,11 @@ trainer:
   # episode boundaries so training episodes are never truncated.
   eval_every: 25000
   eval_episode_num: ${envs.eval_episode_num}
+  # Run one eval pass before the first training step, so W&B gets a baseline
+  # (untrained on a fresh run, whatever `resume` restored on a resumed one)
+  # instead of waiting eval_every steps for the first data point.  A no-op
+  # when eval is disabled (eval_episode_num: 0).
+  eval_at_start: true
   # Agent checkpoint cadence (env steps).  Refreshes <logdir>/latest.pt
   # (~a few hundred MB: weights+optimiser), atomically replaced each time.
   checkpoint_every: 50000

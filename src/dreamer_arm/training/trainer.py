@@ -13,7 +13,11 @@ Design notes
 * Eval reuses the train envs (``eval_envs is train_envs``), so no extra EGL
   contexts are created.  Eval is triggered when the step counter crosses a
   multiple of ``eval_every``, then deferred until an env is at an episode
-  boundary (``is_first.any()``).  The rollout itself lives in
+  boundary (``is_first.any()``).  ``eval_at_start`` additionally seeds this
+  trigger before the loop's first iteration, so a run's first eval reads the
+  policy exactly as ``begin`` received it -- untrained on a fresh run,
+  whatever ``resume`` restored on a resumed one -- rather than waiting
+  ``eval_every`` steps for a baseline.  The rollout itself lives in
   :mod:`dreamer_arm.inference.evaluate`.
 * Episode ids are monotonically-increasing int32 counters shared across all
   envs; the SliceSampler uses them to avoid splicing across resets.  The counter
@@ -69,6 +73,7 @@ class TrainerConfig:
     checkpoint_dir: str  # directory holding latest.pt / best.pt / checkpoints/
     checkpoint_keep_every: int = 0  # also archive on this grid (0 = no archives)
     checkpoint_buffer: bool = False  # persist the replay buffer beside latest.pt
+    eval_at_start: bool = True  # run one eval pass before the first training step
     heartbeat_secs: float = 30.0  # console liveness line cadence (0 disables)
 
 
@@ -164,8 +169,13 @@ class OnlineTrainer:
         # Total (post-repeat) env steps taken
         env_step = start_step
 
-        # Eval scheduling
-        eval_pending = False
+        # Eval scheduling.  is_first is already all-True above, so seeding
+        # eval_pending here fires the deferred-eval check on the very first
+        # loop iteration, before any action is taken or transition stored --
+        # a baseline read on the (possibly untrained) policy.  Gated the same
+        # way as the periodic trigger below, so eval_at_start is a no-op
+        # when eval is disabled entirely rather than a surprise first pass.
+        eval_pending = bool(cfg.eval_at_start and cfg.eval_episode_num > 0 and self._eval_envs is not None)
         _last_eval_trigger = (start_step // cfg.eval_every) * cfg.eval_every
         # Checkpoint / log watermarks
         _last_ckpt = (start_step // cfg.checkpoint_every) * cfg.checkpoint_every
