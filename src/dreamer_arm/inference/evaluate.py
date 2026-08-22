@@ -20,6 +20,8 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
+from dreamer_arm.utils.logging import phase
+
 log = logging.getLogger(__name__)
 
 #: Fixed seed for evaluation resets, so eval is deterministic across checkpoints.
@@ -148,7 +150,8 @@ def _run(cfg: DictConfig) -> EvalResult:
         agent.load_checkpoint_state(ckpt["agent"])
         log.info("loaded %s (trained to step %d)", cfg.checkpoint, int(ckpt["step"]))
 
-        result = evaluate(agent, envs, int(cfg.eval.episodes))
+        with phase("eval"):
+            result = evaluate(agent, envs, int(cfg.eval.episodes))
     finally:
         envs.close()
 

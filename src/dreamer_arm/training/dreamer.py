@@ -83,6 +83,7 @@ def _run(cfg: DictConfig) -> None:
         update_log_every=int(cfg.trainer.update_log_every),
         checkpoint_every=int(cfg.trainer.checkpoint_every),
         checkpoint_path=str(Path(cfg.logdir) / "checkpoint.pt"),
+        heartbeat_secs=float(cfg.trainer.heartbeat_secs),
     )
 
     # Crash-resume: restore agent weights/optimiser and continue the step

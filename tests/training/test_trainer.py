@@ -420,3 +420,88 @@ def test_rollout_only_state_not_written_to_buffer() -> None:
     assert len(buffer._transitions) > 0
     for td in buffer._transitions:
         assert "context" not in td, "rollout-only state key leaked into the replay buffer"
+
+
+# ---------------------------------------------------------------------------
+# Progress heartbeat
+# ---------------------------------------------------------------------------
+
+
+class _FilledBuffer(_MockBuffer):
+    """Buffer that reports enough fill to leave prefill immediately."""
+
+    def __len__(self) -> int:
+        return 10_000
+
+
+def test_heartbeat_reports_prefill_progress(caplog: Any) -> None:
+    """While the buffer is below the training minimum, the heartbeat shows fill."""
+    N = 2
+    envs = _MockVectorEnv(num_envs=N, done_every=99)
+    agent = _MockAgent(num_envs=N)
+
+    # heartbeat_secs tiny → fires on every loop iteration.
+    cfg = _make_trainer_cfg(steps=4 * N, heartbeat_secs=1e-9)
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, eval_envs=None)
+    with caplog.at_level("INFO", logger="dreamer_arm.training.trainer"):
+        trainer.begin(agent)
+
+    assert any("prefill" in r.message and "transitions" in r.message for r in caplog.records), (
+        f"no prefill heartbeat in: {[r.message for r in caplog.records]}"
+    )
+
+
+def test_heartbeat_reports_update_pace(caplog: Any) -> None:
+    """Once training starts the heartbeat reports seconds-per-update, which is
+    the number that distinguishes a slow world model from a hang."""
+    N = 2
+    envs = _MockVectorEnv(num_envs=N, done_every=99)
+    agent = _MockAgent(num_envs=N)
+
+    cfg = _make_trainer_cfg(steps=4 * N, train_ratio=1.0, heartbeat_secs=1e-9)
+    trainer = OnlineTrainer(cfg, _FilledBuffer(), _MockLogger(), envs, eval_envs=None)
+    with caplog.at_level("INFO", logger="dreamer_arm.training.trainer"):
+        trainer.begin(agent)
+
+    assert any("s/update" in r.message for r in caplog.records), (
+        f"no update-pace heartbeat in: {[r.message for r in caplog.records]}"
+    )
+
+
+def test_heartbeat_disabled_by_zero(caplog: Any) -> None:
+    N = 2
+    envs = _MockVectorEnv(num_envs=N, done_every=99)
+    agent = _MockAgent(num_envs=N)
+
+    cfg = _make_trainer_cfg(steps=4 * N, train_ratio=1.0, heartbeat_secs=0.0)
+    trainer = OnlineTrainer(cfg, _FilledBuffer(), _MockLogger(), envs, eval_envs=None)
+    with caplog.at_level("INFO", logger="dreamer_arm.training.trainer"):
+        trainer.begin(agent)
+
+    # "working"/"s/update" and "N/M transitions" are heartbeat-only phrasings;
+    # the one-off "collecting ...-transition prefill" banner is not a heartbeat.
+    assert not any("working" in r.message or "s/update" in r.message for r in caplog.records)
+
+
+def test_pretrain_runs_once_after_prefill() -> None:
+    """`pretrain` warms the model on the collected prefill.
+
+    It used to run before any collection, where its own buffer-size guard was
+    always false -- so the knob silently did nothing.
+    """
+    N = 2
+    update_calls: list[int] = []
+
+    class _CountingAgent(_MockAgent):
+        def update(self, buffer: Any) -> dict[str, torch.Tensor]:
+            update_calls.append(1)
+            return {}
+
+    envs = _MockVectorEnv(num_envs=N, done_every=99)
+    agent = _CountingAgent(num_envs=N)
+
+    cfg = _make_trainer_cfg(steps=6 * N, train_ratio=0.0, pretrain=5)
+    trainer = OnlineTrainer(cfg, _FilledBuffer(), _MockLogger(), envs, eval_envs=None)
+    trainer.begin(agent)
+
+    assert len(update_calls) == 5, f"expected 5 pretrain updates, got {len(update_calls)}"

@@ -23,6 +23,7 @@ Design notes
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ import torch
 from tensordict import TensorDict
 
 from dreamer_arm.inference.evaluate import evaluate
+from dreamer_arm.utils.logging import phase, set_phase
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +43,7 @@ class TrainerConfig:
     """Hyperparameters for the online training loop."""
 
     steps: int  # total environment steps to train for
-    pretrain: int  # agent.update calls to run before collection
+    pretrain: int  # extra agent.update calls once the prefill is collected
     train_ratio: float  # update calls per env step (fractional)
     batch_size: int  # stored here for documentation / config round-trip
     batch_length: int  # stored here for documentation / config round-trip
@@ -51,6 +53,7 @@ class TrainerConfig:
     update_log_every: int  # write logger scalars every N env steps
     checkpoint_every: int  # save checkpoint every N env steps
     checkpoint_path: str  # path for the checkpoint file
+    heartbeat_secs: float = 30.0  # console liveness line cadence (0 disables)
 
 
 class OnlineTrainer:
@@ -78,6 +81,9 @@ class OnlineTrainer:
         self._train_envs = train_envs
         self._eval_envs = eval_envs
         self._N = train_envs.num_envs
+        self._hb_time = time.time()
+        self._hb_step = 0
+        self._hb_updates = 0
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -91,6 +97,7 @@ class OnlineTrainer:
                         ``update``, ``checkpoint_state``.
             start_step: Resume from this env-step count (crash recovery).
         """
+        set_phase("train")
         cfg = self._cfg
         N = self._N
         device = agent.device
@@ -133,21 +140,22 @@ class OnlineTrainer:
         _last_ckpt = (start_step // cfg.checkpoint_every) * cfg.checkpoint_every
         _last_log = (start_step // cfg.update_log_every) * cfg.update_log_every
 
-        # ---- pretrain ----
-        for _ in range(cfg.pretrain):
-            if len(self._buffer) >= prefill_min:
-                agent.update(self._buffer)
-
         # Liveness markers: collection runs fast, but once training updates
         # start fps drops sharply, so the first periodic step-line can be minutes
-        # away with nothing printed in between.
+        # away with nothing printed in between -- hence the time-based heartbeat.
         log.info(
-            "collecting %d-transition prefill, then training to %d env steps (step line every %d steps)",
+            "collecting %d-transition prefill, then training to %d env steps "
+            "(step line every %d steps, heartbeat every %.0fs)",
             prefill_min,
             cfg.steps,
             cfg.update_log_every,
+            cfg.heartbeat_secs,
         )
         _training_started = False
+        updates = 0
+        self._hb_time = time.time()
+        self._hb_step = env_step
+        self._hb_updates = 0
 
         # ====================================================================
         # Main loop
@@ -170,6 +178,10 @@ class OnlineTrainer:
                 # Bump episode ids for all envs after eval
                 episode_ids = np.arange(_next_ep_id, _next_ep_id + N, dtype=np.int32)
                 _next_ep_id += N
+                # The in-flight episodes were abandoned mid-way; carrying their
+                # partial totals over would inflate the next episode's score.
+                ep_return[:] = 0.0
+                ep_len[:] = 0
 
             # ---- act ----
             obs_torch: dict[str, torch.Tensor] = {k: torch.from_numpy(obs_np[k]).to(device) for k in obs_keys}
@@ -242,14 +254,23 @@ class OnlineTrainer:
                 if not _training_started:
                     log.info("prefill complete at step %d; training updates started", env_step)
                     _training_started = True
+                    # Warm the model on the prefill before collection continues
+                    # at the online train_ratio.
+                    for _ in range(cfg.pretrain):
+                        agent.update(self._buffer)
+                        updates += 1
+                        self._heartbeat(env_step, updates, prefill_min)
                 train_budget += cfg.train_ratio * N
                 while train_budget >= 1.0:
                     metrics = agent.update(self._buffer)
                     train_budget -= 1.0
+                    updates += 1
                     # Prefix the agent's "loss/*" keys with "train/"
                     for k, v in metrics.items():
                         key = f"train/{k}" if not k.startswith("train/") else k
                         self._logger.scalar(key, v)
+                    # Beat between updates too: one update can outlast the interval.
+                    self._heartbeat(env_step, updates, prefill_min)
 
             # ---- periodic logging ----
             if env_step - _last_log >= cfg.update_log_every:
@@ -270,10 +291,55 @@ class OnlineTrainer:
                 _last_ckpt = (env_step // cfg.checkpoint_every) * cfg.checkpoint_every
                 self._save_checkpoint(agent, env_step)
 
+            self._heartbeat(env_step, updates, prefill_min)
             self._logger.keepalive(env_step)
 
         # Final flush
         self._logger.write(env_step, fps=True)
+
+    # ------------------------------------------------------------------
+    # Progress heartbeat
+    # ------------------------------------------------------------------
+
+    def _heartbeat(self, env_step: int, updates: int, prefill_min: int) -> None:
+        """Print a console liveness line if ``heartbeat_secs`` has elapsed.
+
+        ``update_log_every`` is a *step* cadence, which says nothing about wall
+        time: one ``agent.update`` costs milliseconds for the RSSM but seconds
+        for DINO-WM on MPS, so a healthy run's first step-line can be 20+
+        minutes out.  Console-only -- it never calls ``logger.write``, so it
+        adds no W&B steps.
+        """
+        if self._cfg.heartbeat_secs <= 0:
+            return
+        now = time.time()
+        elapsed = now - self._hb_time
+        if elapsed < self._cfg.heartbeat_secs:
+            return
+
+        fill = len(self._buffer)
+        if fill < prefill_min:
+            log.info(
+                "prefill %d/%d transitions (%.0f%%)  step %d",
+                fill,
+                prefill_min,
+                100.0 * fill / prefill_min,
+                env_step,
+            )
+        else:
+            done = updates - self._hb_updates
+            # "0 updates" is itself the signal: one update outlasting the interval.
+            pace = f"{elapsed / done:.1f}s/update" if done else f"0 updates in {elapsed:.0f}s"
+            log.info(
+                "working  step %d  updates %d (%s)  %.1f env steps/s  buffer %d",
+                env_step,
+                updates,
+                pace,
+                (env_step - self._hb_step) / elapsed,
+                fill,
+            )
+
+        self._hb_time, self._hb_step, self._hb_updates = now, env_step, updates
 
     # ------------------------------------------------------------------
     # Eval
@@ -286,11 +352,12 @@ class OnlineTrainer:
         so the standalone eval entrypoint runs exactly the same code; this
         method only forwards the metrics to the logger.
         """
-        result = evaluate(agent, self._eval_envs, self._cfg.eval_episode_num)
-        if result.video is not None:
-            self._logger.video("eval/video", result.video)
-        self._logger.scalars(result.metrics)
-        self._logger.write(env_step, fps=False)
+        with phase("eval"):
+            result = evaluate(agent, self._eval_envs, self._cfg.eval_episode_num)
+            if result.video is not None:
+                self._logger.video("eval/video", result.video)
+            self._logger.scalars(result.metrics)
+            self._logger.write(env_step, fps=False)
 
     # ------------------------------------------------------------------
     # Checkpoint

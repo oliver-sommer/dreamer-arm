@@ -57,4 +57,8 @@ trainer:
   train_ratio: ${envs.train_ratio}
 
   update_log_every: 1000
+  # Wall-clock console liveness line (seconds; 0 disables).  `update_log_every`
+  # is a step cadence, so on a slow world model the first step-line can be 20+
+  # minutes out.
+  heartbeat_secs: 30.0
   action_repeat: ${envs.action_repeat}
