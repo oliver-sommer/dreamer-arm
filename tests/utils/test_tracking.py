@@ -104,3 +104,39 @@ def test_scalars_stacks_each_device_group_separately(monkeypatch: Any) -> None:
     assert all(len(devices) == 1 for devices in stack_call_devices), stack_call_devices
     assert logger._scalars["cpu_a"] == 1.0
     assert logger._scalars["cpu_b"] == 2.0
+
+
+def test_encode_video_returns_none_when_ffmpeg_missing(monkeypatch: Any) -> None:
+    """A missing ffmpeg binary must drop the video, not crash the whole run.
+
+    imageio.mimwrite raises RuntimeError("No ffmpeg exe could be found. ...")
+    when imageio-ffmpeg has no usable binary -- e.g. an out-of-sync pixi env on
+    a remote host.  Losing video logging for one run is fine; losing the run
+    over an incomplete environment is not.
+    """
+    import numpy as np
+
+    from dreamer_arm.utils import tracking
+
+    def raise_no_ffmpeg(*a: Any, **k: Any) -> None:
+        raise RuntimeError(
+            "No ffmpeg exe could be found. Install ffmpeg on your system, "
+            "or set the IMAGEIO_FFMPEG_EXE environment variable."
+        )
+
+    monkeypatch.setattr(tracking.imageio, "mimwrite", raise_no_ffmpeg)
+
+    logger = _make_logger()
+    frames = np.zeros((2, 3, 4, 4), dtype=np.uint8)  # (T, C, H, W)
+
+    assert logger._encode_video(frames) is None
+    assert logger._warned_no_ffmpeg is True
+
+
+def test_write_skips_video_payload_when_ffmpeg_missing(monkeypatch: Any) -> None:
+    logger = _make_logger()
+    monkeypatch.setattr(logger, "_encode_video", lambda arr: None)
+    logger.video("clip", torch.zeros(2, 3, 4, 4, dtype=torch.uint8))
+
+    # write() must not raise, and must simply omit the video from the payload.
+    logger.write(step=0)

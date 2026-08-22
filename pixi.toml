@@ -19,6 +19,13 @@ pyyaml = ">=6.0.3"
 pillow = ">=9.2,<12"
 imageio = ">=2.37"
 imageio-ffmpeg = ">=0.6"
+# imageio-ffmpeg's own conda-forge dependency on ffmpeg is unconstrained, which
+# let the linux-64 solve pick ffmpeg 2.8.6 (a 2016 build) instead of a current
+# one -- built against an old libx264 soname that the modern x264 package
+# installed alongside it doesn't provide, so the binary fails to even run
+# ("libx264.so.138: cannot open shared object file"). Pin a recent major
+# version explicitly so the solver can't pick a build that stale again.
+ffmpeg = ">=6"
 wandb = ">=0.26"
 
 # Plain PyPI for everything.  The CUDA build of torch is pinned per-platform

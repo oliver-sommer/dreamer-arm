@@ -114,6 +114,7 @@ class WandbLogger:
             reinit=True,
         )
         self._video_fps = video_fps
+        self._warned_no_ffmpeg = False
         self._scalars: dict[str, _Scalar] = {}
         self._videos: dict[str, np.ndarray] = {}
         self._images: dict[str, np.ndarray] = {}
@@ -200,7 +201,9 @@ class WandbLogger:
         if fps_value is not None:
             payload["fps/fps"] = fps_value
         for name, arr in self._videos.items():
-            payload[name] = self._encode_video(arr)
+            video = self._encode_video(arr)
+            if video is not None:
+                payload[name] = video
         for name, arr in self._images.items():
             payload[name] = wandb.Image(arr)
         for name, arr in self._histograms.items():
@@ -261,7 +264,7 @@ class WandbLogger:
         except (OSError, subprocess.TimeoutExpired) as exc:
             log.warning("wandb sync failed (will retry): %s", exc)
 
-    def _encode_video(self, arr: np.ndarray) -> wandb.Video:
+    def _encode_video(self, arr: np.ndarray) -> wandb.Video | None:
         """Encode (T, C, H, W) uint8 video via imageio-ffmpeg, then hand wandb a path.
 
         wandb.Video(numpy_array) calls ffmpeg as a subprocess in a way that can
@@ -272,12 +275,26 @@ class WandbLogger:
         The temp file is left on disk because wandb.Video stores the path and
         uploads the file asynchronously; deleting it before the upload would
         silently drop the video.  OS temp-dir cleanup handles the rest.
+
+        Returns ``None`` (dropping the video, logging a one-time warning) if no
+        ffmpeg binary is available -- e.g. imageio-ffmpeg's platform wheel failed
+        to ship one, or the pixi env is out of sync -- so a broken/incomplete
+        environment loses video logging instead of taking down the whole run.
         """
         # _as_uint8_video produces (T, C, H, W); imageio wants (T, H, W, C).
         frames = arr.transpose(0, 2, 3, 1)
         fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
         os.close(fd)
-        imageio.mimwrite(tmp_path, list(frames), fps=self._video_fps)
+        try:
+            imageio.mimwrite(tmp_path, list(frames), fps=self._video_fps)
+        except RuntimeError as exc:
+            if "ffmpeg" not in str(exc).lower():
+                raise
+            Path(tmp_path).unlink()
+            if not self._warned_no_ffmpeg:
+                log.warning("Skipping video logging: %s", exc)
+                self._warned_no_ffmpeg = True
+            return None
         return wandb.Video(tmp_path, format="mp4")
 
     def _console_line(self, step: int, fps_value: float | None) -> str:
