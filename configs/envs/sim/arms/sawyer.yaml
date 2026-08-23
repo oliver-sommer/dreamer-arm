@@ -1,0 +1,15 @@
+# @package envs.sim.arms
+# Sawyer arm — uses Meta-World's default mocap (kinematic) actuation.
+# IK parameters are listed here for schema uniformity but are not used
+# (SawyerArm is a no-op that leaves both hooks uninstalled).
+
+name: sawyer
+ee_step_m: 0.05
+damping: 0.10
+nullspace_gain: 1.0
+ori_gain: 1.0
+joint_margin: 0.05
+max_joint_step: 1.0
+max_lead_m: 0.25
+length_scale: 0.25
+settle_steps: 200

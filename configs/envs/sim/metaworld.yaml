@@ -1,0 +1,71 @@
+# @package envs.sim
+# Single-task Meta-World environment.
+#
+# Usage:
+#   pixi run training envs/sim=metaworld envs.sim.task=door-open
+#   pixi run training envs/sim=metaworld envs.sim.task=pick-place envs/sim/arms=sawyer
+
+defaults:
+  - arms: yam
+  - _self_
+
+name: metaworld
+# Specific task name (mandatory — must be a valid Meta-World env name).
+task: ???
+
+# Vectorised collection.
+env_num: 8
+seed: 0
+
+# Observation image size [height, width].
+size: [64, 64]
+
+# Hold each policy action for four 80 Hz controller steps: the policy observes
+# and acts at 20 Hz while IK and the MuJoCo position servos remain responsive.
+# Reward is summed over repeats.
+action_repeat: 4
+
+# Maximum agent steps per episode (Meta-World max_path_length=500 at frame_skip=5;
+# action_repeat=4 → 125 policy steps = 500 controller steps = 6.25 seconds).
+# Set at MW's horizon so our wrapper owns the truncation boundary.
+time_limit: 125
+
+# Total post-repeat env steps to train for.
+steps: 1000000
+
+# Agent update calls per env step.
+train_ratio: 0.5
+
+# Eval episodes per eval pass (one full set covers all task variants).
+eval_episode_num: 10
+
+# Scene camera (see yam_xyz_base.xml for available names).
+camera: corner
+# Wrist camera (null to disable; set to "wrist" to enable the palm-facing cam).
+wrist_camera: null
+
+# Domain randomisation (all false = deterministic training, faster iteration).
+scene_randomize: false
+camera_pose_randomize: false
+camera_jitter: 0.0
+# Barrel distortion coefficient for wrist fisheye; 0.0 = no distortion.
+wrist_fisheye: 0.0
+
+# Reward shaping penalties (0.0 = disabled; useful for sim-to-real transfer).
+action_rate_cost: 0.0
+action_mag_cost: 0.0
+
+# Fraction of `info["success"]` required to count a step as a success.
+success_threshold: 1.0
+
+# Open a live MuJoCo viewer on env 0 (mjpython only; set via CLI, not here).
+viewer: false
+
+# Keys fed to the encoder / decoder (regex patterns matched by the agent).
+encoder:
+  mlp_keys: "proprio"
+  cnn_keys: "scene"
+
+decoder:
+  mlp_keys: "proprio"
+  cnn_keys: "scene"

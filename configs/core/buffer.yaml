@@ -7,9 +7,9 @@
 # `max_size` targets a fixed ~6.1 GB of stored uint8 RGB frames regardless of
 # render resolution -- 500,000 slots at the RSSM default's 64x64x3, 125,000 at
 # DINO-WM's 128x128x3 (4x the bytes/frame). No per-world-model buffer variant
-# needed as a result: `core/model=dinowm` alone (which also bumps `envs.size`)
+# needed as a result: `core/model=dinowm` alone (which also bumps `envs.sim.size`)
 # is enough, matching `core/model=dreamerv3` already being enough for RSSM.
-max_size: ${buffer_max_size:${envs.size},6144000000}
+max_size: ${buffer_max_size:${envs.sim.size},6144000000}
 batch_size: ${batch_size}
 batch_length: ${batch_length}
 

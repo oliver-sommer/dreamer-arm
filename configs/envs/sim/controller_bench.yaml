@@ -1,0 +1,61 @@
+# @package _global_
+# Standalone Cartesian-controller bench — no training, no checkpoint,
+# no rendering.  Builds a single raw (unwrapped) YAM-armed Meta-World env and
+# rolls the DLS-IK controller under different action-selection regimes,
+# printing the tracking metrics YamArm already exposes.
+# Exists so the controller's real authority can be measured in seconds,
+# instead of only by watching episode/ctrl_* metrics minutes into training.
+#
+#   pixi run controller-bench                           # probe, task=reach
+#   pixi run controller-bench mode=iid envs.sim.task=door-open # frac_stuck under
+#                                                         # policy-like actions
+#   pixi run controller-bench mode=servo servo_joint=0
+#   pixi run controller-bench mode=coverage
+#   pixi run controller-bench sweep=true mode=iid        # grid over IK knobs
+#   pixi run controller-bench envs.sim.arms.damping=0.3       # override any knob
+
+defaults:
+  - /envs/sim/arms: yam
+  - /utils/logging: default
+  - _self_
+
+entrypoint:
+  _target_: dreamer_arm.envs.sim.controller_bench._run
+
+seed: 0
+
+# validate_config only checks these three when cfg.envs.sim exists (it does, via
+# /envs/sim/arms above); this diagnostic builds one raw env directly rather than
+# through envs/sim/factory.py, so they're unused beyond satisfying that check.
+envs:
+  sim:
+    env_num: 1
+    action_repeat: 4
+    time_limit: 125
+    task: reach
+
+logdir: logs/controller/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+logging:
+  wandb:
+    mode: disabled
+
+# probe | iid | servo | coverage
+mode: probe
+
+horizon: 60 # control steps per probe direction / iid decision count
+n_dirs: 6 # random unit directions sampled in addition to +-x/y/z (probe)
+n_episodes: 8 # iid episodes
+action_std: 0.83 # iid Gaussian action std (matches observed train/action_std)
+
+servo_joint: 0 # which arm joint (0-5) to hold in `mode=servo`
+servo_target_rad: 0.5 # offset from the current angle to command
+
+coverage_tasks: # tasks probed in `mode=coverage`
+  - reach
+  - push
+  - pick-place
+  - door-open
+  - drawer-open
+
+sweep: false # grid over IK knobs instead of the single envs.sim.arms config

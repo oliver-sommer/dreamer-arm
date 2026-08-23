@@ -130,14 +130,14 @@ def _run(cfg: DictConfig) -> EvalResult:
     training loop logs under ``eval/``.
     """
     from dreamer_arm.core.model import Dreamer
-    from dreamer_arm.envs.factory import build_from_config
+    from dreamer_arm.envs.sim.factory import build_from_config
     from dreamer_arm.utils.seed import set_seed_everywhere
 
     if cfg.checkpoint is None:
         raise ValueError("inference requires a checkpoint: pass checkpoint=<path/to/best.pt>")
 
     set_seed_everywhere(int(cfg.seed))
-    envs = build_from_config(cfg, viewer=bool(cfg.envs.get("viewer", False)))
+    envs = build_from_config(cfg, viewer=bool(cfg.envs.sim.get("viewer", False)))
     try:
         agent = Dreamer(cfg.core.model, envs.observation_space, envs.action_space).to(cfg.device)
         ckpt = torch.load(str(cfg.checkpoint), map_location=cfg.device, weights_only=False)

@@ -16,7 +16,7 @@ authors = [{ name = "Oliver Sommer" }]
 [project.scripts]
 dreamer-arm-train = "dreamer_arm.training.__main__:run"
 dreamer-arm-eval = "dreamer_arm.inference.evaluate:run"
-dreamer-arm-controller-bench = "dreamer_arm.controller.bench:run"
+dreamer-arm-controller-bench = "dreamer_arm.envs.sim.controller_bench:run"
 
 [build-system]
 requires = ["hatchling"]

@@ -4,22 +4,23 @@
 # no stochastic latent, no KL -- the patch tokens *are* the world-model state.
 #
 # `@package _global_`, not `core.model` like the other core/model variants:
-# this file also has to set `envs.size`, since the ViT-S/16 backbone's
+# this file also has to set `envs.sim.size`, since the ViT-S/16 backbone's
 # 8x8=64 patch grid is fixed at construction time and must match whatever
 # resolution the env renders at. That makes `core/model=dinowm` alone
 # sufficient -- consistently with `core/model=dreamerv3`/`r2dreamer` alone
 # being sufficient for the RSSM variants -- with no separate
 # `training=dreamer-dinowm`-style recipe and no separate `core/buffer=dinowm`
 # needed either (core/buffer/default.yaml's `max_size` is computed from
-# `envs.size`, so it follows this file's override automatically):
-#   pixi run training core/model=dinowm envs.task=door-open
+# `envs.sim.size`, so it follows this file's override automatically):
+#   pixi run training core/model=dinowm envs.sim.task=door-open
 
 defaults:
   - _base
   - _self_
 
 envs:
-  size: [128, 128]
+  sim:
+    size: [128, 128]
 
 core:
   model:
@@ -51,8 +52,8 @@ core:
       # How the actor/critic pool the last frame's (P, tok) tokens into a
       # vector: "mean" (cheap, discards spatial detail) or "flatten" (tok * P wide).
       feat_pool: mean
-      cnn_keys: ${envs.encoder.cnn_keys}
-      mlp_keys: ${envs.encoder.mlp_keys}
+      cnn_keys: ${envs.sim.encoder.cnn_keys}
+      mlp_keys: ${envs.sim.encoder.mlp_keys}
       encoder:
         name: "vit_small_patch16_dinov3.lvd1689m"
         pretrained: true

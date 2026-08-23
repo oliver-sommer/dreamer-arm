@@ -97,7 +97,8 @@ lint = "ruff check src tests"
 format = "ruff format src tests"
 format-check = "ruff format --check src tests"
 # torch and MuJoCo each ship an OpenMP runtime; without this the loader aborts
-# (SIGABRT) the moment both are imported.  MUJOCO_GL is handled in envs/__init__.py.
+# (SIGABRT) the moment both are imported. MUJOCO_GL is handled in the top-level
+# dreamer_arm/__init__.py before either dependency can load.
 test = { cmd = "pytest", env = { KMP_DUPLICATE_LIB_OK = "TRUE" } }
 hooks = "prek install"
 # One command for everything CI runs.
@@ -111,10 +112,10 @@ dev = { features = ["dev"], solve-group = "default" }
 
 [tasks]
 # Training. The env group + task are specified via Hydra overrides, e.g.:
-#   pixi run training envs=metaworld-mt envs.task=MT10            # generalist (default group)
-#   pixi run training envs=metaworld-mt envs.task=MT50 envs.env_num=50
-#   pixi run training envs=metaworld    envs.task=door-open            # single task
-#   pixi run training envs=metaworld    envs.task=door-open envs/arm=sawyer
+#   pixi run training envs/sim=metaworld-mt envs.sim.task=MT10            # generalist (default group)
+#   pixi run training envs/sim=metaworld-mt envs.sim.task=MT50 envs.sim.env_num=50
+#   pixi run training envs/sim=metaworld    envs.sim.task=door-open            # single task
+#   pixi run training envs/sim=metaworld    envs.sim.task=door-open envs/sim/arms=sawyer
 # TORCHINDUCTOR_CACHE_DIR persists torch.compile kernels across runs so only
 # the very first run pays the compilation cost (~30s); subsequent runs start fast.
 # It MUST be absolute.  Inductor stores the path verbatim, then runs g++ with
@@ -127,15 +128,15 @@ dev = { features = ["dev"], solve-group = "default" }
 # 12h MT50 run died to a bare SIGSEGV with zero context otherwise).
 training = { cmd = "python -m dreamer_arm.training", env = { TORCHINDUCTOR_CACHE_DIR = "$PIXI_PROJECT_ROOT/.torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE", PYTHONFAULTHANDLER = "1" } }
 # Standalone evaluation of a saved checkpoint:
-#   pixi run inference checkpoint=logs/<date>/<time>/checkpoint.pt envs.task=MT10
+#   pixi run inference checkpoint=logs/<date>/<time>/checkpoint.pt envs.sim.task=MT10
 inference = { cmd = "python -m dreamer_arm.inference.evaluate", env = { KMP_DUPLICATE_LIB_OK = "TRUE" } }
 # Live MuJoCo viewer window (macOS + mjpython only).
 # Works with any task / benchmark — the viewer attaches to env 0.
-#   pixi run training-view envs.task=door-open          # single task
-#   pixi run training-view envs.task=MT10               # MT10, viewer on task 0
-training-view = { cmd = "mjpython -m dreamer_arm.training envs.viewer=true logging.wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = "$PIXI_PROJECT_ROOT/.torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE" } }
+#   pixi run training-view envs.sim.task=door-open          # single task
+#   pixi run training-view envs.sim.task=MT10               # MT10, viewer on task 0
+training-view = { cmd = "mjpython -m dreamer_arm.training envs.sim.viewer=true logging.wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = "$PIXI_PROJECT_ROOT/.torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE" } }
 # Cartesian-controller bench — no training, checkpoint, or rendering:
 #   pixi run controller-bench
-#   pixi run controller-bench mode=iid envs.task=door-open
+#   pixi run controller-bench mode=iid envs.sim.task=door-open
 #   pixi run controller-bench sweep=true mode=iid
-controller-bench = { cmd = "python -m dreamer_arm.controller.bench", env = { KMP_DUPLICATE_LIB_OK = "TRUE" } }
+controller-bench = { cmd = "python -m dreamer_arm.envs.sim.controller_bench", env = { KMP_DUPLICATE_LIB_OK = "TRUE" } }

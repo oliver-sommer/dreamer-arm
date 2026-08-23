@@ -70,8 +70,8 @@ rssm:
 
 # Multi-modal encoder.
 encoder:
-  mlp_keys: ${envs.encoder.mlp_keys}
-  cnn_keys: ${envs.encoder.cnn_keys}
+  mlp_keys: ${envs.sim.encoder.mlp_keys}
+  cnn_keys: ${envs.sim.encoder.cnn_keys}
   mlp:
     shape: null
     layers: 3

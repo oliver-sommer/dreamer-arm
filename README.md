@@ -25,17 +25,17 @@ pixi install
 pixi run training
 
 # larger multi-task benchmark, one env per task
-pixi run training envs.task=MT50 envs.env_num=50
+pixi run training envs.sim.task=MT50 envs.sim.env_num=50
 
 # single task, and with the Sawyer arm instead of YAM
-pixi run training envs=metaworld envs.task=door-open
-pixi run training envs=metaworld envs.task=door-open envs/arm=sawyer
+pixi run training envs/sim=metaworld envs.sim.task=door-open
+pixi run training envs/sim=metaworld envs.sim.task=door-open envs/sim/arms=sawyer
 
 # DreamerV3 baseline
 pixi run training core/model=dreamerv3
 
 # evaluate a saved checkpoint
-pixi run inference checkpoint=logs/<date>/<time>/best.pt envs.task=MT10
+pixi run inference checkpoint=logs/<date>/<time>/best.pt envs.sim.task=MT10
 
 # inspect Cartesian-controller tracking without launching training
 pixi run controller-bench
@@ -49,25 +49,29 @@ on hosts with unreliable egress.
 
 ## Project layout
 
-`configs/` and `tests/` mirror the package layout, so a config group, its code
-and its tests always sit at the same path.
+`configs/` and `tests/` mirror the package layout. Hydra config groups that
+configure a module use that module's path (for example, `envs/sim/arms`), and
+entrypoint configs sit beside the subsystem they launch.
 
 ```
 src/dreamer_arm/
   core/               model + algorithm: agent, world models, networks, losses, buffer, optim
-  controller/         Cartesian IK, runtime metrics, and controller bench
-  envs/               MuJoCo / Meta-World envs, arm plugins, rendering, wrappers
+  envs/               shared wrappers plus interchangeable environment backends
+    control/           backend-independent Cartesian IK and controller metrics
+    sim/               MuJoCo / Meta-World envs, arm adapters, rendering, and controller bench
+    hardware/          reserved for physical-robot integration
   training/           online loop, checkpoint persistence, and composition root
   inference/          checkpoint evaluation (also used by the in-loop eval)
   utils/              config dispatch, console logging, W&B tracking, video, seeding
-configs/              controller/  core/{model,buffer}/  envs/{,arm/}  training/  inference/  utils/logging/
+configs/              core/{model/,buffer.yaml}  envs/sim/{arms/,metaworld*.yaml,controller_bench.yaml}
+                      training/  inference/  utils/logging/
 tests/                mirrors src/dreamer_arm/ (no GPU required)
 thirdparty/metaworld/ YAMetaworld submodule: YAM MJCF, meshes and task suite
 logs/<date>/<time>/    latest.pt, best.pt, checkpoints/, videos/, config.yaml
 ```
 
 Each command is one config: `configs/training/dreamer.yaml`,
-`configs/inference/evaluate.yaml`, and `configs/controller/bench.yaml`
+`configs/inference/evaluate.yaml`, and `configs/envs/sim/controller_bench.yaml`
 name their own `entrypoint._target_`, which `dreamer_arm.utils.config.dispatch`
 calls after validating the config. Adding a command means adding a config plus
 the module it points at.
@@ -75,7 +79,7 @@ the module it points at.
 ```bash
 python -m dreamer_arm.training                # = pixi run training
 python -m dreamer_arm.inference.evaluate      # = pixi run inference
-python -m dreamer_arm.controller.bench       # = pixi run controller-bench
+python -m dreamer_arm.envs.sim.controller_bench  # = pixi run controller-bench
 ```
 
 ## Development

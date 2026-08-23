@@ -92,14 +92,15 @@ def validate_config(cfg: DictConfig) -> None:
     if int(cfg.seed) < 0:
         raise ValueError("seed must be non-negative")
 
-    envs = cfg.get("envs")
+    envs_root = cfg.get("envs")
+    envs = envs_root.get("sim") if envs_root is not None else None
     if envs is not None:
         if int(envs.env_num) <= 0:
-            raise ValueError("envs.env_num must be positive")
+            raise ValueError("envs.sim.env_num must be positive")
         if int(envs.action_repeat) <= 0:
-            raise ValueError("envs.action_repeat must be positive")
+            raise ValueError("envs.sim.action_repeat must be positive")
         if int(envs.time_limit) <= 0:
-            raise ValueError("envs.time_limit must be positive")
+            raise ValueError("envs.sim.time_limit must be positive")
 
     core = cfg.get("core")
     model = core.get("model") if core is not None else None
@@ -113,7 +114,7 @@ def validate_config(cfg: DictConfig) -> None:
         if wm in ("dinowm", "dreamer4") and size is not None:
             size = [int(x) for x in size]
             if any(s % 16 != 0 for s in size):
-                raise ValueError(f"core.model.wm={wm!r} needs envs.size divisible by 16 (patch size), got {size}")
+                raise ValueError(f"core.model.wm={wm!r} needs envs.sim.size divisible by 16 (patch size), got {size}")
 
     buffer = core.get("buffer") if core is not None else None
     if buffer is not None:
@@ -125,7 +126,7 @@ def validate_config(cfg: DictConfig) -> None:
         if needed and int(buffer.max_size) < needed:
             raise ValueError(
                 f"buffer.max_size ({buffer.max_size}) is below the minimum fill "
-                f"envs.env_num * (buffer.batch_length + 1) = {needed}; "
+                f"envs.sim.env_num * (buffer.batch_length + 1) = {needed}; "
                 "training would never start"
             )
 

@@ -1,0 +1,36 @@
+# @package envs.sim
+# Multi-task Meta-World (MT10 / MT25 / MT50).
+#
+# Usage:
+#   pixi run training                                         # default: MT10, 10 envs
+#   pixi run training envs.sim.task=MT25 envs.sim.env_num=25
+#   pixi run training envs.sim.task=MT50 envs.sim.env_num=50
+#
+# Constraint: env_num must be divisible by task_count (10 / 25 / 50).
+# Each env is pinned to one task type and emits a one-hot task_id observation.
+
+defaults:
+  - metaworld
+  - _self_
+
+# Default multi-task benchmark.
+task: MT10
+
+# One env per task (MT10 → 10 envs, MT25 → 25, MT50 → 50).
+env_num: 10
+
+# Longer runs for the harder multi-task problem.
+steps: 5000000
+train_ratio: 1.0
+
+# Evaluate one episode per env slot (= one episode per task for MT10).
+eval_episode_num: 10
+
+# Include task_id one-hot in encoder / decoder.
+encoder:
+  mlp_keys: "proprio|task_id"
+  cnn_keys: "scene"
+
+decoder:
+  mlp_keys: "proprio|task_id"
+  cnn_keys: "scene"

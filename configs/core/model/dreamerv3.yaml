@@ -9,8 +9,8 @@ defaults:
 rep_loss: "dreamerv3"
 
 decoder:
-  mlp_keys: ${envs.decoder.mlp_keys}
-  cnn_keys: ${envs.decoder.cnn_keys}
+  mlp_keys: ${envs.sim.decoder.mlp_keys}
+  cnn_keys: ${envs.sim.decoder.cnn_keys}
   mlp_dist:
     name: "symlog_mse"
   cnn_dist:

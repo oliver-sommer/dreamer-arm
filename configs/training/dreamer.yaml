@@ -2,20 +2,20 @@
 # Online Dreamer training.
 #
 # `pixi run training` with no overrides trains MT10 (the metaworld-mt default).
-# The single-task group leaves envs.task mandatory, so `envs=metaworld` must be
+# The single-task group leaves envs.sim.task mandatory, so `envs/sim=metaworld` must be
 # paired with an explicit task.  Override from the CLI:
-#   pixi run training envs=metaworld-mt envs.task=MT10                   # generalist (default)
-#   pixi run training envs=metaworld-mt envs.task=MT50 envs.env_num=50
-#   pixi run training envs=metaworld    envs.task=door-open              # single task
-#   pixi run training envs=metaworld    envs.task=door-open envs/arm=sawyer
+#   pixi run training envs/sim=metaworld-mt envs.sim.task=MT10                   # generalist (default)
+#   pixi run training envs/sim=metaworld-mt envs.sim.task=MT50 envs.sim.env_num=50
+#   pixi run training envs/sim=metaworld    envs.sim.task=door-open              # single task
+#   pixi run training envs/sim=metaworld    envs.sim.task=door-open envs/sim/arms=sawyer
 #   pixi run training core/model=dreamerv3                               # swap world model (RSSM variant)
-#   pixi run training core/model=dinowm envs.task=door-open              # swap world model (DINO-WM)
+#   pixi run training core/model=dinowm envs.sim.task=door-open              # swap world model (DINO-WM)
 
 defaults:
   - /core/buffer
-  - /envs: metaworld-mt
-  # Listed after /envs: dinowm.yaml's `@package _global_` override of
-  # `envs.size` (needed so the ViT backbone's patch grid matches the
+  - /envs/sim: metaworld-mt
+  # Listed after /envs/sim: dinowm.yaml's `@package _global_` override of
+  # `envs.sim.size` (needed so the ViT backbone's patch grid matches the
   # rendered resolution) must be applied after /envs's own default, or the
   # later group would clobber it back to 64x64.
   - /core/model: r2dreamer
@@ -36,22 +36,22 @@ logdir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
 # latest.pt also restores the replay buffer from the latest_buffer/ dir beside
 # it; best.pt and the archives under checkpoints/ carry no buffer, so those
 # resume onto an empty one.
-#   pixi run training envs.task=MT50 envs.env_num=50 resume=logs/<date>/<time>/latest.pt
+#   pixi run training envs.sim.task=MT50 envs.sim.env_num=50 resume=logs/<date>/<time>/latest.pt
 resume: null
 
 batch_size: 16
 batch_length: 64
 
 trainer:
-  steps: ${envs.steps}
+  steps: ${envs.sim.steps}
   pretrain: 0
   # Eval is expensive with shared train/eval envs: each eval steps the envs
-  # for a full episode (time_limit/action_repeat × env_num global steps —
-  # 25000 for MT50), so eval_every must be several times that or most env
+  # for a full episode (time_limit × env_num global policy steps — 6250 for
+  # MT50), so eval_every must be several times that or most env
   # compute goes to eval.  The trainer additionally defers shared-env eval to
   # episode boundaries so training episodes are never truncated.
   eval_every: 25000
-  eval_episode_num: ${envs.eval_episode_num}
+  eval_episode_num: ${envs.sim.eval_episode_num}
   # Run one eval pass before the first training step, so W&B gets a baseline
   # (untrained on a fresh run, whatever `resume` restored on a resumed one)
   # instead of waiting eval_every steps for the first data point.  A no-op
@@ -73,11 +73,11 @@ trainer:
   checkpoint_buffer: true
   batch_size: ${batch_size}
   batch_length: ${batch_length}
-  train_ratio: ${envs.train_ratio}
+  train_ratio: ${envs.sim.train_ratio}
 
   update_log_every: 1000
   # Wall-clock console liveness line (seconds; 0 disables).  `update_log_every`
   # is a step cadence, so on a slow world model the first step-line can be 20+
   # minutes out.
   heartbeat_secs: 30.0
-  action_repeat: ${envs.action_repeat}
+  action_repeat: ${envs.sim.action_repeat}

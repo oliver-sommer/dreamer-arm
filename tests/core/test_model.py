@@ -85,7 +85,13 @@ def _run_smoke(agent: Dreamer, batch_length: int) -> None:
 def test_rssm_agent_acts_and_updates() -> None:
     cfg = _compose(
         "training/dreamer",
-        ["envs=metaworld", "envs.task=door-open", "envs.size=[32,32]", "device=cpu", "core.model.compile=false"],
+        [
+            "envs/sim=metaworld",
+            "envs.sim.task=door-open",
+            "envs.sim.size=[32,32]",
+            "device=cpu",
+            "core.model.compile=false",
+        ],
     )
     agent = Dreamer(cfg.core.model, _obs_space(), _act_space())
     assert agent.replay_cache_keys == ("stoch", "deter")
@@ -97,9 +103,9 @@ def test_dinowm_agent_acts_and_updates() -> None:
         "training/dreamer",
         [
             "core/model=dinowm",
-            "envs=metaworld",
-            "envs.task=door-open",
-            "envs.size=[32,32]",
+            "envs/sim=metaworld",
+            "envs.sim.task=door-open",
+            "envs.sim.size=[32,32]",
             "core.model.dinowm.encoder.pretrained=false",
             "core.model.dinowm.encoder.image_size=32",
             "core.model.dinowm.context=3",
@@ -122,7 +128,13 @@ def test_to_and_checkpoint_round_trip_preserve_frozen_views() -> None:
     """`.to()` and checkpoint load must rebuild frozen views from the moved/loaded weights."""
     cfg = _compose(
         "training/dreamer",
-        ["envs=metaworld", "envs.task=door-open", "envs.size=[32,32]", "device=cpu", "core.model.compile=false"],
+        [
+            "envs/sim=metaworld",
+            "envs.sim.task=door-open",
+            "envs.sim.size=[32,32]",
+            "device=cpu",
+            "core.model.compile=false",
+        ],
     )
     agent = Dreamer(cfg.core.model, _obs_space(), _act_space())
     agent.to("cpu")  # no-op device move, but exercises refresh_frozen()

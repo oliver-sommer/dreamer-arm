@@ -1,16 +1,16 @@
 # @package _global_
 # Standalone evaluation of a saved checkpoint.
 #
-#   pixi run inference checkpoint=logs/<date>/<time>/best.pt envs.task=MT10
-#   pixi run inference checkpoint=<path> envs=metaworld envs.task=door-open
-#   pixi run inference checkpoint=<path> core/model=dinowm envs.task=door-open  # DINO-WM checkpoint
+#   pixi run inference checkpoint=logs/<date>/<time>/best.pt envs.sim.task=MT10
+#   pixi run inference checkpoint=<path> envs/sim=metaworld envs.sim.task=door-open
+#   pixi run inference checkpoint=<path> core/model=dinowm envs.sim.task=door-open  # DINO-WM checkpoint
 #
 # Model and env groups must match those the checkpoint was trained with,
 # otherwise the weights will not load into the constructed agent.
 
 defaults:
-  - /envs: metaworld-mt
-  # Listed after /envs -- see the matching comment in training/dreamer.yaml.
+  - /envs/sim: metaworld-mt
+  # Listed after /envs/sim -- see the matching comment in training/dreamer.yaml.
   - /core/model: r2dreamer
   - /utils/logging: default
   - _self_
@@ -29,7 +29,7 @@ logdir: logs/eval/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 eval:
   # Minimum episodes to complete; rounded up to whole rounds across env_num.
-  episodes: ${envs.eval_episode_num}
+  episodes: ${envs.sim.eval_episode_num}
 
 logging:
   wandb:
