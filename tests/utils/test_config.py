@@ -193,8 +193,8 @@ def test_bare_train_defaults_to_mt10() -> None:
 
 def test_default_policy_rate_preserves_metaworld_horizon() -> None:
     cfg = _compose("training/dreamer", [])
-    assert cfg.envs.sim.action_repeat == 4  # 80 Hz controller / 4 = 20 Hz policy
-    assert cfg.envs.sim.time_limit == 125
+    assert cfg.envs.sim.action_repeat == 1
+    assert cfg.envs.sim.time_limit == 500
     assert cfg.envs.sim.action_repeat * cfg.envs.sim.time_limit == 500
 
 

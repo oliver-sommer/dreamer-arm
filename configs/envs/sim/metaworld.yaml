@@ -20,15 +20,14 @@ seed: 0
 # Observation image size [height, width].
 size: [64, 64]
 
-# Hold each policy action for four 80 Hz controller steps: the policy observes
-# and acts at 20 Hz while IK and the MuJoCo position servos remain responsive.
-# Reward is summed over repeats.
-action_repeat: 4
+# Do not repeat Cartesian delta actions.  YamArm integrates every received
+# delta into its TCP setpoint, so repeating one policy action would multiply
+# the requested displacement and rapidly saturate the setpoint leash.
+action_repeat: 1
 
-# Maximum agent steps per episode (Meta-World max_path_length=500 at frame_skip=5;
-# action_repeat=4 → 125 policy steps = 500 controller steps = 6.25 seconds).
-# Set at MW's horizon so our wrapper owns the truncation boundary.
-time_limit: 125
+# Maximum agent steps per episode.  With action_repeat=1 this preserves
+# Meta-World's 500-controller-step, 6.25-second physical horizon.
+time_limit: 500
 
 # Total post-repeat env steps to train for.
 steps: 1000000

@@ -11,7 +11,6 @@
 #                                                         # policy-like actions
 #   pixi run controller-bench mode=servo servo_joint=0
 #   pixi run controller-bench mode=coverage
-#   pixi run push-demo                              # live smooth push (macOS)
 #   pixi run controller-bench sweep=true mode=iid        # grid over IK knobs
 #   pixi run controller-bench envs.sim.arms.damping=0.3       # override any knob
 
@@ -31,8 +30,8 @@ seed: 0
 envs:
   sim:
     env_num: 1
-    action_repeat: 4
-    time_limit: 125
+    action_repeat: 1
+    time_limit: 500
     task: reach
 
 logdir: logs/controller/${now:%Y-%m-%d}/${now:%H-%M-%S}
@@ -44,8 +43,8 @@ logging:
 # probe | iid | servo | coverage | push
 mode: probe
 
-# Native passive viewer for mode=push. On macOS this requires mjpython; use
-# `pixi run push-demo`, which supplies both mjpython and the push overrides.
+# Native passive viewer for mode=push. On macOS this requires launching the
+# controller-bench module with mjpython.
 viewer: false
 
 horizon: 60 # control steps per probe direction / iid decision count
