@@ -106,6 +106,9 @@ class TwoHot:
         self.probs = F.softmax(self.logits, dim=-1)
         self.squash = squash if squash is not None else _identity
         self.unsquash = unsquash if unsquash is not None else _identity
+        # log_prob() is called twice per instance on the value-loss path
+        # (actor_critic.py); build the constant once instead of per call.
+        self._one = torch.ones((), device=self.logits.device, dtype=torch.float32)
 
     def mode(self) -> torch.Tensor:
         n = self.logits.shape[-1]
@@ -130,9 +133,8 @@ class TwoHot:
         below = below.clamp(0, self.bins.shape[-1] - 1)
         above = above.clamp(0, self.bins.shape[-1] - 1)
         equal = below == above
-        one = torch.tensor(1.0, device=target.device, dtype=torch.float32)
-        d_below = torch.where(equal, one, (self.bins[below] - target_sq).abs())
-        d_above = torch.where(equal, one, (self.bins[above] - target_sq).abs())
+        d_below = torch.where(equal, self._one, (self.bins[below] - target_sq).abs())
+        d_above = torch.where(equal, self._one, (self.bins[above] - target_sq).abs())
         total = d_below + d_above
         w_below = d_above / total
         w_above = d_below / total
@@ -223,9 +225,6 @@ class Bound:
         return self._dist.log_prob(x)
 
 
-# ---------- factories (registered as ``MLPHead`` `dist=` choices) ----------
-
-
 def bounded_normal(x: torch.Tensor, min_std: float, max_std: float, **_: Any) -> DistLike:
     mean, std = torch.chunk(x, 2, dim=-1)
     std = (max_std - min_std) * torch.sigmoid(std + 2.0) + min_std
@@ -283,9 +282,6 @@ def kl(logits_left: torch.Tensor, logits_right: torch.Tensor) -> torch.Tensor:
     log_q = torch.log_softmax(logits_right, dim=-1)
     p = torch.softmax(logits_left, dim=-1)
     return (p * (log_p - log_q)).sum(dim=-1)
-
-
-# ---------- helpers ----------
 
 
 def _identity(x: torch.Tensor) -> torch.Tensor:

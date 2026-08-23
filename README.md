@@ -36,6 +36,10 @@ pixi run training core/model=dreamerv3
 
 # evaluate a saved checkpoint
 pixi run inference checkpoint=logs/<date>/<time>/best.pt envs.task=MT10
+
+# inspect Cartesian-controller tracking without launching training
+pixi run controller-bench
+pixi run controller-bench mode=servo
 ```
 
 All runs log to Weights & Biases. Set `WANDB_API_KEY` (and optionally
@@ -50,25 +54,28 @@ and its tests always sit at the same path.
 
 ```
 src/dreamer_arm/
-  core/               model + algorithm: agent, RSSM, networks, losses, buffer, optim
-  envs/               MuJoCo / Meta-World envs, arm plugins, wrappers
-  training/           online loop (trainer.py) + its composition root (dreamer.py)
+  core/               model + algorithm: agent, world models, networks, losses, buffer, optim
+  controller/         Cartesian IK, runtime metrics, and controller bench
+  envs/               MuJoCo / Meta-World envs, arm plugins, rendering, wrappers
+  training/           online loop, checkpoint persistence, and composition root
   inference/          checkpoint evaluation (also used by the in-loop eval)
-  utils/              config dispatch, console logging, W&B tracking, seeding
-configs/              core/{model,buffer}/  envs/{,arm/}  training/  inference/  utils/logging/
-tests/                core/  envs/  training/  inference/  utils/   (no GPU required)
+  utils/              config dispatch, console logging, W&B tracking, video, seeding
+configs/              controller/  core/{model,buffer}/  envs/{,arm/}  training/  inference/  utils/logging/
+tests/                mirrors src/dreamer_arm/ (no GPU required)
 thirdparty/metaworld/ YAMetaworld submodule: YAM MJCF, meshes and task suite
-logs/                 run artefacts (checkpoints, videos, resolved config)
+logs/<date>/<time>/    latest.pt, best.pt, checkpoints/, videos/, config.yaml
 ```
 
-Each command is one config: `configs/training/dreamer.yaml` and
-`configs/inference/evaluate.yaml` name their own `entrypoint._target_`, which
-`dreamer_arm.utils.config.dispatch` calls after validating the config. Adding a
-command means adding a config plus the module it points at.
+Each command is one config: `configs/training/dreamer.yaml`,
+`configs/inference/evaluate.yaml`, and `configs/controller/bench.yaml`
+name their own `entrypoint._target_`, which `dreamer_arm.utils.config.dispatch`
+calls after validating the config. Adding a command means adding a config plus
+the module it points at.
 
 ```bash
-python -m dreamer_arm.training           # = pixi run traininging
-python -m dreamer_arm.inference.evaluate # = pixi run inference
+python -m dreamer_arm.training                # = pixi run training
+python -m dreamer_arm.inference.evaluate      # = pixi run inference
+python -m dreamer_arm.controller.bench       # = pixi run controller-bench
 ```
 
 ## Development
@@ -83,6 +90,10 @@ pixi run -e dev lint       # ruff
 pixi run -e dev typecheck  # ty
 pixi run -e dev test       # pytest
 ```
+
+When running an ad-hoc Python command or pytest invocation that imports both
+PyTorch and MuJoCo, set `KMP_DUPLICATE_LIB_OK=TRUE`; their bundled OpenMP
+runtimes otherwise conflict on macOS. The built-in Pixi tasks already set it.
 
 ## Template
 

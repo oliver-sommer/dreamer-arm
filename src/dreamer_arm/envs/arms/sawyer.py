@@ -11,8 +11,10 @@ treat both arms uniformly.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
+from dreamer_arm.controller.metrics import ServoState
 from dreamer_arm.envs.arms.base import ArmConfig
 
 
@@ -25,6 +27,14 @@ class SawyerArm:
     @property
     def name(self) -> str:
         return "sawyer"
+
+    @property
+    def last_diagnostics(self) -> Mapping[str, float] | None:
+        return None
+
+    @property
+    def servo_state(self) -> ServoState | None:
+        return None
 
     def attach(self, env: Any) -> None:
         """Do nothing — leave hooks unset so the default mocap path runs."""

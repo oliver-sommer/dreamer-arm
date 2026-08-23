@@ -10,10 +10,25 @@ version = "0.1.0"
 [dependencies]
 python = "3.13.*"
 numpy = ">=2.4"
-# dm-control 1.0.41 still references MjModel.flex_bandwidth, which mujoco 3.9
-# removed; pin mujoco below 3.9 until dm-control catches up.
-mujoco = ">=3.2,<3.9"
-dm-control = ">=1.0.41"
+# Require the MuJoCo API validated by this project. dm-control is installed
+# from PyPI below because conda-forge still only publishes 1.0.41.
+mujoco = ">=3.12"
+# dm-control itself comes from PyPI, but its native/transitive dependencies
+# stay on conda-forge so Python 3.13 uses published binaries (notably labmaze,
+# whose PyPI sdist otherwise requires Bazel to build).
+absl-py = ">=0.7"
+dm-env = "*"
+dm-tree = "!=0.1.2"
+glfw = "*"
+labmaze = "*"
+lxml = "*"
+protobuf = ">=3.19.4"
+pyopengl = ">=3.1.4"
+pyparsing = ">=3"
+requests = "*"
+setuptools = "!=50.0.0"
+scipy = "*"
+tqdm = "*"
 hydra-core = ">=1.3.2"
 pyyaml = ">=6.0.3"
 pillow = ">=9.2,<12"
@@ -48,6 +63,7 @@ torchrl = ">=0.12"
 tensordict = ">=0.12"
 gymnasium = ">=1.3"
 moviepy = ">=2.0"
+dm-control = "==1.0.45"
 # DINO-WM's frozen ViT backbone (vit_small_patch16_dinov3.lvd1689m) — timm's
 # mirror is ungated, unlike facebook/dinov3-* on the HF hub directly.
 timm = ">=1.0.20"
@@ -118,3 +134,8 @@ inference = { cmd = "python -m dreamer_arm.inference.evaluate", env = { KMP_DUPL
 #   pixi run training-view envs.task=door-open          # single task
 #   pixi run training-view envs.task=MT10               # MT10, viewer on task 0
 training-view = { cmd = "mjpython -m dreamer_arm.training envs.viewer=true logging.wandb.mode=disabled", env = { TORCHINDUCTOR_CACHE_DIR = "$PIXI_PROJECT_ROOT/.torch_cache", KMP_DUPLICATE_LIB_OK = "TRUE" } }
+# Cartesian-controller bench — no training, checkpoint, or rendering:
+#   pixi run controller-bench
+#   pixi run controller-bench mode=iid envs.task=door-open
+#   pixi run controller-bench sweep=true mode=iid
+controller-bench = { cmd = "python -m dreamer_arm.controller.bench", env = { KMP_DUPLICATE_LIB_OK = "TRUE" } }

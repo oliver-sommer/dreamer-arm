@@ -14,13 +14,14 @@ from tensordict import TensorDict
 from dreamer_arm.core.buffer import BufferConfig, ReplayBuffer
 
 
-def _make_buf(batch_size: int = 2, batch_length: int = 4) -> ReplayBuffer:
+def _make_buf(batch_size: int = 2, batch_length: int = 4, prefetch: int = 0) -> ReplayBuffer:
     cfg = BufferConfig(
         max_size=128,
         batch_size=batch_size,
         batch_length=batch_length,
         device="cpu",
         storage_device="cpu",
+        prefetch=prefetch,
     )
     return ReplayBuffer(cfg)
 
@@ -150,6 +151,76 @@ def test_buffer_sample_alignment() -> None:
 
     assert torch.equal(action, obs - 1.0), f"action misaligned:\nobs={obs}\naction={action}"
     assert torch.equal(reward, obs - 1.0), f"reward misaligned:\nobs={obs}\nreward={reward}"
+
+
+def test_buffer_sample_never_splices_across_episodes() -> None:
+    """A sampled (B, T) slice must never span two different episode ids.
+
+    This is the invariant the ``episode`` key exists to protect: SliceSampler
+    uses it to keep every slice inside one trajectory. Every other test in
+    this file writes a single episode id (0) throughout, so none of them
+    would catch a regression here -- e.g. enabling TorchRL's SliceSampler
+    ``cache_values`` without correctly invalidating it, which could hand the
+    sampler stale episode boundaries and let a slice splice across a reset.
+    """
+    n_envs = 2
+    batch_length = 4
+    buf = _make_buf(batch_size=8, batch_length=batch_length)
+
+    # Two envs, each resetting every 5 steps -> multiple distinct episode ids
+    # per env, interleaved across the (time, env) storage grid.
+    episode_ids = list(range(n_envs))
+    next_ep_id = n_envs
+    for t in range(40):
+        buf.add_transition(
+            TensorDict(
+                {
+                    "obs": torch.full((n_envs, 1), float(t)),
+                    "action": torch.zeros(n_envs, 1),
+                    "reward": torch.zeros(n_envs, 1),
+                    "episode": torch.tensor(episode_ids, dtype=torch.int32),
+                },
+                batch_size=(n_envs,),
+            )
+        )
+        if (t + 1) % 5 == 0:
+            episode_ids = [next_ep_id + i for i in range(n_envs)]
+            next_ep_id += n_envs
+
+    for _ in range(20):
+        data, _, _ = buf.sample(())
+        episodes = data["episode"]  # (B, T)
+        assert (episodes == episodes[:, :1]).all(), f"slice spans multiple episodes:\n{episodes}"
+
+
+def test_buffer_prefetch_matches_synchronous_sample_shape() -> None:
+    """prefetch>0 must sample the same shapes as prefetch=0, just off-thread."""
+    n_envs = 2
+    stoch_shape = (4, 4)
+    deter_dim = 8
+    buf = _make_buf(batch_size=2, batch_length=4, prefetch=2)
+    for _t in range(16):
+        buf.add_transition(
+            TensorDict(
+                {
+                    "action": torch.zeros(n_envs, 3),
+                    "reward": torch.zeros(n_envs, 1),
+                    "stoch": torch.zeros(n_envs, *stoch_shape),
+                    "deter": torch.zeros(n_envs, deter_dim),
+                    "episode": torch.zeros(n_envs, dtype=torch.int32),
+                },
+                batch_size=(n_envs,),
+            )
+        )
+
+    # Sample more times than the prefetch cap so both the prefetched and the
+    # synchronous-fallback paths inside TorchRL run.
+    for _ in range(6):
+        data, index, initial = buf.sample(("stoch", "deter"))
+        assert data.shape == torch.Size([2, 4])
+        assert initial["stoch"].shape == (2, *stoch_shape)
+        assert initial["deter"].shape == (2, deter_dim)
+        assert len(index) == 2
 
 
 def test_buffer_save_load_round_trip(tmp_path: Any) -> None:

@@ -17,10 +17,6 @@ from tensordict import TensorDict
 
 from dreamer_arm.training.trainer import OnlineTrainer, TrainerConfig
 
-# ---------------------------------------------------------------------------
-# Mock objects
-# ---------------------------------------------------------------------------
-
 
 def _make_trainer_cfg(**overrides: Any) -> TrainerConfig:
     defaults: dict[str, Any] = dict(  # noqa: C408
@@ -94,10 +90,7 @@ class _MockVectorEnv:
             "proprio": np.ones((N, 4), dtype=np.float32),
         }
         fin_info = [{"success": False, "task_name": "mock"} if terms[i] else None for i in range(N)]
-        info: dict[str, Any] = {
-            "final_observation": {k: np.zeros_like(v) for k, v in obs.items()},
-            "final_info": fin_info,
-        }
+        info: dict[str, Any] = {"final_info": fin_info}
         return obs, rewards, terms, truncs, info
 
     def close(self) -> None:
@@ -186,7 +179,7 @@ class _MockLogger:
     def scalar(self, name: str, value: Any) -> None:
         self.recorded.append((name, float(value)))
 
-    def scalars(self, values: dict[str, Any]) -> None:
+    def scalars(self, values: dict[str, Any], defer: bool = False) -> None:
         for k, v in values.items():
             self.scalar(k, v)
 
@@ -200,13 +193,7 @@ class _MockLogger:
         pass
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
 def test_transition_episode_ids_monotonic() -> None:
-    """Episode ids in the buffer must be strictly increasing when envs reset."""
     N = 2
     envs = _MockVectorEnv(num_envs=N, done_every=3)
     buffer = _MockBuffer()
@@ -235,7 +222,6 @@ def test_transition_episode_ids_monotonic() -> None:
 
 
 def test_is_first_after_done() -> None:
-    """is_first must be True for the step immediately after a done."""
     N = 2
     envs = _MockVectorEnv(num_envs=N, done_every=2)  # done every 2 steps
     buffer = _MockBuffer()
@@ -258,7 +244,6 @@ def test_is_first_after_done() -> None:
 
 
 def test_reward_shape() -> None:
-    """Reward stored in the buffer must have shape (N, 1)."""
     N = 2
     envs = _MockVectorEnv(num_envs=N, done_every=99)
     buffer = _MockBuffer()
@@ -274,7 +259,6 @@ def test_reward_shape() -> None:
 
 
 def test_episode_score_logged() -> None:
-    """episode/score is logged each time an episode finishes."""
     N = 2
     # done_every=3: each env finishes after 3 steps; with steps=9 → 3 resets per env
     envs = _MockVectorEnv(num_envs=N, done_every=3)
@@ -292,7 +276,6 @@ def test_episode_score_logged() -> None:
 
 
 def test_checkpoint_round_trip(tmp_path: Path) -> None:
-    """Save a checkpoint and verify the envelope has the expected keys."""
     N = 1
     envs = _MockVectorEnv(num_envs=N, done_every=99)
     buffer = _MockBuffer()
@@ -317,7 +300,6 @@ def test_checkpoint_round_trip(tmp_path: Path) -> None:
 
 
 def test_train_ratio_accumulation() -> None:
-    """With train_ratio=1.0 and a full buffer, each env step calls agent.update once."""
     N = 2
     update_calls: list[int] = []
 
@@ -349,7 +331,6 @@ def test_train_ratio_accumulation() -> None:
 
 
 def test_no_updates_during_prefill() -> None:
-    """agent.update should NOT be called while buffer is empty (prefill phase)."""
     N = 2
     update_calls: list[int] = []
 
@@ -421,11 +402,6 @@ def test_rollout_only_state_not_written_to_buffer() -> None:
         assert "context" not in td, "rollout-only state key leaked into the replay buffer"
 
 
-# ---------------------------------------------------------------------------
-# Progress heartbeat
-# ---------------------------------------------------------------------------
-
-
 class _FilledBuffer(_MockBuffer):
     """Buffer that reports enough fill to leave prefill immediately."""
 
@@ -434,7 +410,6 @@ class _FilledBuffer(_MockBuffer):
 
 
 def test_heartbeat_reports_prefill_progress(caplog: Any) -> None:
-    """While the buffer is below the training minimum, the heartbeat shows fill."""
     N = 2
     envs = _MockVectorEnv(num_envs=N, done_every=99)
     agent = _MockAgent(num_envs=N)
@@ -450,9 +425,9 @@ def test_heartbeat_reports_prefill_progress(caplog: Any) -> None:
     )
 
 
-def test_heartbeat_reports_update_pace(caplog: Any) -> None:
-    """Once training starts the heartbeat reports seconds-per-update, which is
-    the number that distinguishes a slow world model from a hang."""
+def test_heartbeat_reports_updates_once_training_starts(caplog: Any) -> None:
+    """Once training starts the heartbeat reports the running update count,
+    which is what distinguishes a slow world model from a hang."""
     N = 2
     envs = _MockVectorEnv(num_envs=N, done_every=99)
     agent = _MockAgent(num_envs=N)
@@ -462,8 +437,8 @@ def test_heartbeat_reports_update_pace(caplog: Any) -> None:
     with caplog.at_level("INFO", logger="dreamer_arm.training.trainer"):
         trainer.begin(agent)
 
-    assert any("s/update" in r.message for r in caplog.records), (
-        f"no update-pace heartbeat in: {[r.message for r in caplog.records]}"
+    assert any("working" in r.message and "updates" in r.message for r in caplog.records), (
+        f"no working heartbeat in: {[r.message for r in caplog.records]}"
     )
 
 
@@ -477,9 +452,9 @@ def test_heartbeat_disabled_by_zero(caplog: Any) -> None:
     with caplog.at_level("INFO", logger="dreamer_arm.training.trainer"):
         trainer.begin(agent)
 
-    # "working"/"s/update" and "N/M transitions" are heartbeat-only phrasings;
-    # the one-off "collecting ...-transition prefill" banner is not a heartbeat.
-    assert not any("working" in r.message or "s/update" in r.message for r in caplog.records)
+    # "working" and "N/M transitions" are heartbeat-only phrasings; the one-off
+    # "collecting ...-transition prefill" banner is not a heartbeat.
+    assert not any("working" in r.message for r in caplog.records)
 
 
 def test_pretrain_runs_once_after_prefill() -> None:
@@ -506,13 +481,7 @@ def test_pretrain_runs_once_after_prefill() -> None:
     assert len(update_calls) == 5, f"expected 5 pretrain updates, got {len(update_calls)}"
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint layout: archives, best.pt, resume state
-# ---------------------------------------------------------------------------
-
-
 def test_archives_only_on_keep_every_grid(tmp_path: Path) -> None:
-    """latest.pt refreshes every checkpoint_every steps; checkpoints/ only every keep_every."""
     N = 1
     envs = _MockVectorEnv(num_envs=N, done_every=99)
     agent = _MockAgent(num_envs=N)
@@ -660,11 +629,6 @@ def test_trainer_state_round_trips_through_resume(tmp_path: Path) -> None:
     assert resumed._best_success == 0.75
 
 
-# ---------------------------------------------------------------------------
-# eval_at_start
-# ---------------------------------------------------------------------------
-
-
 def test_eval_at_start_runs_before_any_collection(monkeypatch: Any) -> None:
     """With eval_at_start, the first eval must happen before any transition
     is stored -- a baseline read on the policy exactly as begin() received it.
@@ -731,7 +695,6 @@ def test_eval_at_start_false_waits_for_normal_cadence(monkeypatch: Any) -> None:
 
 
 def test_eval_at_start_is_a_noop_when_eval_disabled(monkeypatch: Any) -> None:
-    """eval_at_start must respect the same gate as the periodic trigger."""
     called = False
 
     def fail_if_called(*args: Any, **kwargs: Any) -> Any:

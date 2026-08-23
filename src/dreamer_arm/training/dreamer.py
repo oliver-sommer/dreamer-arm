@@ -78,6 +78,7 @@ def _run(cfg: DictConfig) -> None:
             batch_length=int(cfg.core.buffer.batch_length),
             device=str(cfg.core.buffer.device),
             storage_device=str(cfg.core.buffer.storage_device),
+            prefetch=int(cfg.core.buffer.prefetch),
         )
     )
 

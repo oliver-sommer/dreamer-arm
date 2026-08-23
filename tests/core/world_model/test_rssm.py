@@ -6,9 +6,16 @@ plumbing of ``observe`` / ``img_step`` matches what the agent assumes.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
+from dreamer_arm.core.world_model.factory import build_world_model
 from dreamer_arm.core.world_model.rssm import RSSM
+
+
+def test_world_model_factory_rejects_unknown_kind() -> None:
+    with pytest.raises(NotImplementedError, match="not implemented"):
+        build_world_model({"wm": "dreamer4"}, {}, 4, torch.device("cpu"))
 
 
 def test_rssm_observe_shapes(tiny_rssm_cfg) -> None:  # type: ignore[no-untyped-def]

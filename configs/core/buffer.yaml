@@ -17,3 +17,9 @@ batch_length: ${batch_length}
 device: ${device}
 # Storage lives on the CPU; the grid is far too large for VRAM.
 storage_device: cpu
+
+# Batches to prefetch on a background thread so the next sample() is already
+# gathered (and pin_memory()'d/copied to device) by the time an update needs
+# it, instead of blocking the update loop on the gather + H2D copy every step.
+# 0 disables prefetching (fully synchronous sample()).
+prefetch: 2

@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from dreamer_arm.utils.modules import weight_init_
+from dreamer_arm.core.networks.layers import weight_init_
 from dreamer_arm.utils.tensor import rpad
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -219,8 +219,6 @@ class DinoWM(nn.Module):
             if module is not None:
                 module.apply(weight_init_)
 
-    # ------------------------------------------------------------ embedding
-
     def embed_extra(self, data: dict[str, torch.Tensor]) -> torch.Tensor | None:
         """Proprio/task-id → ``(B, T, extra_dim)``, or ``None`` if there is none."""
         if self.proprio_embed is None:
@@ -234,8 +232,6 @@ class DinoWM(nn.Module):
         """``(..., P, C), (..., E) → (..., P, C+E)`` by tiling ``extra`` over patches."""
         extra = extra.unsqueeze(-2).expand(*extra.shape[:-1], tokens.shape[-2], extra.shape[-1])
         return torch.cat([tokens, extra], dim=-1)
-
-    # ------------------------------------------------------------- rollout
 
     def initial(self, batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
         tokens = torch.zeros(batch_size, self.context, self.num_patches, self.tok_dim, device=device)
@@ -258,8 +254,6 @@ class DinoWM(nn.Module):
         if self.feat_pool == "mean":
             return last_frame.mean(dim=-2)
         return last_frame.reshape(*last_frame.shape[:-2], -1)
-
-    # ---------------------------------------------------------------- loss
 
     def loss(self, tokens: torch.Tensor, action: torch.Tensor) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Teacher-forced next-frame-token prediction.

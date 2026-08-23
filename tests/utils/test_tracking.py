@@ -106,6 +106,41 @@ def test_scalars_stacks_each_device_group_separately(monkeypatch: Any) -> None:
     assert logger._scalars["cpu_b"] == 2.0
 
 
+def test_scalars_deferred_does_not_sync_until_write(monkeypatch: Any) -> None:
+    """scalars(defer=True) must not call .item()/tolist() -- only write() may.
+
+    The update loop logs metrics after every agent.update but only the last
+    call's values before the next write() are ever read (each overwrites the
+    last). Deferring means only one device->host sync happens per write(), no
+    matter how many updates ran in between.
+    """
+    logger = _make_logger()
+    item_calls: list[int] = []
+    monkeypatch.setattr(torch.Tensor, "tolist", lambda self: item_calls.append(1) or [self.item()])
+
+    logger.scalars({"loss/dyn": torch.tensor(1.0)}, defer=True)
+    logger.scalars({"loss/dyn": torch.tensor(2.0)}, defer=True)  # overwrites the first
+    assert item_calls == [], "deferred scalars() must not sync before write()"
+    assert logger._scalars == {}
+    assert logger._pending["loss/dyn"].item() == 2.0
+
+    logger._flush_pending()
+    assert item_calls == [1]
+    assert logger._scalars == {"loss/dyn": 2.0}
+    assert logger._pending == {}
+
+
+def test_write_flushes_pending_deferred_scalars(monkeypatch: Any) -> None:
+    logger = _make_logger()
+    monkeypatch.setattr(logger, "_encode_video", lambda arr: None)
+    logger.scalars({"loss/dyn": torch.tensor(0.5)}, defer=True)
+
+    logger.write(step=0)
+
+    assert logger._pending == {}
+    assert logger._scalars == {}  # write() clears after flushing into the payload
+
+
 def test_encode_video_returns_none_when_ffmpeg_missing(monkeypatch: Any) -> None:
     """A missing ffmpeg binary must drop the video, not crash the whole run.
 
@@ -116,7 +151,7 @@ def test_encode_video_returns_none_when_ffmpeg_missing(monkeypatch: Any) -> None
     """
     import numpy as np
 
-    from dreamer_arm.utils import tracking
+    from dreamer_arm.utils import video
 
     def raise_no_ffmpeg(*a: Any, **k: Any) -> None:
         raise RuntimeError(
@@ -124,7 +159,7 @@ def test_encode_video_returns_none_when_ffmpeg_missing(monkeypatch: Any) -> None
             "or set the IMAGEIO_FFMPEG_EXE environment variable."
         )
 
-    monkeypatch.setattr(tracking.imageio, "mimwrite", raise_no_ffmpeg)
+    monkeypatch.setattr(video.imageio, "mimwrite", raise_no_ffmpeg)
 
     logger = _make_logger()
     frames = np.zeros((2, 3, 4, 4), dtype=np.uint8)  # (T, C, H, W)

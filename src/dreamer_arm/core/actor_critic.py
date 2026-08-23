@@ -152,8 +152,6 @@ class ActorCritic(nn.Module):
         action = action_dist.mode if eval_mode else action_dist.rsample()
         return sanitize_action(action, self.act_discrete)
 
-    # ------------------------------------------------------------------ imagination
-
     def _gather_imag_starts(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Flatten a ``(B, T, ...)`` posterior trajectory into imagination starts.
 
@@ -192,8 +190,6 @@ class ActorCritic(nn.Module):
             state = frozen_wm.img_step(state, action)
         return torch.stack(feats, dim=1), torch.stack(actions, dim=1)
 
-    # ------------------------------------------------------------------ losses
-
     def loss(
         self,
         feat: torch.Tensor,
@@ -216,7 +212,6 @@ class ActorCritic(nn.Module):
         cont_target = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
         losses["con"] = -self.cont(feat).log_prob(cont_target).mean()
 
-        # --- imagination rollout for actor-critic ---
         start = self._gather_imag_starts(state)
         imag_feat, imag_action = self._imagine(frozen_wm, start, self.imag_horizon + 1)
         imag_feat = imag_feat.detach()
@@ -224,7 +219,15 @@ class ActorCritic(nn.Module):
 
         imag_reward = self._frozen_reward(imag_feat).mode()
         imag_cont = self._frozen_cont(imag_feat).mean
-        imag_value = self._frozen_value(imag_feat).mode()
+        # self.value, not the frozen clone: imag_feat is already detached
+        # above, so this carries no gradient regardless -- and the value loss
+        # further down needs this exact distribution object anyway. Computing
+        # it once here (instead of again via _frozen_value, whose parameters
+        # share storage with self.value and so would return bit-identical
+        # numbers) removes a redundant forward over the same 1024x(H+1)
+        # features.
+        imag_value_dist = self.value(imag_feat)
+        imag_value = imag_value_dist.mode().detach()
         imag_slow_value = self._frozen_slow_value(imag_feat).mode()
 
         disc = 1.0 - 1.0 / self.horizon
@@ -240,7 +243,6 @@ class ActorCritic(nn.Module):
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
         losses["policy"] = (weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy)).mean()
 
-        imag_value_dist = self.value(imag_feat)
         tar_padded = torch.cat([ret, torch.zeros_like(ret[:, -1:])], dim=1)
         losses["value"] = (
             weight[:, :-1].detach()
@@ -264,11 +266,13 @@ class ActorCritic(nn.Module):
         metrics["action_entropy"] = entropy.mean()
         metrics.update(tensorstats(imag_action, "action"))
 
-        # --- replay-based value learning ---
         rep_last = to_f32(data["is_last"]).unsqueeze(-1)
         rep_term = to_f32(data["is_terminal"]).unsqueeze(-1)
         rep_reward = to_f32(data["reward"])
-        rep_value = self._frozen_value(feat).mode()
+        # self.value, not the frozen clone -- see the imag_value comment above;
+        # the value loss below needs value_dist regardless, so compute it once.
+        value_dist = self.value(feat)
+        rep_value = value_dist.mode().detach()
         rep_slow = self._frozen_slow_value(feat).mode()
         if self.imag_starts is None:  # noqa: SIM108 (branch comments matter more than brevity here)
             # ret[:, 0] is, for every flattened (b, t) posterior, the return of
@@ -284,7 +288,6 @@ class ActorCritic(nn.Module):
         rep_ret = lambda_return(rep_last, rep_term, rep_reward, rep_value, boot, disc, self.lamb)
         rep_padded = torch.cat([rep_ret, torch.zeros_like(rep_ret[:, -1:])], dim=1)
         rep_weight = 1.0 - rep_last
-        value_dist = self.value(feat)
         losses["repval"] = (
             rep_weight[:, :-1]
             * (-value_dist.log_prob(rep_padded.detach()) - value_dist.log_prob(rep_slow.detach()))[:, :-1].unsqueeze(-1)

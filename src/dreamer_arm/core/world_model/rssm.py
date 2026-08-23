@@ -30,7 +30,7 @@ from torch import nn
 from dreamer_arm.core import distributions as dists
 from dreamer_arm.core.losses import barlow_twins_loss
 from dreamer_arm.core.networks import BlockLinear, MultiDecoder, MultiEncoder, _StochReshape
-from dreamer_arm.utils.modules import weight_init_
+from dreamer_arm.core.networks.layers import weight_init_
 from dreamer_arm.utils.tensor import rpad
 
 
@@ -163,15 +163,10 @@ class RSSM(nn.Module):
         seq.add_module(f"{prefix}_net_reshape", _StochReshape(self._stoch, self._discrete))
         return seq
 
-    # ---- initial state ----
-
     def initial(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(stoch, deter)`` zero-initialised on the model's device."""
         deter = torch.zeros(batch_size, self._deter, dtype=torch.float32, device=self._device)
         stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
         return stoch, deter
-
-    # ---- rollout entry points ----
 
     def observe(
         self,
@@ -214,8 +209,6 @@ class RSSM(nn.Module):
             deters.append(deter)
         return torch.stack(stochs, dim=1), torch.stack(deters, dim=1)
 
-    # ---- single-step transitions ----
-
     def obs_step(
         self,
         stoch: torch.Tensor,
@@ -249,8 +242,6 @@ class RSSM(nn.Module):
         """Sample the prior stochastic state from a deterministic state."""
         logit = self._img_net(deter)
         return self.get_dist(logit).rsample(), logit
-
-    # ---- feature + loss helpers ----
 
     def get_feat(self, stoch: torch.Tensor, deter: torch.Tensor) -> torch.Tensor:
         stoch = stoch.reshape(*stoch.shape[:-2], self._stoch * self._discrete)

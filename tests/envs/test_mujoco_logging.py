@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 import dreamer_arm.envs  # noqa: F401  -- import installs the warning handler
-from dreamer_arm.envs import _forward_mujoco_warning, _warning_counts
+from dreamer_arm.envs.mujoco_logging import _forward_mujoco_warning, _warning_counts
 
 # Single sliding body: NaN in qpos makes mj_step emit the instability warning.
 _XML = '<mujoco><worldbody><body><joint name="j" type="slide"/><geom size=".1"/></body></worldbody></mujoco>'
@@ -41,7 +41,7 @@ def test_handler_is_installed() -> None:
 
 def test_engine_warning_is_logged(caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    with caplog.at_level(logging.WARNING, logger="dreamer_arm.envs"):
+    with caplog.at_level(logging.WARNING, logger="dreamer_arm.envs.mujoco_logging"):
         _trigger_nan_warning()
 
     assert any("QPOS" in record.message for record in caplog.records), caplog.text
@@ -51,7 +51,7 @@ def test_engine_warning_is_logged(caplog: pytest.LogCaptureFixture, tmp_path: Pa
 
 def test_repeated_warnings_are_counted_not_flooded(caplog: pytest.LogCaptureFixture) -> None:
     """A diverging sim warns every step; the log must not grow one line per step."""
-    with caplog.at_level(logging.WARNING, logger="dreamer_arm.envs"):
+    with caplog.at_level(logging.WARNING, logger="dreamer_arm.envs.mujoco_logging"):
         for _ in range(20):
             _forward_mujoco_warning("Nan, Inf or huge value in QPOS at DOF 0. Time = 1.8000.")
 

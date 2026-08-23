@@ -17,21 +17,19 @@ which survives network failures that permanently kill wandb's online stream.
 from __future__ import annotations
 
 import logging
-import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-import imageio
 import numpy as np
 import torch
 
 from dreamer_arm.utils.logging import CONTINUATION_INDENT
+from dreamer_arm.utils.video import VideoEncodingUnavailable, as_uint8_video, encode_video
 
 try:
     import wandb
@@ -49,31 +47,6 @@ def _to_numpy(value: Any) -> np.ndarray:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().numpy()
     return np.asarray(value)
-
-
-def _as_uint8_video(frames: _Array, cols: int | None = None) -> np.ndarray:
-    """Normalise a ``(B?, T, H, W, C)`` array into ``(T, C, rows*H, cols*W)`` uint8.
-
-    Accepts an optional leading batch axis. ``cols`` controls how many videos
-    appear per row; the remainder fill the rows below. Defaults to all videos
-    in a single row (``cols=B``).
-    """
-    arr = _to_numpy(frames)
-    if arr.ndim == 4:
-        arr = arr[None]  # add batch axis
-    if arr.ndim != 5:
-        raise ValueError(f"expected video shape (B, T, H, W, C) or (T, H, W, C); got {arr.shape}")
-    if np.issubdtype(arr.dtype, np.floating):
-        arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-    elif arr.dtype != np.uint8:
-        arr = arr.astype(np.uint8)
-    b, t, h, w, c = arr.shape
-    n_cols = cols if cols is not None else b
-    n_rows = b // n_cols
-    # (B, T, H, W, C) -> (rows, cols, T, H, W, C) -> (T, C, rows*H, cols*W)
-    arr = arr.reshape(n_rows, n_cols, t, h, w, c)
-    arr = arr.transpose(2, 5, 0, 3, 1, 4).reshape(t, c, n_rows * h, n_cols * w)
-    return arr
 
 
 class WandbLogger:
@@ -116,6 +89,7 @@ class WandbLogger:
         self._video_fps = video_fps
         self._warned_no_ffmpeg = False
         self._scalars: dict[str, _Scalar] = {}
+        self._pending: dict[str, torch.Tensor] = {}
         self._videos: dict[str, np.ndarray] = {}
         self._images: dict[str, np.ndarray] = {}
         self._histograms: dict[str, np.ndarray] = {}
@@ -138,23 +112,20 @@ class WandbLogger:
             self._sync_thread = threading.Thread(target=self._sync_loop, args=(float(sync_interval),), daemon=True)
             self._sync_thread.start()
 
-    # --------------------------------------------------------------- buffering
-
     def scalar(self, name: str, value: _Scalar | torch.Tensor) -> None:
         if isinstance(value, torch.Tensor):
             value = float(value.detach().cpu().item())
         self._scalars[name] = float(value)
 
-    def scalars(self, values: Mapping[str, _Scalar | torch.Tensor]) -> None:
-        """Log a batch of scalars with at most one CUDA sync per device, not one per key.
+    def scalars(self, values: Mapping[str, _Scalar | torch.Tensor], defer: bool = False) -> None:
+        """Log a batch of scalars.
 
-        A Dreamer update reports 15-20 metrics, and ``.item()`` blocks until
-        every kernel queued so far has finished -- called once per key, that
-        serialises the update loop into N host round-trips instead of the one
-        it needs.  ``torch.stack(...).tolist()`` still blocks, but only once
-        per device: with the GPU otherwise saturated by many small kernels
-        (the common case for a small recurrent model like this), that
-        difference is the gap between a sync every update and twenty of them.
+        With ``defer=True`` (the update-loop path), tensor values are kept as
+        tensors in ``_pending`` and only synced to host in :meth:`write` --
+        see :meth:`_flush_pending` for why that matters. With ``defer=False``
+        (the default), tensors are synced immediately: at most one CUDA sync
+        per device, not one per key, so a handful of scalars logged outside
+        the update loop still don't pay a sync per key.
 
         Grouped by device rather than stacked in one call: a metrics dict that
         mixes a stray CPU-default ``torch.tensor(x)`` in with the rest (an easy
@@ -164,21 +135,47 @@ class WandbLogger:
         nothing to mismatch against.
         """
         tensors = {k: v for k, v in values.items() if isinstance(v, torch.Tensor)}
-        by_device: dict[torch.device, list[str]] = {}
-        for k, v in tensors.items():
-            by_device.setdefault(v.device, []).append(k)
-        for _device, keys in by_device.items():
-            # Every value here is a loss/metric mean -> single-element; reshape
-            # rather than stacking mismatched shapes if that invariant ever slips.
-            stacked = torch.stack([tensors[k].detach().reshape(()) for k in keys])
-            for k, val in zip(keys, stacked.tolist(), strict=True):
-                self._scalars[k] = float(val)
+        if defer:
+            self._pending.update({k: v.detach() for k, v in tensors.items()})
+        else:
+            by_device: dict[torch.device, list[str]] = {}
+            for k, v in tensors.items():
+                by_device.setdefault(v.device, []).append(k)
+            for _device, keys in by_device.items():
+                # Every value here is a loss/metric mean -> single-element; reshape
+                # rather than stacking mismatched shapes if that invariant ever slips.
+                stacked = torch.stack([tensors[k].detach().reshape(()) for k in keys])
+                for k, val in zip(keys, stacked.tolist(), strict=True):
+                    self._scalars[k] = float(val)
         for k, v in values.items():
             if k not in tensors:
                 self.scalar(k, v)
 
+    def _flush_pending(self) -> None:
+        """Sync every deferred tensor scalar to host, once, grouped by device.
+
+        The update loop calls :meth:`scalars` with ``defer=True`` after every
+        ``agent.update`` -- but only the last update's metrics before the next
+        :meth:`write` are ever read (each call overwrites the last). Syncing
+        immediately, as ``scalars(defer=False)`` does, would pay a blocking
+        device->host stall after every update just to throw away all but one
+        of them. Deferring collapses that to one sync per ``write``, no matter
+        how many updates ran in between -- the same "one sync, not N" argument
+        ``scalars`` used to make per-call, now amortised across the window.
+        """
+        if not self._pending:
+            return
+        by_device: dict[torch.device, list[str]] = {}
+        for k, v in self._pending.items():
+            by_device.setdefault(v.device, []).append(k)
+        for _device, keys in by_device.items():
+            stacked = torch.stack([self._pending[k].reshape(()) for k in keys])
+            for k, val in zip(keys, stacked.tolist(), strict=True):
+                self._scalars[k] = float(val)
+        self._pending.clear()
+
     def video(self, name: str, frames: _Array, cols: int | None = None) -> None:
-        self._videos[name] = _as_uint8_video(frames, cols=cols)
+        self._videos[name] = as_uint8_video(frames, cols=cols)
 
     def image(self, name: str, image: _Array) -> None:
         self._images[name] = _to_numpy(image)
@@ -186,9 +183,9 @@ class WandbLogger:
     def histogram(self, name: str, values: _Array) -> None:
         self._histograms[name] = _to_numpy(values)
 
-    # ------------------------------------------------------------------- flush
-
     def write(self, step: int, fps: bool = False) -> None:
+        self._flush_pending()
+
         # wandb silently drops any log whose step <= the previous committed step.
         # Nudge by 1 on collision so eval payloads (including video) always land.
         if self._max_logged_step is not None and step <= self._max_logged_step:
@@ -196,7 +193,7 @@ class WandbLogger:
         self._max_logged_step = step
 
         fps_value = self._compute_fps(step) if fps else None
-        log.info(self._console_line(step, fps_value))
+        log.info(self._console_line(step))
         payload: dict[str, Any] = dict(self._scalars)
         if fps_value is not None:
             payload["fps/fps"] = fps_value
@@ -241,8 +238,6 @@ class WandbLogger:
                 # Final sync after finish() so the run's end state is uploaded.
                 self._sync_once(sync_dir)
 
-    # --------------------------------------------------------------- internals
-
     def _sync_loop(self, interval: float) -> None:
         sync_dir = str(self._run.settings.sync_dir)
         while not self._sync_stop.wait(interval):
@@ -281,34 +276,22 @@ class WandbLogger:
         to ship one, or the pixi env is out of sync -- so a broken/incomplete
         environment loses video logging instead of taking down the whole run.
         """
-        # _as_uint8_video produces (T, C, H, W); imageio wants (T, H, W, C).
-        frames = arr.transpose(0, 2, 3, 1)
-        fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
-        os.close(fd)
         try:
-            imageio.mimwrite(tmp_path, list(frames), fps=self._video_fps)
-        except RuntimeError as exc:
-            if "ffmpeg" not in str(exc).lower():
-                raise
-            Path(tmp_path).unlink()
+            return encode_video(arr, self._video_fps)
+        except VideoEncodingUnavailable as exc:
             if not self._warned_no_ffmpeg:
                 log.warning("Skipping video logging: %s", exc)
                 self._warned_no_ffmpeg = True
             return None
-        return wandb.Video(tmp_path, format="mp4")
 
-    def _console_line(self, step: int, fps_value: float | None) -> str:
-        # --- header: step + optional fps / episode scores ---
+    def _console_line(self, step: int) -> str:
         # The logging formatter prepends the bracketed timestamp + level.
         parts = [f"step {step:>8}"]
-        if fps_value is not None:
-            parts.append(f"fps {fps_value:>6.1f}")
         for key, label in (("episode/score", "score"), ("episode/eval_score", "eval")):
             if key in self._scalars:
                 parts.append(f"{label} {self._scalars[key]:.2f}")
         header = "  ".join(parts)
 
-        # --- loss sub-line: only present on train-burst flushes ---
         loss_keys = [
             ("train/loss/dyn", "dyn"),
             ("train/loss/rep", "rep"),
@@ -333,8 +316,6 @@ class WandbLogger:
         elapsed = now - self._last_time
         self._last_step, self._last_time = step, now
         return steps / elapsed if elapsed > 0 else 0.0
-
-    # ----------------------------------------------------------- context mgr
 
     def __enter__(self) -> WandbLogger:
         return self

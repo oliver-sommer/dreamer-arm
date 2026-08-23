@@ -72,11 +72,20 @@ class OptimStep:
             scale_before = self._scaler.get_scale()
             self._scaler.step(self._optimizer)
             self._scaler.update()
-            stepped = self._scaler.get_scale() >= scale_before
+            scale_after = self._scaler.get_scale()
+            stepped = scale_after >= scale_before
         else:
-            stepped = all(p.grad is None or torch.isfinite(p.grad).all() for p in params)
+            # A single reduction instead of `all(... torch.isfinite(p.grad).all()
+            # for p in params)`: the latter forces `torch.Tensor.__bool__` once
+            # per parameter (via `or`'s truthiness check), i.e. one device sync
+            # per parameter tensor -- hundreds of syncs per step on CPU/MPS.
+            # Stacking the per-tensor `.all()` results defers every sync until
+            # the single `bool(...)` below.
+            grad_flags = [torch.isfinite(p.grad).all() for p in params if p.grad is not None]
+            stepped = bool(torch.stack(grad_flags).all()) if grad_flags else True
             if stepped:
                 self._optimizer.step()
+            scale_after = self._scaler.get_scale()
         # Only advance the LR schedule when the optimizer actually ran.
         if stepped:
             self._scheduler.step()
@@ -89,7 +98,7 @@ class OptimStep:
         # defaults to CPU and torch.stack refuses to mix devices.
         mets["opt/grad_skipped"] = torch.tensor(0.0 if stepped else 1.0, device=self.device)
         mets["opt/lr"] = torch.tensor(self._scheduler.get_last_lr()[0], device=self.device)
-        mets["opt/grad_scale"] = torch.tensor(self._scaler.get_scale(), device=self.device)
+        mets["opt/grad_scale"] = torch.tensor(scale_after, device=self.device)
         if self._log_grads:
             updates = [(p.data - old) for p, old in zip(params, old_params, strict=True)]
             mets["opt/param_rms"] = compute_rms([p.data for p in params])

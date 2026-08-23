@@ -40,6 +40,7 @@ class BufferConfig:
     device: str = "cpu"
     storage_device: str = "cpu"
     episode_key: str = "episode"
+    prefetch: int = 0
 
 
 class ReplayBuffer:
@@ -71,12 +72,15 @@ class ReplayBuffer:
                 truncated_key=None,
                 strict_length=True,
             ),
-            prefetch=0,
+            # >0 samples the next batch(es) on a background thread while the
+            # current update runs, so sample()'s gather + pin_memory() + H2D
+            # copy overlap with compute instead of blocking it. extend() and
+            # the prefetch thread's _sample() both take TorchRL's internal
+            # _replay_lock, so concurrent add_transition() is safe.
+            prefetch=int(config.prefetch),
             # +1 for the context step that feeds the RSSM initial state.
             batch_size=self.batch_size * (self.batch_length + 1),
         )
-
-    # ------------------------------------------------------------------ writes
 
     def add_transition(self, data: TensorDict) -> None:
         """Append one batched timestep across all envs.
@@ -85,8 +89,6 @@ class ReplayBuffer:
         the storage's ``(time, env)`` grid sees a single new row.
         """
         self._buffer.extend(data.unsqueeze(1))
-
-    # ----------------------------------------------------------------- samples
 
     def sample(
         self, cache_keys: Sequence[str] = ("stoch", "deter")
@@ -145,8 +147,6 @@ class ReplayBuffer:
         # (env_idx, time_idx) order, so swap.
         self._buffer[flat_index[1], flat_index[0]] = TensorDict(flat_state, batch_size=(n,))
 
-    # ------------------------------------------------------------------ persist
-
     def save(self, path: str | Path) -> None:
         """Write the buffer to ``path`` so a resumed run starts warm.
 
@@ -171,15 +171,11 @@ class ReplayBuffer:
         """
         self._buffer.loads(Path(path))
 
-    # ---------------------------------------------------------------- introspect
-
     def __len__(self) -> int:
         shape = self._buffer.storage.shape
         if shape is None:
             return 0
         return int(shape.numel())
-
-    # ----------------------------------------------------------------- internals
 
     def _move_to_device(self, td: TensorDict) -> TensorDict:
         src = td.device

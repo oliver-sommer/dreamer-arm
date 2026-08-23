@@ -22,6 +22,9 @@ logs/
 # torch.compile kernel cache (TORCHINDUCTOR_CACHE_DIR)
 .torch_cache/
 
+# Per-machine Claude Code permissions; shared project settings may be tracked.
+.claude/settings.local.json
+
 # ty type-checker cache
 .ty/
 

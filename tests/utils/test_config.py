@@ -8,12 +8,13 @@ would otherwise only surface minutes into a real run.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
-from dreamer_arm.utils.config import get_config_root, validate_config
+from dreamer_arm.utils.config import get_config_root, run_hydra, validate_config
 
 CONFIG_ROOT = get_config_root()
 
@@ -23,6 +24,7 @@ ENTRYPOINTS = [
     ("inference/evaluate", ["checkpoint=/tmp/ckpt.pt", "envs.task=MT10"]),
     ("training/dreamer", ["core/model=dinowm", "envs.task=MT10"]),
     ("inference/evaluate", ["core/model=dinowm", "checkpoint=/tmp/ckpt.pt", "envs.task=MT10"]),
+    ("controller/bench", []),
 ]
 
 
@@ -37,11 +39,25 @@ def test_config_root_exists() -> None:
 
 
 def test_config_tree_mirrors_package() -> None:
-    """Every config group must correspond to a package under ``src/dreamer_arm``."""
+    """Config groups and test packages must mirror source packages."""
     package_root = Path(__file__).resolve().parents[2] / "src" / "dreamer_arm"
+    test_root = Path(__file__).resolve().parents[1]
     groups = {p.name for p in CONFIG_ROOT.iterdir() if p.is_dir()}
     packages = {p.name for p in package_root.iterdir() if p.is_dir() and (p / "__init__.py").is_file()}
     assert groups <= packages, f"config groups with no matching package: {groups - packages}"
+
+    source_packages = {
+        path.parent.relative_to(package_root)
+        for path in package_root.rglob("__init__.py")
+        if path.parent != package_root
+    }
+    test_packages = {
+        path.parent.relative_to(test_root) for path in test_root.rglob("__init__.py") if path.parent != test_root
+    }
+    assert test_packages == source_packages, (
+        f"tests missing packages: {source_packages - test_packages}; "
+        f"tests with no source package: {test_packages - source_packages}"
+    )
 
 
 @pytest.mark.parametrize(("config_name", "overrides"), ENTRYPOINTS)
@@ -60,6 +76,18 @@ def test_entrypoint_target_is_importable(config_name: str, overrides: list[str])
     target = _compose(config_name, overrides).entrypoint._target_
     module_name, _, attr = target.rpartition(".")
     assert hasattr(importlib.import_module(module_name), attr), f"{target} does not exist"
+
+
+def test_run_hydra_help_composes_without_running(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    task = MagicMock()
+    monkeypatch.setattr("sys.argv", ["dreamer-arm-train", "--help", "envs.task=MT10"])
+    with pytest.raises(SystemExit) as exc_info:
+        run_hydra(task, config_name="training/dreamer")
+    assert exc_info.value.code == 0
+    assert "Resolved configuration" in capsys.readouterr().out
+    task.assert_not_called()
 
 
 def test_composed_config_mirrors_package_layout() -> None:
@@ -164,11 +192,6 @@ def test_validate_config_rejects(override: str, match: str) -> None:
 
 def test_validate_config_accepts_the_defaults() -> None:
     validate_config(_compose("training/dreamer", ["envs.task=MT10"]))
-
-
-# ---------------------------------------------------------------------------
-# pixi task environment
-# ---------------------------------------------------------------------------
 
 
 def test_inductor_cache_dir_is_absolute() -> None:

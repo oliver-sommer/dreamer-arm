@@ -105,8 +105,6 @@ class Dreamer(nn.Module):
             # take 5-10 min on first run before any progress shows in the logs.
             self._cal_grad = torch.compile(self._cal_grad, mode="default")  # type: ignore[method-assign]
 
-    # ------------------------------------------------------------------ world model views
-
     @property
     def wm(self) -> WorldModel:
         """The live (trainable) world-model view, used to compute the representation loss."""
@@ -136,8 +134,6 @@ class Dreamer(nn.Module):
         self.ac.refresh_frozen()
         return self
 
-    # -------------------------------------------------------------- checkpoint
-
     def checkpoint_state(self) -> dict[str, Any]:
         """Full training state for crash-resume (weights, optimiser, counters)."""
         return {
@@ -156,8 +152,6 @@ class Dreamer(nn.Module):
         # loaded state.
         self._wm_bundle.refresh_frozen()
         self.ac.refresh_frozen()
-
-    # ------------------------------------------------------------------ rollout
 
     @torch.no_grad()
     def get_initial_state(self, batch_size: int) -> TensorDict:
@@ -182,10 +176,7 @@ class Dreamer(nn.Module):
         action = self.ac.act(feat, eval_mode)
         return action, TensorDict({**next_state, "prev_action": action}, batch_size=state.batch_size)
 
-    # ------------------------------------------------------------------ training step
-
     def update(self, replay_buffer: Any) -> dict[str, torch.Tensor]:
-        """Sample one batch from ``replay_buffer`` and take one optimiser step."""
         data, index, initial = replay_buffer.sample(self.replay_cache_keys)
         p_data = self._preprocess(dict(data))
         self.ac.update_slow_target()
@@ -203,12 +194,9 @@ class Dreamer(nn.Module):
             replay_buffer.update_initial_state(index, cache)
         return mets
 
-    # ------------------------------------------------------------------ losses
-
     def _cal_grad(
         self, data: dict[str, torch.Tensor], initial: dict[str, torch.Tensor]
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """Compute world-model + actor-critic losses and backprop them."""
         state, losses, metrics = self.wm.loss(data, initial)
         feat = self.wm.get_feat(state)
 
@@ -234,8 +222,6 @@ class Dreamer(nn.Module):
         metrics.update({f"loss/{k}": v.detach() for k, v in losses.items()})
         metrics["opt/loss"] = total_loss.detach()
         return state, metrics
-
-    # ------------------------------------------------------------------ preproc
 
     @torch.no_grad()
     def _preprocess(self, data: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

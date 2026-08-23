@@ -48,16 +48,8 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     Episodes are collected in parallel across the vector env, so the effective
     count is rounded up to a whole number of rounds across ``envs.num_envs``.
 
-    Args:
-        agent:    Dreamer agent with ``get_initial_state``, ``act``, ``device``.
-        envs:     ``SyncVectorEnv`` to evaluate in.  Reset with a fixed seed,
-                  so a shared train/eval env must be re-reset by the caller
-                  afterwards to resume collection.
-        episodes: Minimum number of episodes to complete.
-
-    Returns:
-        An :class:`EvalResult` with per-task success rates, the mean success
-        across all episodes, and any controller diagnostics the envs report.
+    The env is reset with a fixed seed. A caller sharing its training env must
+    reset it again before resuming collection.
     """
     n = envs.num_envs
     device = agent.device
@@ -65,7 +57,7 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     num_rounds = max(1, math.ceil(episodes / n))
 
     task_success: dict[str, list[float]] = {}
-    # EEController diagnostics, averaged across eval episodes (YAM only).
+    # YamArm controller diagnostics, averaged across eval episodes (YAM only).
     ctrl_diags: dict[str, list[float]] = {}
 
     obs_np = envs.reset(seed=EVAL_SEED)
@@ -80,8 +72,10 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
         if not video_done and "scene" in obs_np:
             video_frames.append(obs_np["scene"][0])
 
-        obs_torch: dict[str, torch.Tensor] = {k: torch.from_numpy(obs_np[k]).to(device) for k in obs_keys}
-        obs_torch["is_first"] = torch.from_numpy(is_first).to(device)
+        obs_torch: dict[str, torch.Tensor] = {
+            k: torch.from_numpy(obs_np[k]).to(device, non_blocking=True) for k in obs_keys
+        }
+        obs_torch["is_first"] = torch.from_numpy(is_first).to(device, non_blocking=True)
 
         with torch.no_grad():
             action_t, next_state = agent.act(obs_torch, state, eval_mode=True)

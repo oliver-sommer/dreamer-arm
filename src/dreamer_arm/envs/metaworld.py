@@ -34,53 +34,12 @@ import mujoco
 import numpy as np
 from gymnasium import spaces
 
+from dreamer_arm.controller.metrics import ControllerMetrics
+from dreamer_arm.envs.arms.base import Arm
+from dreamer_arm.envs.rendering import SceneRenderer
+
 _ARM_JOINT_NAMES = [f"joint{i}" for i in range(1, 7)]
 _PROPRIO_DIM = 10  # 6 joint angles + 1 gripper open + 3 TCP xyz
-
-# Hemisphere sampling for camera DR (world frame, z=up)
-_CAM_LOOKAT = np.array([0.0, 0.55, 0.15])
-_CAM_AZIMUTH_RANGE = (100.0, 200.0)  # degrees (behind arm)
-_CAM_ELEVATION_RANGE = (-50.0, -15.0)  # degrees
-_CAM_DISTANCE_RANGE = (0.85, 1.3)  # metres
-
-
-# ---------------------------------------------------------------------------
-# Barrel distortion helper
-# ---------------------------------------------------------------------------
-
-
-def _apply_barrel_distortion(image: np.ndarray, k1: float) -> np.ndarray:
-    """Barrel (k1>0) / pincushion (k1<0) distortion for wrist fisheye."""
-    if abs(k1) < 1e-6:
-        return image
-    try:
-        from scipy.ndimage import map_coordinates  # type: ignore[import-not-found]
-    except ImportError:
-        return image
-
-    h, w, c = image.shape
-    cx, cy = w / 2.0, h / 2.0
-    y_idx, x_idx = np.mgrid[0:h, 0:w]
-    xn = (x_idx - cx) / cx
-    yn = (y_idx - cy) / cy
-    r2 = xn**2 + yn**2
-    factor = 1.0 + k1 * r2
-    xs = xn * factor * cx + cx
-    ys = yn * factor * cy + cy
-    out = np.empty_like(image)
-    for ch in range(c):
-        out[:, :, ch] = map_coordinates(
-            image[:, :, ch].astype(np.float32),
-            [ys, xs],
-            order=1,
-            mode="nearest",
-        )
-    return out.astype(np.uint8)
-
-
-# ---------------------------------------------------------------------------
-# Adapter
-# ---------------------------------------------------------------------------
 
 
 class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
@@ -96,6 +55,7 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         size: tuple[int, int],
         camera: str,
         *,
+        arm_plugin: Arm | None = None,
         wrist_camera: str | None = None,
         scene_randomize: bool = False,
         camera_pose_randomize: bool = False,
@@ -108,13 +68,9 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
     ) -> None:
         super().__init__()
         self._arm = arm
+        self._arm_plugin = arm_plugin
         self._size = size
-        self._camera = camera
         self._wrist_camera = wrist_camera
-        self._scene_randomize = scene_randomize
-        self._camera_pose_randomize = camera_pose_randomize
-        self._camera_jitter = camera_jitter
-        self._wrist_fisheye = wrist_fisheye
         self._task_idx = task_idx
         self._num_tasks = num_tasks
         self._success_threshold = success_threshold
@@ -123,9 +79,22 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         env.set_task(task)
         self._task_name: str = str(task.env_name)
 
-        # Single renderer — one EGL context for both scene and wrist
-        self._renderer = mujoco.Renderer(env.model, height=size[0], width=size[1])
-        self._scene_cam: mujoco.MjvCamera | None = None  # set each reset
+        self._rendering = SceneRenderer(
+            env,
+            size,
+            camera,
+            wrist_camera,
+            scene_randomize=scene_randomize,
+            camera_pose_randomize=camera_pose_randomize,
+            camera_jitter=camera_jitter,
+            wrist_fisheye=wrist_fisheye,
+        )
+
+        # Last rendered frame(s), returned by step(render=False) instead of a
+        # fresh render -- see step()'s docstring.  Always set on reset()
+        # (which always renders), so step() never sees them as None.
+        self._last_scene: np.ndarray | None = None
+        self._last_wrist: np.ndarray | None = None
 
         # No post-render flip: mujoco.Renderer.render() normalises the GL buffer
         # itself and returns upright pixels on every backend (verified on CGL and
@@ -149,13 +118,10 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         # signal).  Aggregates are reset each episode in reset().
         self._is_yam = arm == "yam"
         self._grasp_site_id = int(mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "grasp_site")) if self._is_yam else -1
-        self._reset_ctrl_diag()
+        self._controller_metrics = ControllerMetrics(self._is_yam, self._grasp_site_id)
 
         self._episode_success: bool = False
         self._rng = np.random.default_rng()
-
-        self._light_diffuse0 = m.light_diffuse.copy()
-        self._light_ambient0 = m.light_ambient.copy()
 
         # Passive viewer (mjpython only; None when viewer=False)
         self._mj_viewer: Any = None
@@ -177,10 +143,6 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         self.observation_space: spaces.Dict = spaces.Dict(obs_dict)
         self.action_space: spaces.Box = spaces.Box(-1.0, 1.0, (4,), dtype=np.float32)
 
-    # ------------------------------------------------------------------
-    # Gymnasium interface
-    # ------------------------------------------------------------------
-
     def reset(
         self,
         *,
@@ -193,24 +155,28 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         # Inner env reset (calls _reset_hand → YamArm.reset_hand → sets init_tcp)
         self._env.reset()
         self._episode_success = False
-        self._reset_ctrl_diag()
-        if self._is_yam:
-            self._prev_tcp = np.asarray(self._env.data.site_xpos[self._grasp_site_id], dtype=np.float64).copy()
+        self._controller_metrics.reset(self._env.data)
 
-        # Camera setup for this episode
-        if self._camera_pose_randomize or self._camera_jitter > 0.0:
-            self._scene_cam = self._make_free_camera()
-        else:
-            self._scene_cam = None  # use named camera string
-
-        if self._scene_randomize:
-            self._randomise_lighting()
+        self._rendering.reset(self._rng)
 
         obs = self._get_obs_dict()
         info = self._build_info()
         return obs, info
 
-    def step(self, action: np.ndarray) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
+    def step(
+        self, action: np.ndarray, *, render: bool = True
+    ) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
+        """Step the inner env.
+
+        ``render=False`` skips the camera render(s) in the returned obs
+        (``proprio``/``task_id`` are always computed -- they're cheap and
+        ``SyncVectorEnv`` needs correct non-image obs every inner step).  The
+        ``scene``/``wrist_image`` keys still come back correctly shaped: they
+        hold the *last actually rendered* frame rather than a fresh one. This
+        is for ``SyncVectorEnv``'s ``action_repeat`` loop, where every repeat
+        but the last is immediately overwritten and its rendered pixels are
+        never read -- see ``wrappers.py``.
+        """
         action = np.asarray(action, dtype=np.float32)
         try:
             _, reward, terminated, truncated, inner_info = self._env.step(action)
@@ -219,11 +185,16 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
             # This is not an MDP terminal state, so flag it as a *truncation* (not
             # terminated) — otherwise the critic learns these glitch states have
             # zero future value. Zero reward, and the episode resets.
-            obs = self._get_obs_dict()
+            obs = self._get_obs_dict(render=render)
             return obs, 0.0, False, True, self._build_info()
 
         if self._is_yam:
-            self._accumulate_ctrl_diag()
+            diagnostics = (
+                self._arm_plugin.last_diagnostics
+                if self._arm_plugin is not None
+                else getattr(self._env, "_ctrl_diag", None)
+            )
+            self._controller_metrics.accumulate(diagnostics, self._env.data)
 
         if float(inner_info.get("success", 0.0)) >= self._success_threshold:
             self._episode_success = True
@@ -231,7 +202,7 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         if self._mj_viewer is not None:
             self._mj_viewer.sync()
 
-        obs = self._get_obs_dict()
+        obs = self._get_obs_dict(render=render)
         return obs, float(reward), bool(terminated), bool(truncated), self._build_info()
 
     def close(self) -> None:
@@ -240,92 +211,32 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
                 self._mj_viewer.close()
             self._mj_viewer = None
         with contextlib.suppress(Exception):
-            self._renderer.close()
+            self._rendering.close()
         with contextlib.suppress(Exception):
             self._env.close()
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
-            self._renderer.close()
-
-    # ------------------------------------------------------------------
-    # Controller diagnostics (YAM)
-    # ------------------------------------------------------------------
-
-    def _reset_ctrl_diag(self) -> None:
-        """Zero the per-episode EEController diagnostic aggregates."""
-        self._cd_n = 0
-        self._cd_sigma_sum = 0.0
-        self._cd_sigma_min = float("inf")
-        self._cd_ori_capped = 0
-        self._cd_dq_clamped = 0
-        self._cd_track_sum = 0.0
-        self._cd_track_n = 0
-        self._cd_stuck = 0
-        self._prev_tcp: np.ndarray | None = None
-
-    def _accumulate_ctrl_diag(self) -> None:
-        """Fold the controller's last per-step diagnostics into episode aggregates.
-
-        ``YamArm.actuate`` stashes its per-step diag on ``env._ctrl_diag``; here
-        we read it after the inner step and also measure the *achieved* TCP
-        displacement (at the IK-controlled ``grasp_site``) against the commanded
-        step.  A persistently low achieved/commanded ratio is the stuck signal.
-        """
-        diag = getattr(self._env, "_ctrl_diag", None)
-        if not diag:
-            return
-        self._cd_n += 1
-        sigma = float(diag.get("sigma_min", 0.0))
-        self._cd_sigma_sum += sigma
-        self._cd_sigma_min = min(self._cd_sigma_min, sigma)
-        self._cd_ori_capped += int(diag.get("ori_capped", 0.0) > 0.0)
-        self._cd_dq_clamped += int(diag.get("dq_clamped", 0.0) > 0.0)
-
-        tcp = np.asarray(self._env.data.site_xpos[self._grasp_site_id], dtype=np.float64)
-        cmd = float(diag.get("cmd_norm", 0.0))
-        # Only count steps that actually commanded motion (cmd ~ 0 → ratio is
-        # meaningless and would falsely read as "stuck").
-        if self._prev_tcp is not None and cmd > 1e-4:
-            ratio = float(np.linalg.norm(tcp - self._prev_tcp)) / cmd
-            self._cd_track_sum += ratio
-            self._cd_track_n += 1
-            if ratio < 0.25:
-                self._cd_stuck += 1
-        self._prev_tcp = tcp
-
-    def _ctrl_diag_summary(self) -> dict[str, float] | None:
-        """Episode-aggregate controller diagnostics, or ``None`` if unavailable."""
-        if not self._is_yam or self._cd_n == 0:
-            return None
-        return {
-            "sigma_min_mean": self._cd_sigma_sum / self._cd_n,
-            "sigma_min_min": self._cd_sigma_min,
-            "frac_ori_capped": self._cd_ori_capped / self._cd_n,
-            "frac_dq_clamped": self._cd_dq_clamped / self._cd_n,
-            "track_ratio_mean": (self._cd_track_sum / self._cd_track_n if self._cd_track_n else 1.0),
-            "frac_stuck": (self._cd_stuck / self._cd_track_n if self._cd_track_n else 0.0),
-        }
+            self._rendering.close()
 
     def _build_info(self) -> dict[str, Any]:
-        """Step/reset info dict, tagged with task name, success, and ctrl_diag."""
         info: dict[str, Any] = {"task_name": self._task_name, "success": self._episode_success}
-        summary = self._ctrl_diag_summary()
+        summary = self._controller_metrics.summary()
         if summary is not None:
             info["ctrl_diag"] = summary
         return info
 
-    # ------------------------------------------------------------------
-    # Observation helpers
-    # ------------------------------------------------------------------
-
-    def _get_obs_dict(self) -> dict[str, np.ndarray]:
+    def _get_obs_dict(self, render: bool = True) -> dict[str, np.ndarray]:
+        if render or self._last_scene is None:
+            self._last_scene = self._render_scene()
         obs: dict[str, np.ndarray] = {
-            "scene": self._render_scene(),
+            "scene": self._last_scene,
             "proprio": self._get_proprio(),
         }
         if self._wrist_camera is not None:
-            obs["wrist_image"] = self._render_wrist()
+            if render or self._last_wrist is None:
+                self._last_wrist = self._render_wrist()
+            obs["wrist_image"] = self._last_wrist
         if self._task_idx is not None and self._num_tasks is not None:
             one_hot = np.zeros(self._num_tasks, dtype=np.float32)
             one_hot[self._task_idx] = 1.0
@@ -347,50 +258,7 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         return np.concatenate([joints, gripper_open, tcp])
 
     def _render_scene(self) -> np.ndarray:
-        if self._scene_cam is not None:
-            self._renderer.update_scene(self._env.data, camera=self._scene_cam)
-        else:
-            self._renderer.update_scene(self._env.data, camera=self._camera)
-        return self._grab_frame()
+        return self._rendering.render_scene()
 
     def _render_wrist(self) -> np.ndarray:
-        self._renderer.update_scene(self._env.data, camera=self._wrist_camera)
-        frame = self._grab_frame()
-        if self._wrist_fisheye != 0.0:
-            frame = _apply_barrel_distortion(frame, self._wrist_fisheye)
-        return frame
-
-    def _grab_frame(self) -> np.ndarray:
-        """Render the scene currently loaded into the renderer."""
-        return self._renderer.render().copy()
-
-    # ------------------------------------------------------------------
-    # Domain randomisation
-    # ------------------------------------------------------------------
-
-    def _make_free_camera(self) -> mujoco.MjvCamera:
-        cam = mujoco.MjvCamera()
-        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        if self._camera_pose_randomize:
-            cam.azimuth = float(self._rng.uniform(*_CAM_AZIMUTH_RANGE))
-            cam.elevation = float(self._rng.uniform(*_CAM_ELEVATION_RANGE))
-            cam.distance = float(self._rng.uniform(*_CAM_DISTANCE_RANGE))
-        else:
-            cam.azimuth = 150.0
-            cam.elevation = -35.0
-            cam.distance = 1.0
-        lookat = _CAM_LOOKAT.copy()
-        if self._camera_jitter > 0.0:
-            lookat += self._rng.normal(0.0, self._camera_jitter, 3)
-        cam.lookat[:] = lookat
-        return cam
-
-    def _randomise_lighting(self) -> None:
-        # Scale the captured baseline, never the current value: MjModel persists
-        # across resets, so compounding would fade the scene to black (both
-        # factors have mean < 1, ~0.85x per episode).
-        m = self._env.model
-        for li in range(m.nlight):
-            tint = self._rng.uniform(0.7, 1.0, 3).astype(np.float32)
-            m.light_diffuse[li] = np.clip(self._light_diffuse0[li] * tint, 0.0, 1.0)
-            m.light_ambient[li] = np.clip(self._light_ambient0[li] * float(self._rng.uniform(0.5, 1.2)), 0.0, 1.0)
+        return self._rendering.render_wrist()

@@ -31,9 +31,6 @@ from dreamer_arm.utils.logging import configure_logging
 log = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------- resolvers
-
-
 def _auto_device() -> str:
     if torch.cuda.is_available():
         return "cuda:0"
@@ -63,9 +60,6 @@ OmegaConf.register_new_resolver("auto_compile", _auto_compile, replace=True)
 OmegaConf.register_new_resolver("buffer_max_size", _buffer_max_size, replace=True)
 
 
-# ------------------------------------------------------------------- discovery
-
-
 def get_config_root() -> Path:
     """Locate ``configs/``, whether running from a checkout or an installed wheel."""
     candidates: list[Path] = []
@@ -82,9 +76,6 @@ def get_config_root() -> Path:
             return root
     searched = ", ".join(map(str, candidates))
     raise FileNotFoundError(f"dreamer-arm Hydra config directory not found; searched: {searched}")
-
-
-# ------------------------------------------------------------------ validation
 
 
 def validate_config(cfg: DictConfig) -> None:
@@ -151,9 +142,6 @@ def validate_config(cfg: DictConfig) -> None:
         raise ValueError(f"Unsupported logging.wandb.mode: {wandb.mode}")
 
 
-# -------------------------------------------------------------------- dispatch
-
-
 def dispatch(cfg: DictConfig) -> object:
     """Validate ``cfg``, freeze it, and call its ``entrypoint._target_``."""
     validate_config(cfg)
@@ -176,6 +164,8 @@ def run_hydra[ResultT](
     the overrides, so it never reaches the composed config.
     """
     overrides = list(sys.argv[1:])
+    show_help = any(arg in {"-h", "--help"} for arg in overrides)
+    overrides = [arg for arg in overrides if arg not in {"-h", "--help"}]
     if selector is not None:
         field, group = selector
         prefix = f"{field}="
@@ -191,6 +181,12 @@ def run_hydra[ResultT](
 
     with initialize_config_dir(config_dir=str(get_config_root()), version_base=None):
         cfg = compose(config_name=config_name, overrides=overrides)
+
+    if show_help:
+        print(f"Usage: {Path(sys.argv[0]).name} [key=value ...]")
+        print("\nResolved configuration:\n")
+        print(OmegaConf.to_yaml(cfg, resolve=True))
+        raise SystemExit(0)
 
     configure_logging(str(cfg.logging.level))
 
