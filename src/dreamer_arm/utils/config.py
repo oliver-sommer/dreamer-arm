@@ -136,6 +136,9 @@ def validate_config(cfg: DictConfig) -> None:
             raise ValueError("trainer.train_ratio must be non-negative")
         if int(trainer.eval_episode_num) > 0 and int(trainer.eval_every) <= 0:
             raise ValueError("trainer.eval_every must be positive when eval is enabled")
+        warmup_steps = [int(step) for step in trainer.get("eval_warmup_steps", [])]
+        if any(step <= 0 for step in warmup_steps):
+            raise ValueError("trainer.eval_warmup_steps must contain only positive steps")
 
     logging_cfg = cfg.get("logging")
     wandb = logging_cfg.get("wandb") if logging_cfg is not None else None

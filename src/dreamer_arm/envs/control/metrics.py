@@ -33,10 +33,14 @@ class ControllerMetrics:
         self._sigma_min = float("inf")
         self._ori_capped = 0
         self._dq_clamped = 0
+        self._joint_limit_clamped = 0
         self._lead_clamped = 0
         self._dq_max_sum = 0.0
         self._err_sum = 0.0
+        self._ori_error_sum = 0.0
+        self._ori_task_sum = 0.0
         self._track_sum = 0.0
+        self._motion_sum = 0.0
         self._track_n = 0
         self._stuck = 0
         self._prev_tcp = (
@@ -54,16 +58,37 @@ class ControllerMetrics:
         self._sigma_min = min(self._sigma_min, sigma)
         self._ori_capped += int(diagnostics.get("ori_capped", 0.0) > 0.0)
         self._dq_clamped += int(diagnostics.get("dq_clamped", 0.0) > 0.0)
+        self._joint_limit_clamped += int(diagnostics.get("joint_limit_clamped", 0.0) > 0.0)
         self._lead_clamped += int(diagnostics.get("lead_clamped", 0.0) > 0.0)
         self._dq_max_sum += float(diagnostics.get("dq_max", 0.0))
         self._err_sum += float(diagnostics.get("err_norm", 0.0))
+        self._ori_error_sum += float(diagnostics.get("ori_error_norm", 0.0))
+        self._ori_task_sum += float(diagnostics.get("ori_task_norm", 0.0))
 
         # Copy: site_xpos is a persistent MuJoCo buffer overwritten in place.
         tcp = np.asarray(data.site_xpos[self._site_id], dtype=np.float64).copy()
         cmd = float(diagnostics.get("cmd_norm", 0.0))
         if self._prev_tcp is not None and cmd > 1e-4:
-            ratio = float(np.linalg.norm(tcp - self._prev_tcp)) / cmd
+            achieved = tcp - self._prev_tcp
+            motion_ratio = float(np.linalg.norm(achieved)) / cmd
+            err_keys = ("err_x", "err_y", "err_z")
+            cmd_keys = ("cmd_x", "cmd_y", "cmd_z")
+            direction_keys = err_keys if all(key in diagnostics for key in err_keys) else cmd_keys
+            if all(key in diagnostics for key in direction_keys):
+                desired = np.array([diagnostics[key] for key in direction_keys], dtype=np.float64)
+                desired_norm = float(np.linalg.norm(desired))
+                # Directional progress toward the integrated setpoint, not
+                # merely motion.  The current action is intentionally not the
+                # direction reference: after an action reversal the leashed
+                # setpoint can still lie in the previous direction while the
+                # physical servo catches up.
+                ratio = float(achieved @ desired) / (desired_norm * cmd) if desired_norm > 1e-12 else 0.0
+            else:
+                # Backward compatibility for third-party controllers that
+                # only expose the scalar diagnostic.
+                ratio = motion_ratio
             self._track_sum += ratio
+            self._motion_sum += motion_ratio
             self._track_n += 1
             self._stuck += int(ratio < 0.25)
         self._prev_tcp = tcp
@@ -76,9 +101,13 @@ class ControllerMetrics:
             "sigma_min_min": self._sigma_min,
             "frac_ori_capped": self._ori_capped / self._n,
             "frac_dq_clamped": self._dq_clamped / self._n,
+            "frac_joint_limit_clamped": self._joint_limit_clamped / self._n,
             "frac_lead_clamped": self._lead_clamped / self._n,
             "dq_max_mean": self._dq_max_sum / self._n,
             "err_norm_mean": self._err_sum / self._n,
+            "ori_error_norm_mean": self._ori_error_sum / self._n,
+            "ori_task_norm_mean": self._ori_task_sum / self._n,
             "track_ratio_mean": self._track_sum / self._track_n if self._track_n else 1.0,
+            "motion_ratio_mean": self._motion_sum / self._track_n if self._track_n else 1.0,
             "frac_stuck": self._stuck / self._track_n if self._track_n else 0.0,
         }

@@ -43,7 +43,13 @@ class ArmConfig:
     """Posture-bias gain; pulls joints toward home configuration."""
 
     ori_gain: float = 1.0
-    """Scale on orientation error in the DLS task vector."""
+    """Feedback gain on orientation error in the DLS task vector."""
+
+    ori_weight: float = 0.3
+    """Relative priority of orientation versus unit-scaled translation in
+    the DLS objective.  Unlike ori_gain, zero truly disables the rotational
+    constraint.  A sub-unit default prevents orientation maintenance from
+    starving translation on this 6-DOF arm."""
 
     joint_margin: float = 0.05
     """Soft joint-limit margin (rad)."""

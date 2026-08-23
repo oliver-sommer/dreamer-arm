@@ -41,7 +41,18 @@ class IKConfig:
     """Gain on the posture bias (q_home - q) projected into the null-space."""
 
     ori_gain: float = 1.0
-    """Scale on the orientation error component."""
+    """Feedback gain on the orientation error component."""
+
+    ori_weight: float = 0.3
+    """Relative priority of the rotational task rows in the DLS objective.
+
+    This must weight both the rotational Jacobian and error.  Scaling only
+    the error (``ori_gain``) still asks the solver for zero angular velocity
+    at gain zero, so it does *not* disable the orientation constraint and can
+    make a 6-DOF arm sacrifice translation near a wrist singularity.  ``0``
+    genuinely leaves orientation unconstrained; ``1`` gives it equal
+    unit-consistent priority with translation.
+    """
 
     joint_margin: float = 0.05
     """Soft-limit margin (rad) kept inside each joint limit."""
@@ -173,10 +184,19 @@ def solve_dls(
     # smaller, not by kinematic conditioning (position singular values sit
     # ~O(0.05) at the YAM home pose purely from the metre/radian mismatch,
     # independent of joint configuration).
-    w = np.ones(6)
-    w[:3] = 1.0 / cfg.length_scale
-    Jw = J * w[:, None]  # (6, n_arm)
-    ew = e * w  # (6,)
+    unit_scale = np.ones(6)
+    unit_scale[:3] = 1.0 / cfg.length_scale
+    Ju = J * unit_scale[:, None]
+
+    # Task priority is distinct from feedback gain.  In particular,
+    # ori_gain=0 only requests zero angular velocity; unless the rotational
+    # Jacobian rows are also removed/weighted down, that still constrains the
+    # position solve.  Weight J and e together so ori_weight controls the
+    # least-squares objective and ori_weight=0 is a true position-only solve.
+    task_weight = np.ones(6)
+    task_weight[3:] = cfg.ori_weight
+    Jw = Ju * task_weight[:, None]  # (6, n_arm)
+    ew = e * unit_scale * task_weight  # (6,)
 
     lam2 = cfg.damping**2
     JJt = Jw @ Jw.T + lam2 * np.eye(6)
@@ -204,8 +224,9 @@ def solve_dls(
     dq_null, _null_clamped = _clamp_step(dq_null, cfg.max_joint_step)
     dq = dq_task + dq_null
 
+    q_unclipped = q + dq
     q_target = np.clip(
-        q + dq,
+        q_unclipped,
         jnt_range[:, 0] + cfg.joint_margin,
         jnt_range[:, 1] - cfg.joint_margin,
     )
@@ -213,9 +234,13 @@ def solve_dls(
     if diag is not None:
         diag["dq_max"] = float(np.abs(dq).max())
         diag["dq_clamped"] = float(task_clamped)
+        diag["joint_limit_clamped"] = float(not np.array_equal(q_target, q_unclipped))
         if sigma_min:
             try:
-                diag["sigma_min"] = float(np.linalg.svd(Jw, compute_uv=False).min())
+                # Keep conditioning comparable across ori_weight ablations:
+                # report the unit-normalised physical Jacobian, not the
+                # deliberately de-prioritised task matrix used by the solve.
+                diag["sigma_min"] = float(np.linalg.svd(Ju, compute_uv=False).min())
             except np.linalg.LinAlgError:
                 diag["sigma_min"] = 0.0
     return q_target

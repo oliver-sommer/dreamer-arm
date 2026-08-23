@@ -109,6 +109,7 @@ def _run(cfg: DictConfig) -> None:
         checkpoint_keep_every=int(cfg.trainer.checkpoint_keep_every),
         checkpoint_buffer=bool(cfg.trainer.checkpoint_buffer),
         eval_at_start=bool(cfg.trainer.eval_at_start),
+        eval_warmup_steps=tuple(int(step) for step in cfg.trainer.eval_warmup_steps),
         heartbeat_secs=float(cfg.trainer.heartbeat_secs),
     )
 

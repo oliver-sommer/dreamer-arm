@@ -694,6 +694,69 @@ def test_eval_at_start_false_waits_for_normal_cadence(monkeypatch: Any) -> None:
     assert eval_calls == 0
 
 
+def test_eval_warmup_steps_fire_once_at_safe_boundaries(monkeypatch: Any) -> None:
+    """Milestones crossed mid-episode wait for the next boundary."""
+    N = 2
+    envs = _MockVectorEnv(num_envs=N, done_every=2)
+    agent = _MockAgent(num_envs=N)
+    cfg = _make_trainer_cfg(
+        steps=16,
+        eval_episode_num=2,
+        eval_every=9999,
+        eval_at_start=False,
+        eval_warmup_steps=(4, 10),
+    )
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
+    eval_steps: list[int] = []
+    monkeypatch.setattr(trainer, "_run_eval", lambda _agent, env_step: eval_steps.append(env_step))
+
+    trainer.begin(agent)
+
+    # 4 is an episode boundary.  10 is crossed halfway through the next
+    # episode, so the shared-env evaluation safely runs at step 12.
+    assert eval_steps == [4, 12]
+
+
+def test_eval_warmup_steps_before_resume_are_not_replayed(monkeypatch: Any) -> None:
+    N = 2
+    envs = _MockVectorEnv(num_envs=N, done_every=1)
+    agent = _MockAgent(num_envs=N)
+    cfg = _make_trainer_cfg(
+        steps=18,
+        eval_episode_num=2,
+        eval_every=9999,
+        eval_at_start=False,
+        eval_warmup_steps=(4, 10, 12),
+    )
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
+    eval_steps: list[int] = []
+    monkeypatch.setattr(trainer, "_run_eval", lambda _agent, env_step: eval_steps.append(env_step))
+
+    trainer.begin(agent, start_step=10)
+
+    assert eval_steps == [12]
+
+
+def test_eval_warmup_and_periodic_trigger_coalesce(monkeypatch: Any) -> None:
+    N = 2
+    envs = _MockVectorEnv(num_envs=N, done_every=1)
+    agent = _MockAgent(num_envs=N)
+    cfg = _make_trainer_cfg(
+        steps=10,
+        eval_episode_num=2,
+        eval_every=4,
+        eval_at_start=False,
+        eval_warmup_steps=(4,),
+    )
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
+    eval_steps: list[int] = []
+    monkeypatch.setattr(trainer, "_run_eval", lambda _agent, env_step: eval_steps.append(env_step))
+
+    trainer.begin(agent)
+
+    assert eval_steps == [4, 8]
+
+
 def test_eval_at_start_is_a_noop_when_eval_disabled(monkeypatch: Any) -> None:
     called = False
 

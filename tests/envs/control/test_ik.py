@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pytest
 
 from dreamer_arm.envs.control.ik import IKConfig, _mat2quat, quat_log_error, solve_dls
 
@@ -79,3 +80,46 @@ def test_solve_dls_joint_clamp() -> None:
     )
     assert np.all(target >= limits[:, 0] + margin - 1e-9)
     assert np.all(target <= limits[:, 1] - margin + 1e-9)
+
+
+def test_orientation_weight_zero_releases_rotational_constraint() -> None:
+    """ori_gain=0 alone still constrains angular velocity; ori_weight=0 must not."""
+    jacobian = np.zeros((6, 2))
+    jacobian[0] = [1.0, 0.0]  # requested translation uses joint 0
+    jacobian[3] = [1.0, 1.0]  # maintaining orientation couples both joints
+    error = np.zeros(6)
+    error[0] = 1.0
+    q = np.zeros(2)
+    limits = np.tile([-10.0, 10.0], (2, 1))
+
+    constrained = solve_dls(
+        jacobian,
+        error,
+        q,
+        q,
+        limits,
+        _make_cfg(
+            nullspace_gain=0.0,
+            max_joint_step=0.0,
+            length_scale=1.0,
+            ori_gain=0.0,
+            ori_weight=1.0,
+        ),
+    )
+    released = solve_dls(
+        jacobian,
+        error,
+        q,
+        q,
+        limits,
+        _make_cfg(
+            nullspace_gain=0.0,
+            max_joint_step=0.0,
+            length_scale=1.0,
+            ori_gain=0.0,
+            ori_weight=0.0,
+        ),
+    )
+
+    assert released[0] > constrained[0]
+    assert released[0] == pytest.approx(1.0 / (1.0 + 0.05**2))

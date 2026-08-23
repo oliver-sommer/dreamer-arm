@@ -13,12 +13,53 @@ def test_controller_metrics_tracks_motion_from_reset_pose() -> None:
     metrics = ControllerMetrics(enabled=True, site_id=0)
     metrics.reset(data)
     data.site_xpos[0] = [0.01, 0.0, 0.0]
-    metrics.accumulate({"cmd_norm": 0.02, "sigma_min": 0.3}, data)
+    metrics.accumulate(
+        {
+            "cmd_norm": 0.02,
+            "cmd_x": 0.02,
+            "cmd_y": 0.0,
+            "cmd_z": 0.0,
+            "err_x": 0.02,
+            "err_y": 0.0,
+            "err_z": 0.0,
+            "sigma_min": 0.3,
+            "ori_error_norm": 0.4,
+            "ori_task_norm": 0.1,
+        },
+        data,
+    )
 
     summary = metrics.summary()
     assert summary is not None
     assert summary["track_ratio_mean"] == pytest.approx(0.5)
     assert summary["frac_stuck"] == 0.0
+    assert summary["ori_error_norm_mean"] == pytest.approx(0.4)
+    assert summary["ori_task_norm_mean"] == pytest.approx(0.1)
+
+
+def test_controller_metrics_does_not_count_orthogonal_drift_as_tracking() -> None:
+    data = SimpleNamespace(site_xpos=np.array([[0.0, 0.0, 0.0]]))
+    metrics = ControllerMetrics(enabled=True, site_id=0)
+    metrics.reset(data)
+    data.site_xpos[0] = [0.0, 0.02, 0.0]
+    metrics.accumulate(
+        {
+            "cmd_norm": 0.02,
+            "cmd_x": 0.02,
+            "cmd_y": 0.0,
+            "cmd_z": 0.0,
+            "err_x": 0.02,
+            "err_y": 0.0,
+            "err_z": 0.0,
+        },
+        data,
+    )
+
+    summary = metrics.summary()
+    assert summary is not None
+    assert summary["track_ratio_mean"] == pytest.approx(0.0)
+    assert summary["motion_ratio_mean"] == pytest.approx(1.0)
+    assert summary["frac_stuck"] == 1.0
 
 
 def test_controller_metrics_copies_mujoco_position_buffer() -> None:

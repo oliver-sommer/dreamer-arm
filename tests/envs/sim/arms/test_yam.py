@@ -79,6 +79,24 @@ def test_yam_tracks_commands_without_sticking() -> None:
     assert float(np.mean(per_direction_stuck)) <= 0.3
 
 
+def test_yam_translation_priority_reaches_task_workspace() -> None:
+    """A task target must not become unreachable just to preserve wrist pose."""
+    inner, arm, site_id = _make_yam_inner()
+    try:
+        inner.reset()
+        target = (np.asarray(inner.goal_space.low) + np.asarray(inner.goal_space.high)) / 2.0
+        for _ in range(300):
+            # Exercise the controller/physics solve without adding error from
+            # the benchmark's separate velocity-to-setpoint feedback loop.
+            arm._x_des = target.copy()
+            inner.step(np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float32))
+        error = float(np.linalg.norm(np.asarray(inner.data.site_xpos[site_id]) - target))
+    finally:
+        inner.close()
+
+    assert error < 0.02
+
+
 def test_yam_exposes_servo_state_after_attach() -> None:
     inner, arm, _ = _make_yam_inner()
     try:

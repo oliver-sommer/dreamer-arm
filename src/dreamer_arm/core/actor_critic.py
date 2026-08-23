@@ -265,6 +265,19 @@ class ActorCritic(nn.Module):
         metrics["weight"] = weight.mean()
         metrics["action_entropy"] = entropy.mean()
         metrics.update(tensorstats(imag_action, "action"))
+        if not self.act_discrete:
+            # The aggregate action_mean mixes XYZ motion with the gripper and
+            # can make a gripper pinned at -1 look like a directional arm
+            # bias.  Keep the aggregate for continuity, but expose the four
+            # semantic control axes separately, including how often each one
+            # is at the environment clamp.
+            action_labels = ("x", "y", "z", "gripper")
+            for index in range(imag_action.shape[-1]):
+                label = action_labels[index] if index < len(action_labels) else str(index)
+                component = imag_action[..., index]
+                metrics[f"action_{label}_mean"] = component.mean()
+                metrics[f"action_{label}_std"] = component.std()
+                metrics[f"action_{label}_frac_saturated"] = (component.abs() >= 1.0 - 1e-6).float().mean()
 
         rep_last = to_f32(data["is_last"]).unsqueeze(-1)
         rep_term = to_f32(data["is_terminal"]).unsqueeze(-1)

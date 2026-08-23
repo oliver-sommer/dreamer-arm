@@ -8,6 +8,7 @@ ee_step_m: 0.05
 damping: 0.10
 nullspace_gain: 1.0
 ori_gain: 1.0
+ori_weight: 0.3
 joint_margin: 0.05
 max_joint_step: 1.0
 max_lead_m: 0.25

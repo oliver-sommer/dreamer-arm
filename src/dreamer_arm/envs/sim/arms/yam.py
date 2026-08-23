@@ -113,6 +113,7 @@ class YamArm:
             damping=cfg.damping,
             nullspace_gain=cfg.nullspace_gain,
             ori_gain=cfg.ori_gain,
+            ori_weight=cfg.ori_weight,
             joint_margin=cfg.joint_margin,
             max_joint_step=cfg.max_joint_step,
             max_lead_m=cfg.max_lead_m,
@@ -177,7 +178,8 @@ class YamArm:
         e_pos = lead
 
         ik_cfg = self._ik_cfg
-        e_ori = cfg.ori_gain * quat_log_error(d.site_xmat[self._grasp_site_id], self._quat_home)
+        ori_error = quat_log_error(d.site_xmat[self._grasp_site_id], self._quat_home)
+        e_ori = cfg.ori_gain * ori_error
 
         # Cap the orientation term relative to the commanded translation.  The
         # full-quaternion error can reach ‖e_ori‖≈2 (a 180° wrist offset) while
@@ -187,7 +189,8 @@ class YamArm:
         # the position command, dragging the TCP off target and freezing the
         # arm.  Capping orientation to the translation budget (floored at
         # 0.3·ee_step so regulation stays alive for near-zero commands)
-        # guarantees position tracking always wins.
+        # ensures the lower-priority orientation task cannot dominate solely
+        # because its raw error is expressed in radians.
         ori_cap = max(float(np.linalg.norm(e_pos)), 0.3 * cfg.ee_step_m)
         ori_norm = float(np.linalg.norm(e_ori))
         ori_capped = ori_norm > ori_cap
@@ -214,9 +217,17 @@ class YamArm:
         # but they diverge once the setpoint accumulates across steps.
         diag: dict[str, float] = {
             "cmd_norm": float(np.linalg.norm(a[:3]) * cfg.ee_step_m),
+            "cmd_x": float(a[0] * cfg.ee_step_m),
+            "cmd_y": float(a[1] * cfg.ee_step_m),
+            "cmd_z": float(a[2] * cfg.ee_step_m),
             "err_norm": float(np.linalg.norm(e_pos)),
+            "err_x": float(e_pos[0]),
+            "err_y": float(e_pos[1]),
+            "err_z": float(e_pos[2]),
             "lead_clamped": float(lead_clamped),
             "ori_capped": float(ori_capped),
+            "ori_error_norm": float(np.linalg.norm(ori_error)),
+            "ori_task_norm": float(np.linalg.norm(e_ori)),
         }
         self._last_diagnostics = diag
         env._ctrl_diag = diag

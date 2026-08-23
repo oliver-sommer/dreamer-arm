@@ -12,13 +12,13 @@ Design notes
   credits; whole credits are drained via ``agent.update`` calls.
 * Eval reuses the train envs (``eval_envs is train_envs``), so no extra EGL
   contexts are created.  Eval is triggered when the step counter crosses a
-  multiple of ``eval_every``, then deferred until an env is at an episode
-  boundary (``is_first.any()``).  ``eval_at_start`` additionally seeds this
-  trigger before the loop's first iteration, so a run's first eval reads the
-  policy exactly as ``begin`` received it -- untrained on a fresh run,
-  whatever ``resume`` restored on a resumed one -- rather than waiting
-  ``eval_every`` steps for a baseline.  The rollout itself lives in
-  :mod:`dreamer_arm.inference.evaluate`.
+  multiple of ``eval_every`` or a one-shot ``eval_warmup_steps`` milestone,
+  then deferred until an env is at an episode boundary (``is_first.any()``).
+  ``eval_at_start`` additionally seeds this trigger before the loop's first
+  iteration, so a run's first eval reads the policy exactly as ``begin``
+  received it -- untrained on a fresh run, whatever ``resume`` restored on a
+  resumed one -- rather than waiting ``eval_every`` steps for a baseline.  The
+  rollout itself lives in :mod:`dreamer_arm.inference.evaluate`.
 * Episode ids are monotonically-increasing int32 counters shared across all
   envs; the SliceSampler uses them to avoid splicing across resets.  The counter
   lives on the trainer and is checkpointed, so a run resumed onto a restored
@@ -63,6 +63,7 @@ class TrainerConfig:
     checkpoint_keep_every: int = 0  # also archive on this grid (0 = no archives)
     checkpoint_buffer: bool = False  # persist the replay buffer beside latest.pt
     eval_at_start: bool = True  # run one eval pass before the first training step
+    eval_warmup_steps: tuple[int, ...] = ()  # additional one-shot eval milestones
     heartbeat_secs: float = 30.0  # console liveness line cadence (0 disables)
 
 
@@ -143,6 +144,15 @@ class OnlineTrainer:
         # when eval is disabled entirely rather than a surprise first pass.
         eval_pending = bool(cfg.eval_at_start and cfg.eval_episode_num > 0 and self._eval_envs is not None)
         _last_eval_trigger = (start_step // cfg.eval_every) * cfg.eval_every
+        # Normalise here as well as validating the Hydra config because unit
+        # tests and library users construct TrainerConfig directly.  bisect
+        # semantics are implemented by advancing past every milestone at or
+        # below start_step: a resumed run evaluates its restored policy via
+        # eval_at_start, but must not replay historical warmup evaluations.
+        _eval_warmup_steps = tuple(sorted({int(step) for step in cfg.eval_warmup_steps if int(step) > 0}))
+        _next_warmup = 0
+        while _next_warmup < len(_eval_warmup_steps) and _eval_warmup_steps[_next_warmup] <= start_step:
+            _next_warmup += 1
         _last_ckpt = (start_step // cfg.checkpoint_every) * cfg.checkpoint_every
         _last_log = (start_step // cfg.update_log_every) * cfg.update_log_every
         # Archives ride a coarser grid than latest.pt.  Watermarked, not
@@ -294,6 +304,16 @@ class OnlineTrainer:
             ):
                 _last_eval_trigger = (env_step // cfg.eval_every) * cfg.eval_every
                 eval_pending = True
+
+            # One-shot early-training evaluations.  Advance across every
+            # crossed milestone so an uneven vector-env step cannot trigger
+            # the same one twice.  A bool is intentional: if a warmup and
+            # periodic trigger become due before the same safe boundary, one
+            # evaluation represents both instead of running identical passes.
+            if cfg.eval_episode_num > 0 and self._eval_envs is not None:
+                while _next_warmup < len(_eval_warmup_steps) and env_step >= _eval_warmup_steps[_next_warmup]:
+                    eval_pending = True
+                    _next_warmup += 1
 
             if env_step - _last_ckpt >= cfg.checkpoint_every:
                 _last_ckpt = (env_step // cfg.checkpoint_every) * cfg.checkpoint_every

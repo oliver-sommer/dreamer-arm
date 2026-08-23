@@ -33,6 +33,11 @@ Composition root for ``configs/envs/sim/controller_bench.yaml``. Modes
               conditioning at the final approach. Replaces the legacy
               workspace-coverage sweep.
 
+    push      YAM-specific staged push diagnostic.  Moves a smooth Cartesian
+              reference above/behind the puck, descends, settles, then pushes
+              through the puck.  Unlike SawyerPushV3Policy it has no hard
+              threshold that can chatter between approach and descend.
+
 ``sweep=true`` runs the mode's evaluation (``probe`` or ``iid``) across a
 small grid of ``ee_step_m`` / ``damping`` / ``max_joint_step`` /
 ``nullspace_gain`` / ``max_lead_m`` instead of the single ``envs.sim.arms.*``
@@ -64,6 +69,7 @@ _SWEEP_GRID: dict[str, tuple[float, ...]] = {
     "damping": (0.05, 0.10, 0.15),
     "max_joint_step": (0.5, 1.0, 1.5),
     "nullspace_gain": (0.5, 1.0),
+    "ori_weight": (0.0, 0.1, 0.3, 1.0),
     "max_lead_m": (0.10, 0.25, 0.40),
 }
 
@@ -76,6 +82,20 @@ class DiagnosticResult:
 
     mode: str
     metrics: dict[str, float]
+
+
+@dataclass(frozen=True)
+class PushStageResult:
+    """Pose/constraint trace summary for one smooth-push stage."""
+
+    steps: int
+    success: bool
+    tcp_error_m: float
+    tcp_z_min_m: float
+    tcp_z_max_m: float
+    z_reversals: int
+    ori_error_max_rad: float
+    joint_limit_clamp_fraction: float
 
 
 def _build_env(arm_cfg: Any, arm_name: str, task: str, seed: int) -> tuple[Any, Any, int]:
@@ -139,7 +159,9 @@ def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int,
                 if cmd > 1e-4:
                     achieved = tcp - prev_tcp
                     achieved_norm = float(np.linalg.norm(achieved))
-                    ratios.append(achieved_norm / cmd)
+                    desired = np.array([diag.get(f"err_{axis}", 0.0) for axis in "xyz"])
+                    desired_norm = float(np.linalg.norm(desired))
+                    ratios.append(float(achieved @ desired) / (desired_norm * cmd) if desired_norm > 1e-12 else 0.0)
                     if achieved_norm > 1e-9:
                         cosines.append(float(achieved @ direction) / achieved_norm)
                 dq_clamped += int(diag.get("dq_clamped", 0.0) > 0.0)
@@ -259,7 +281,10 @@ def _roll_iid(
                 tcp = _tcp(inner, gid)
                 cmd = float(diag.get("cmd_norm", 0.0)) if diag else 0.0
                 if cmd > 1e-4:
-                    ratios.append(float(np.linalg.norm(tcp - prev_tcp)) / cmd)
+                    achieved = tcp - prev_tcp
+                    desired = np.array([diag.get(f"err_{axis}", 0.0) for axis in "xyz"], dtype=np.float64)
+                    desired_norm = float(np.linalg.norm(desired))
+                    ratios.append(float(achieved @ desired) / (desired_norm * cmd) if desired_norm > 1e-12 else 0.0)
                 prev_tcp = tcp
     inner.close()
     arr = np.array(ratios) if ratios else np.zeros(1)
@@ -405,6 +430,191 @@ def run_coverage(cfg: DictConfig) -> dict[str, float]:
     return results
 
 
+def _advance_push_reference(
+    inner: Any,
+    arm: Any,
+    gid: int,
+    target: np.ndarray,
+    *,
+    budget: int,
+    reference_step_m: float,
+    viewer: Any | None = None,
+    realtime: bool = False,
+) -> PushStageResult:
+    """Move the YAM integrated setpoint smoothly to one push waypoint."""
+    import time
+
+    reference = _tcp(inner, gid)
+    settled = 0
+    success = False
+    error = float("inf")
+    tcp_z_min = float("inf")
+    tcp_z_max = -float("inf")
+    previous_z: float | None = None
+    previous_dz = 0.0
+    z_reversals = 0
+    ori_error_max = 0.0
+    joint_limit_clamps = 0
+    for _step in range(1, budget + 1):
+        delta = target - reference
+        distance = float(np.linalg.norm(delta))
+        if distance > 0.0:
+            reference += delta * min(1.0, reference_step_m / distance)
+
+        # This is intentionally a controller/mechanics diagnostic, not an
+        # agent policy.  Driving the integrated reference directly removes
+        # action-integrator windup while retaining the complete IK, joint
+        # servo, collision, and reward paths under test.
+        arm._x_des = reference.copy()
+        _obs, _reward, _terminated, _truncated, info = inner.step(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32))
+        success = success or float(info.get("success", 0.0)) >= 1.0
+        tcp = _tcp(inner, gid)
+        error = float(np.linalg.norm(tcp - target))
+        settled = settled + 1 if distance <= reference_step_m and error < 0.012 else 0
+
+        tcp_z = float(tcp[2])
+        tcp_z_min = min(tcp_z_min, tcp_z)
+        tcp_z_max = max(tcp_z_max, tcp_z)
+        if previous_z is not None:
+            dz = tcp_z - previous_z
+            # Ignore sub-0.1 mm solver/contact noise when counting a visible
+            # reversal; raw sign changes greatly overstate the wiggle.
+            if abs(dz) >= 1e-4:
+                if previous_dz and dz * previous_dz < 0.0:
+                    z_reversals += 1
+                previous_dz = dz
+        previous_z = tcp_z
+
+        diagnostics = arm.last_diagnostics or {}
+        ori_error_max = max(ori_error_max, float(diagnostics.get("ori_error_norm", 0.0)))
+        joint_limit_clamps += int(diagnostics.get("joint_limit_clamped", 0.0) > 0.0)
+
+        if viewer is not None:
+            if not viewer.is_running():
+                break
+            viewer.sync()
+            if realtime:
+                time.sleep(float(inner.model.opt.timestep) * int(inner.frame_skip))
+
+        if settled >= 8 or success:
+            break
+    return PushStageResult(
+        steps=_step,
+        success=success,
+        tcp_error_m=error,
+        tcp_z_min_m=tcp_z_min,
+        tcp_z_max_m=tcp_z_max,
+        z_reversals=z_reversals,
+        ori_error_max_rad=ori_error_max,
+        joint_limit_clamp_fraction=joint_limit_clamps / _step,
+    )
+
+
+def _smooth_push_episode(inner: Any, arm: Any, gid: int, viewer: Any | None = None) -> dict[str, float]:
+    """Run one non-chattering push trajectory and return outcome metrics."""
+    obs, _info = inner.reset()
+    puck_start = np.asarray(obs[4:7], dtype=np.float64).copy()
+    goal = np.asarray(obs[-3:], dtype=np.float64).copy()
+
+    push_direction = goal - puck_start
+    push_direction[2] = 0.0
+    push_direction /= max(float(np.linalg.norm(push_direction)), 1e-9)
+
+    # Place the closed gripper just behind the puck, low enough for its pad
+    # collision boxes to overlap the puck, then carry the reference beyond the
+    # goal so contact is maintained until Meta-World's 5 cm success radius.
+    contact = puck_start - 0.04 * push_direction
+    contact[2] = puck_start[2] + 0.015
+    above = contact.copy()
+    above[2] += 0.10
+    through_goal = goal + 0.15 * push_direction
+    # A mild downward bias counters the wrist's tendency to rise under
+    # horizontal contact load.  The realised TCP remains above the table; the
+    # reference is a force-producing servo target, not an expected pose.
+    through_goal[2] = puck_start[2] - 0.01
+
+    stages = (
+        ("approach", above, 130, 0.00225),
+        ("descend", contact, 90, 0.00150),
+        ("push", through_goal, 260, 0.00090),
+    )
+    total_steps = 0
+    success = False
+    for name, target, budget, reference_step_m in stages:
+        result = _advance_push_reference(
+            inner,
+            arm,
+            gid,
+            target,
+            budget=budget,
+            reference_step_m=reference_step_m,
+            viewer=viewer,
+            realtime=viewer is not None,
+        )
+        total_steps += result.steps
+        success = success or result.success
+        log.info(
+            "  push stage=%-8s steps=%3d tcp_error=%.4f z=[%.4f, %.4f] "
+            "z_reversals=%d ori_max=%.3f limit_clamp=%.2f success=%s",
+            name,
+            result.steps,
+            result.tcp_error_m,
+            result.tcp_z_min_m,
+            result.tcp_z_max_m,
+            result.z_reversals,
+            result.ori_error_max_rad,
+            result.joint_limit_clamp_fraction,
+            success,
+        )
+        if success or (viewer is not None and not viewer.is_running()):
+            break
+
+    final_obs = inner._get_obs()
+    puck_final = np.asarray(final_obs[4:7], dtype=np.float64)
+    return {
+        "success": float(success),
+        "puck_motion_m": float(np.linalg.norm(puck_final - puck_start)),
+        "puck_goal_error_m": float(np.linalg.norm(puck_final - goal)),
+        "controller_steps": float(total_steps),
+    }
+
+
+def run_push(cfg: DictConfig) -> dict[str, float]:
+    """Run the smooth YAM push, optionally repeating it in a live viewer."""
+    import time
+
+    arm_cfg = _arm_cfg_from_cfg(cfg)
+    arm_name = str(cfg.envs.sim.arms.name)
+    if arm_name != "yam":
+        raise ValueError("mode=push requires the YAM arm")
+    if str(cfg.envs.sim.task) not in {"push", "push-v3"}:
+        raise ValueError("mode=push requires envs.sim.task=push")
+
+    inner, arm, gid = _build_env(arm_cfg, arm_name, "push", int(cfg.seed))
+    viewer = None
+    try:
+        if bool(cfg.viewer):
+            import mujoco.viewer
+
+            viewer = mujoco.viewer.launch_passive(inner.model, inner.data)
+
+        episode = 0
+        metrics: dict[str, float] = {}
+        while viewer is None or viewer.is_running():
+            episode += 1
+            metrics = _smooth_push_episode(inner, arm, gid, viewer)
+            log.info("smooth push episode=%d metrics=%s", episode, metrics)
+            if viewer is None:
+                break
+            if viewer.is_running():
+                time.sleep(1.0)
+        return metrics
+    finally:
+        if viewer is not None:
+            viewer.close()
+        inner.close()
+
+
 def run_sweep(cfg: DictConfig) -> None:
     base = _arm_cfg_from_cfg(cfg)
     arm_name = str(cfg.envs.sim.arms.name)
@@ -442,7 +652,7 @@ def run_sweep(cfg: DictConfig) -> None:
             log.info("  %s=%-20s %10.4f %10.4f %10.4f", field, value, track, stuck, cos)
 
 
-_MODES = {"probe": run_probe, "iid": run_iid, "servo": run_servo, "coverage": run_coverage}
+_MODES = {"probe": run_probe, "iid": run_iid, "servo": run_servo, "coverage": run_coverage, "push": run_push}
 
 
 def _run(cfg: DictConfig) -> DiagnosticResult | None:

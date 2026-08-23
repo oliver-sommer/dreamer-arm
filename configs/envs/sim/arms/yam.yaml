@@ -7,7 +7,9 @@
 # damping:         DLS regularisation λ on the length-scaled task Jacobian;
 #                  bounds ‖dq‖ near true kinematic degeneracies
 # nullspace_gain:  strength of home-pose pull in the arm's nullspace
-# ori_gain:        orientation error weight relative to position error
+# ori_gain:        orientation feedback gain
+# ori_weight:      rotational task priority relative to scaled translation;
+#                  0 genuinely disables the orientation constraint
 # joint_margin:    keep joints this far from their hard limits [rad]
 # max_joint_step:  per-step cap on max|dq_i| [rad], applied to the task and
 #                  posture-bias components independently
@@ -23,6 +25,7 @@ ee_step_m: 0.05
 damping: 0.10
 nullspace_gain: 1.0
 ori_gain: 1.0
+ori_weight: 0.3
 joint_margin: 0.05
 max_joint_step: 1.0
 max_lead_m: 0.25

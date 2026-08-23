@@ -198,6 +198,11 @@ def test_default_policy_rate_preserves_metaworld_horizon() -> None:
     assert cfg.envs.sim.action_repeat * cfg.envs.sim.time_limit == 500
 
 
+def test_default_eval_warmup_schedule() -> None:
+    cfg = _compose("training/dreamer", [])
+    assert list(cfg.trainer.eval_warmup_steps) == [1000, 2500, 5000, 10000, 15000]
+
+
 def test_single_task_group_requires_a_task() -> None:
     """`envs/sim=metaworld` leaves envs.sim.task=??? and must fail loudly."""
     cfg = _compose("training/dreamer", ["envs/sim=metaworld"])
@@ -213,6 +218,7 @@ def test_single_task_group_requires_a_task() -> None:
         ("envs.sim.action_repeat=0", "envs.sim.action_repeat must be positive"),
         ("core.buffer.max_size=10", "buffer.max_size"),
         ("trainer.train_ratio=-1", "trainer.train_ratio must be non-negative"),
+        ("trainer.eval_warmup_steps=[0,1000]", "eval_warmup_steps"),
         ("logging.wandb.mode=sometimes", "Unsupported logging.wandb.mode"),
     ],
 )

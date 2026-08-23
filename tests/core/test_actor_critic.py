@@ -46,6 +46,10 @@ def test_actor_critic_loss_shapes_and_gradient(tiny_actor_critic_cfg) -> None:  
         assert losses[key].shape == ()
         assert torch.isfinite(losses[key])
     assert "ret" in metrics and "action_mean" in metrics
+    for label in ("x", "y", "z"):
+        assert f"action_{label}_mean" in metrics
+        assert f"action_{label}_std" in metrics
+        assert f"action_{label}_frac_saturated" in metrics
 
     sum(losses.values()).backward()
     assert feat.grad is not None and torch.isfinite(feat.grad).all()
