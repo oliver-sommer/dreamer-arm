@@ -20,12 +20,14 @@ seed: 0
 # Observation image size [height, width].
 size: [64, 64]
 
-# One policy action per controller step; XYZ is Cartesian velocity.
-action_repeat: 1
+# Hold each Cartesian-velocity action for two 80 Hz controller steps.  The
+# policy observes and acts at 40 Hz while IK is recomputed from measured joints
+# at 80 Hz, so this is a zero-order velocity hold rather than target buildup.
+action_repeat: 2
 
-# Maximum agent steps per episode.  With action_repeat=1 this preserves
-# Meta-World's 500-controller-step, 6.25-second physical horizon.
-time_limit: 500
+# 250 policy steps x 2 controller steps preserves Meta-World's
+# 500-controller-step, 6.25-second physical horizon.
+time_limit: 250
 
 # Total post-repeat env steps to train for.
 steps: 1000000

@@ -28,7 +28,7 @@ class ArmConfig:
     name: str
     """Arm identifier: ``"yam"`` or ``"sawyer"``."""
 
-    max_ee_speed_m_s: float = 0.25
+    max_ee_speed_m_s: float = 0.35
     """Maximum Cartesian speed per axis at action magnitude 1.0 (m/s)."""
 
     damping: float = 0.10
@@ -56,7 +56,7 @@ class ArmConfig:
     joint_margin: float = 0.05
     """Soft joint-limit margin (rad)."""
 
-    max_joint_speed_rad_s: float = 2.0
+    max_joint_speed_rad_s: float = 3.0
     """Maximum joint speed used to bound the IK lookahead (rad/s).
 
     The task and posture components are capped separately before summing, so

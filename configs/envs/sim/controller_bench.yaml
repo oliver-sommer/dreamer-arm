@@ -30,8 +30,8 @@ seed: 0
 envs:
   sim:
     env_num: 1
-    action_repeat: 1
-    time_limit: 500
+    action_repeat: 2
+    time_limit: 250
     task: reach
 
 logdir: logs/controller/${now:%Y-%m-%d}/${now:%H-%M-%S}

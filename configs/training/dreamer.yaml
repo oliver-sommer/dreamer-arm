@@ -46,7 +46,7 @@ trainer:
   steps: ${envs.sim.steps}
   pretrain: 0
   # Eval is expensive with shared train/eval envs: each eval steps the envs
-  # for a full episode (time_limit × env_num global policy steps — 6250 for
+  # for a full episode (time_limit × env_num global policy steps — 12500 for
   # MT50), so eval_every must be several times that or most env
   # compute goes to eval.  The trainer additionally defers shared-env eval to
   # episode boundaries so training episodes are never truncated.

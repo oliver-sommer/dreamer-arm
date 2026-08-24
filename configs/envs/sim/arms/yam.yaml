@@ -16,14 +16,14 @@
 # settle_steps:    physics steps to servo to home pose at each reset
 
 name: yam
-max_ee_speed_m_s: 0.25
+max_ee_speed_m_s: 0.35
 damping: 0.10
 nullspace_gain: 1.0
 ori_gain: 1.0
 max_ori_speed_rad_s: 1.0
 ori_weight: 0.0
 joint_margin: 0.05
-max_joint_speed_rad_s: 2.0
+max_joint_speed_rad_s: 3.0
 joint_target_horizon_s: 0.10
 length_scale: 0.25
 settle_steps: 200
