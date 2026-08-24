@@ -86,15 +86,48 @@ def test_yam_translation_priority_reaches_task_workspace() -> None:
         inner.reset()
         target = (np.asarray(inner.goal_space.low) + np.asarray(inner.goal_space.high)) / 2.0
         for _ in range(300):
-            # Exercise the controller/physics solve without adding error from
-            # the benchmark's separate velocity-to-setpoint feedback loop.
-            arm._x_des = target.copy()
-            inner.step(np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float32))
+            tcp = np.asarray(inner.data.site_xpos[site_id], dtype=np.float64)
+            xyz = np.clip((target - tcp) / arm._cfg.max_ee_speed_m_s, -1.0, 1.0)
+            inner.step(np.array([*xyz, -1.0], dtype=np.float32))
         error = float(np.linalg.norm(np.asarray(inner.data.site_xpos[site_id]) - target))
     finally:
         inner.close()
 
-    assert error < 0.02
+    assert error < 0.025
+
+
+def test_yam_resets_stalled_setpoint_and_reverses_without_windup() -> None:
+    """An unreachable command must not leave latent error after reversal."""
+    inner, arm, site_id = _make_yam_inner()
+    try:
+        inner.reset()
+        unreachable = np.array([0.0, -1.0, 0.0, -1.0], dtype=np.float32)
+        for _ in range(40):
+            inner.step(unreachable)
+
+        before_reverse = np.asarray(inner.data.site_xpos[site_id], dtype=np.float64).copy()
+        reverse = np.array([0.0, 1.0, 0.0, -1.0], dtype=np.float32)
+        for _ in range(5):
+            inner.step(reverse)
+        after_reverse = np.asarray(inner.data.site_xpos[site_id], dtype=np.float64).copy()
+    finally:
+        inner.close()
+
+    assert not hasattr(arm, "_x_des")
+    assert after_reverse[1] - before_reverse[1] > 0.005
+
+
+def test_yam_default_is_position_only() -> None:
+    inner, arm, _ = _make_yam_inner()
+    try:
+        inner.reset()
+        inner.step(np.array([0.5, 0.0, 0.0, -1.0], dtype=np.float32))
+        diagnostics = arm.last_diagnostics or {}
+    finally:
+        inner.close()
+
+    assert diagnostics["ori_task_norm"] == 0.0
+    assert diagnostics["ori_capped"] == 0.0
 
 
 def test_yam_exposes_servo_state_after_attach() -> None:

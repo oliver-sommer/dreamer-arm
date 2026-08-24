@@ -1,9 +1,7 @@
 # @package envs.sim.arms
 # YAM 6-DOF arm — DLS-IK control parameters.
 #
-# ee_step_m:       per-action increment [metres] to the accumulated TCP
-#                  setpoint at action magnitude 1.0 (not a per-step bound —
-#                  see max_lead_m)
+# max_ee_speed_m_s: maximum Cartesian speed per axis at action magnitude 1
 # damping:         DLS regularisation λ on the length-scaled task Jacobian;
 #                  bounds ‖dq‖ near true kinematic degeneracies
 # nullspace_gain:  strength of home-pose pull in the arm's nullspace
@@ -11,23 +9,21 @@
 # ori_weight:      rotational task priority relative to scaled translation;
 #                  0 genuinely disables the orientation constraint
 # joint_margin:    keep joints this far from their hard limits [rad]
-# max_joint_step:  per-step cap on max|dq_i| [rad], applied to the task and
-#                  posture-bias components independently
-# max_lead_m:      leash [metres] bounding how far the accumulated TCP
-#                  setpoint may lead the actual TCP — the real per-step
-#                  task-error bound
+# max_joint_speed_rad_s: speed used to cap the IK joint-target lookahead
+# joint_target_horizon_s: stateless position-servo lookahead duration
 # length_scale:    characteristic length [metres] used to make the DLS
 #                  Jacobian's position and orientation rows unit-consistent
 # settle_steps:    physics steps to servo to home pose at each reset
 
 name: yam
-ee_step_m: 0.05
+max_ee_speed_m_s: 0.25
 damping: 0.10
 nullspace_gain: 1.0
 ori_gain: 1.0
-ori_weight: 0.3
+max_ori_speed_rad_s: 1.0
+ori_weight: 0.0
 joint_margin: 0.05
-max_joint_step: 1.0
-max_lead_m: 0.25
+max_joint_speed_rad_s: 2.0
+joint_target_horizon_s: 0.10
 length_scale: 0.25
 settle_steps: 200

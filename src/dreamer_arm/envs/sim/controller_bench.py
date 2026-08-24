@@ -39,9 +39,8 @@ Composition root for ``configs/envs/sim/controller_bench.yaml``. Modes
               threshold that can chatter between approach and descend.
 
 ``sweep=true`` runs the mode's evaluation (``probe`` or ``iid``) across a
-small grid of ``ee_step_m`` / ``damping`` / ``max_joint_step`` /
-``nullspace_gain`` / ``max_lead_m`` instead of the single ``envs.sim.arms.*``
-configuration, printing one summary row per (field, value) combination.
+small grid of controller speed, damping, joint-speed, nullspace, orientation,
+and lookahead settings, printing one summary row per field/value combination.
 """
 
 from __future__ import annotations
@@ -65,12 +64,12 @@ _AXIS_DIRS: tuple[np.ndarray, ...] = tuple(
 # Grid probed by `sweep=true`, one field varied at a time from the base
 # (`envs.sim.arms.*`) config.
 _SWEEP_GRID: dict[str, tuple[float, ...]] = {
-    "ee_step_m": (0.02, 0.05, 0.08),
+    "max_ee_speed_m_s": (0.15, 0.25, 0.40),
     "damping": (0.05, 0.10, 0.15),
-    "max_joint_step": (0.5, 1.0, 1.5),
+    "max_joint_speed_rad_s": (1.0, 2.0, 3.0),
     "nullspace_gain": (0.5, 1.0),
     "ori_weight": (0.0, 0.1, 0.3, 1.0),
-    "max_lead_m": (0.10, 0.25, 0.40),
+    "joint_target_horizon_s": (0.05, 0.10, 0.20),
 }
 
 _SERVO_CHECKPOINTS: tuple[int, ...] = (1, 2, 5, 10, 20, 50, 100)
@@ -149,7 +148,7 @@ def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int,
         action = np.array([*(0.7 * direction), -1.0], dtype=np.float32)
         ratios: list[float] = []
         cosines: list[float] = []
-        dq_clamped = ori_capped = lead_clamped = n = 0
+        dq_clamped = joint_limit_clamped = ori_capped = n = 0
         for _t in range(horizon):
             inner.step(action)
             diag = arm.last_diagnostics
@@ -159,14 +158,14 @@ def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int,
                 if cmd > 1e-4:
                     achieved = tcp - prev_tcp
                     achieved_norm = float(np.linalg.norm(achieved))
-                    desired = np.array([diag.get(f"err_{axis}", 0.0) for axis in "xyz"])
+                    desired = np.array([diag.get(f"cmd_{axis}", 0.0) for axis in "xyz"])
                     desired_norm = float(np.linalg.norm(desired))
                     ratios.append(float(achieved @ desired) / (desired_norm * cmd) if desired_norm > 1e-12 else 0.0)
                     if achieved_norm > 1e-9:
                         cosines.append(float(achieved @ direction) / achieved_norm)
                 dq_clamped += int(diag.get("dq_clamped", 0.0) > 0.0)
+                joint_limit_clamped += int(diag.get("joint_limit_clamped", 0.0) > 0.0)
                 ori_capped += int(diag.get("ori_capped", 0.0) > 0.0)
-                lead_clamped += int(diag.get("lead_clamped", 0.0) > 0.0)
                 n += 1
             prev_tcp = tcp
         # "Steady state" = the last quarter of the horizon, once the servo
@@ -180,8 +179,8 @@ def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int,
                 "cos_mean": float(np.mean(cosines)) if cosines else 0.0,
                 "frac_stuck": float(np.mean([r < 0.25 for r in ratios])) if ratios else 1.0,
                 "frac_dq_clamped": dq_clamped / n if n else 0.0,
+                "frac_joint_limit_clamped": joint_limit_clamped / n if n else 0.0,
                 "frac_ori_capped": ori_capped / n if n else 0.0,
-                "frac_lead_clamped": lead_clamped / n if n else 0.0,
             }
         )
     inner.close()
@@ -192,8 +191,8 @@ def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int,
         "cos_mean",
         "frac_stuck",
         "frac_dq_clamped",
+        "frac_joint_limit_clamped",
         "frac_ori_capped",
-        "frac_lead_clamped",
     )
     agg = {k: float(np.mean([row[k] for row in rows])) for k in agg_keys}
     return {"rows": rows, "agg": agg}
@@ -218,8 +217,8 @@ def run_probe(cfg: DictConfig) -> dict[str, float]:
         "cos",
         "stuck",
         "dq_clmp",
+        "jnt_clmp",
         "ori_cap",
-        "lead_clm",
     )
     for row in result["rows"]:
         d = row["direction"]
@@ -233,8 +232,8 @@ def run_probe(cfg: DictConfig) -> dict[str, float]:
             row["cos_mean"],
             row["frac_stuck"],
             row["frac_dq_clamped"],
+            row["frac_joint_limit_clamped"],
             row["frac_ori_capped"],
-            row["frac_lead_clamped"],
         )
     agg = result["agg"]
     log.info(
@@ -245,8 +244,8 @@ def run_probe(cfg: DictConfig) -> dict[str, float]:
         agg["cos_mean"],
         agg["frac_stuck"],
         agg["frac_dq_clamped"],
+        agg["frac_joint_limit_clamped"],
         agg["frac_ori_capped"],
-        agg["frac_lead_clamped"],
     )
     return agg
 
@@ -270,6 +269,12 @@ def _roll_iid(
     inner, arm, gid = _build_env(arm_cfg, arm_name, task, seed)
     rng = np.random.default_rng(seed)
     ratios: list[float] = []
+    diag_counts = {
+        "dq_clamped": 0,
+        "joint_limit_clamped": 0,
+        "ori_capped": 0,
+    }
+    diag_n = 0
     for _ep in range(n_episodes):
         inner.reset()
         prev_tcp = _tcp(inner, gid)
@@ -279,20 +284,26 @@ def _roll_iid(
                 inner.step(a)
                 diag = arm.last_diagnostics
                 tcp = _tcp(inner, gid)
+                if diag:
+                    diag_n += 1
+                    for key in diag_counts:
+                        diag_counts[key] += int(diag.get(key, 0.0) > 0.0)
                 cmd = float(diag.get("cmd_norm", 0.0)) if diag else 0.0
                 if cmd > 1e-4:
                     achieved = tcp - prev_tcp
-                    desired = np.array([diag.get(f"err_{axis}", 0.0) for axis in "xyz"], dtype=np.float64)
+                    desired = np.array([diag.get(f"cmd_{axis}", 0.0) for axis in "xyz"], dtype=np.float64)
                     desired_norm = float(np.linalg.norm(desired))
                     ratios.append(float(achieved @ desired) / (desired_norm * cmd) if desired_norm > 1e-12 else 0.0)
                 prev_tcp = tcp
     inner.close()
     arr = np.array(ratios) if ratios else np.zeros(1)
-    return {
+    result = {
         "track_ratio_mean": float(arr.mean()),
         "frac_stuck": float((arr < 0.25).mean()),
         "n_samples": float(len(ratios)),
     }
+    result.update({f"frac_{key}": count / diag_n if diag_n else 0.0 for key, count in diag_counts.items()})
+    return result
 
 
 def run_iid(cfg: DictConfig) -> dict[str, float]:
@@ -441,10 +452,9 @@ def _advance_push_reference(
     viewer: Any | None = None,
     realtime: bool = False,
 ) -> PushStageResult:
-    """Move the YAM integrated setpoint smoothly to one push waypoint."""
+    """Pursue one push waypoint with smooth Cartesian velocity commands."""
     import time
 
-    reference = _tcp(inner, gid)
     settled = 0
     success = False
     error = float("inf")
@@ -456,17 +466,18 @@ def _advance_push_reference(
     ori_error_max = 0.0
     joint_limit_clamps = 0
     for _step in range(1, budget + 1):
-        delta = target - reference
+        delta = target - _tcp(inner, gid)
         distance = float(np.linalg.norm(delta))
+        requested_step = np.zeros(3)
         if distance > 0.0:
-            reference += delta * min(1.0, reference_step_m / distance)
+            requested_step = delta * min(1.0, reference_step_m / distance)
 
         # This is intentionally a controller/mechanics diagnostic, not an
-        # agent policy.  Driving the integrated reference directly removes
-        # action-integrator windup while retaining the complete IK, joint
-        # servo, collision, and reward paths under test.
-        arm._x_des = reference.copy()
-        _obs, _reward, _terminated, _truncated, info = inner.step(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32))
+        # agent policy.  It retains the complete IK, joint-servo, collision,
+        # and reward paths under test.
+        dt = float(inner.model.opt.timestep) * int(inner.frame_skip)
+        xyz = requested_step / (dt * arm._cfg.max_ee_speed_m_s)
+        _obs, _reward, _terminated, _truncated, info = inner.step(np.array([*xyz, 1.0], dtype=np.float32))
         success = success or float(info.get("success", 0.0)) >= 1.0
         tcp = _tcp(inner, gid)
         error = float(np.linalg.norm(tcp - target))
@@ -536,7 +547,7 @@ def _smooth_push_episode(inner: Any, arm: Any, gid: int, viewer: Any | None = No
     stages = (
         ("approach", above, 130, 0.00225),
         ("descend", contact, 90, 0.00150),
-        ("push", through_goal, 260, 0.00090),
+        ("push", through_goal, 260, 0.00300),
     )
     total_steps = 0
     success = False

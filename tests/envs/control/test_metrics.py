@@ -19,6 +19,8 @@ def test_controller_metrics_tracks_motion_from_reset_pose() -> None:
             "cmd_x": 0.02,
             "cmd_y": 0.0,
             "cmd_z": 0.0,
+            "cmd_speed_m_s": 0.2,
+            "ik_step_norm": 0.02,
             "err_x": 0.02,
             "err_y": 0.0,
             "err_z": 0.0,
@@ -35,6 +37,10 @@ def test_controller_metrics_tracks_motion_from_reset_pose() -> None:
     assert summary["frac_stuck"] == 0.0
     assert summary["ori_error_norm_mean"] == pytest.approx(0.4)
     assert summary["ori_task_norm_mean"] == pytest.approx(0.1)
+    assert summary["cmd_x_mean"] == pytest.approx(0.02)
+    assert summary["cmd_x_abs_mean"] == pytest.approx(0.02)
+    assert summary["cmd_speed_m_s_mean"] == pytest.approx(0.2)
+    assert summary["ik_step_norm_mean"] == pytest.approx(0.02)
 
 
 def test_controller_metrics_does_not_count_orthogonal_drift_as_tracking() -> None:

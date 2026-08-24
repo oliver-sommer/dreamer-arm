@@ -4,24 +4,13 @@ The YAM arm has 6 position-actuated joints (``joint1``…``joint6``) plus a
 ``gripper`` actuator driving the ``left_finger`` slide joint (``right_finger``
 is mirrored via an equality constraint).
 
-Key design choices that address the old failure modes:
-- An *integrated* Cartesian setpoint (``_x_des``), leashed to within
-  ``max_lead_m`` of the actual TCP, replaces a per-step relative delta.  The
-  MuJoCo position servos take several control steps (~10 at the default
-  gains) to realise a commanded joint increment; re-deriving the setpoint
-  from the freshly measured joint angle every step (as the old design did)
-  made it retreat by the same amount each cycle, so the arm crawled at a few
-  percent of the commanded rate and never converged (``ctrl_frac_stuck≈1``).
-  Integrating the setpoint gives the servo many cycles to catch up instead.
-- Constant-λ DLS on a length-scaled Jacobian bounds ``‖dq‖`` everywhere — no
-  stuck-detector needed.
-- Nullspace posture bias continuously repels from joint limits.
-- Joint target clamping (task and posture components independently, not
-  velocity gating) keeps the actuator live.
-- Position actuators + ``do_simulation`` give real friction for object transport.
-- Dual ``[-1, 1]`` clamp: the agent-side clamp (``core/actor_critic.py``,
-  ``sanitize_action``) is authoritative for buffer / RSSM; this env-side
-  clamp guards the contract boundary against warmup / eval / scripted callers.
+Control contract:
+- XYZ actions are bounded Cartesian velocities.
+- Each call computes IK from measured joints; no Cartesian target is retained.
+- A short joint-position lookahead preserves position-servo contact authority.
+- Damped IK, posture bias, and soft joint limits bound the solve.
+- Orientation is optional and disabled by default for the restricted wrist.
+- The gripper action remains a direct bounded position command.
 """
 
 from __future__ import annotations
@@ -59,7 +48,6 @@ class YamArm:
         self._grasp_site_id: int | None = None
         self._q_home: np.ndarray | None = None  # (6,) home joint angles
         self._quat_home: np.ndarray | None = None  # (4,) [w,x,y,z] home EE orientation
-        self._x_des: np.ndarray | None = None  # (3,) integrated Cartesian TCP setpoint
         self._ik_cfg: IKConfig | None = None  # built once in attach(); cfg is immutable
         self._jacp: np.ndarray | None = None  # (3, m.nv) Jacobian scratch, reused every step
         self._jacr: np.ndarray | None = None  # (3, m.nv) Jacobian scratch, reused every step
@@ -109,14 +97,11 @@ class YamArm:
         # Cache immutable config and fixed-size scratch arrays across 80 Hz calls.
         cfg = self._cfg
         self._ik_cfg = IKConfig(
-            ee_step_m=cfg.ee_step_m,
             damping=cfg.damping,
-            nullspace_gain=cfg.nullspace_gain,
-            ori_gain=cfg.ori_gain,
+            nullspace_gain=cfg.nullspace_gain * cfg.joint_target_horizon_s,
             ori_weight=cfg.ori_weight,
             joint_margin=cfg.joint_margin,
-            max_joint_step=cfg.max_joint_step,
-            max_lead_m=cfg.max_lead_m,
+            max_joint_step=cfg.max_joint_speed_rad_s * cfg.joint_target_horizon_s,
             length_scale=cfg.length_scale,
         )
         self._jacp = np.zeros((3, m.nv))
@@ -151,51 +136,34 @@ class YamArm:
 
         cfg = self._cfg
         q = d.qpos[self._arm_qadr].copy()
-        tcp = np.asarray(d.site_xpos[self._grasp_site_id], dtype=np.float64)
+        tcp = np.asarray(d.site_xpos[self._grasp_site_id], dtype=np.float64).copy()
 
-        # Guard: if physics has already blown up (NaN/Inf), don't propagate
-        # into ctrl and don't corrupt the integrated setpoint with a NaN TCP
-        # — just forward with the current ctrl.
+        # Guard: if physics has already blown up (NaN/Inf), do not propagate
+        # invalid values into actuator controls.
         if not np.all(np.isfinite(q)) or not np.all(np.isfinite(tcp)):
             mujoco.mj_forward(m, d)
             return
 
-        # x_des integrates the action across steps rather than resetting to
-        # `tcp + delta` every step (see module docstring): the servo gets
-        # many control steps to close the gap instead of one that mostly
-        # fails.  The leash retracts x_des back to within max_lead_m of the
-        # *actual* tcp every step, so it cannot wind up unboundedly ahead
-        # while the arm is still catching up.
-        if self._x_des is None:
-            self._x_des = tcp.copy()
-        self._x_des = self._x_des + a[:3] * cfg.ee_step_m
-        lead = self._x_des - tcp
-        lead_norm = float(np.linalg.norm(lead))
-        lead_clamped = lead_norm > cfg.max_lead_m
-        if lead_clamped and lead_norm > 0.0:
-            lead = lead * (cfg.max_lead_m / lead_norm)
-            self._x_des = tcp + lead
-        e_pos = lead
+        # Interpret policy XYZ as Cartesian velocity.  The IK solve uses a
+        # short stateless lookahead so reversing the action reverses the joint
+        # target immediately, with no unreachable Cartesian target to unwind.
+        control_dt = float(m.opt.timestep) * int(env.frame_skip)
+        velocity = a[:3] * cfg.max_ee_speed_m_s
+        e_pos = velocity * cfg.joint_target_horizon_s
 
         ik_cfg = self._ik_cfg
         ori_error = quat_log_error(d.site_xmat[self._grasp_site_id], self._quat_home)
-        e_ori = cfg.ori_gain * ori_error
+        angular_velocity = cfg.ori_gain * ori_error if cfg.ori_weight > 0.0 else np.zeros(3)
 
-        # Cap the orientation term relative to the commanded translation.  The
-        # full-quaternion error can reach ‖e_ori‖≈2 (a 180° wrist offset) while
-        # the translation error is ‖e_pos‖≤max_lead_m·√3 — uncapped, the 6-D
-        # DLS solve spends almost all of dq chasing an orientation the wrist
-        # often *cannot* reach (its joints are limited to ±π/2) and starves
-        # the position command, dragging the TCP off target and freezing the
-        # arm.  Capping orientation to the translation budget (floored at
-        # 0.3·ee_step so regulation stays alive for near-zero commands)
-        # ensures the lower-priority orientation task cannot dominate solely
-        # because its raw error is expressed in radians.
-        ori_cap = max(float(np.linalg.norm(e_pos)), 0.3 * cfg.ee_step_m)
-        ori_norm = float(np.linalg.norm(e_ori))
-        ori_capped = ori_norm > ori_cap
+        # Bound optional orientation feedback independently.  The YAM default
+        # sets ori_weight=0 because preserving the home wrist pose across the
+        # full task workspace can conflict with translation.
+        ori_cap = cfg.max_ori_speed_rad_s
+        ori_norm = float(np.linalg.norm(angular_velocity))
+        ori_capped = cfg.ori_weight > 0.0 and ori_norm > ori_cap
         if ori_capped and ori_norm > 0.0:
-            e_ori = e_ori * (ori_cap / ori_norm)
+            angular_velocity = angular_velocity * (ori_cap / ori_norm)
+        e_ori = angular_velocity * cfg.joint_target_horizon_s
         e = np.concatenate([e_pos, e_ori])
 
         # mj_jacSite overwrites self._jacp/self._jacr in place; J below is a
@@ -211,20 +179,16 @@ class YamArm:
         # Per-step controller diagnostics (read by MetaWorldEnv into info so the
         # trainer can log episode aggregates: singularity, orientation fighting,
         # joint-velocity saturation, commanded vs achieved TCP motion).
-        # `cmd_norm` is the raw per-step action request (‖a[:3]‖·ee_step_m);
-        # `err_norm` is the leash-bounded tracking error actually servoed
-        # this step — under the old (unintegrated) design the two coincided,
-        # but they diverge once the setpoint accumulates across steps.
+        # cmd_* describes the physical displacement requested during this
+        # control interval; ik_step_norm is the longer position-servo lookahead.
+        cmd_delta = velocity * control_dt
         diag: dict[str, float] = {
-            "cmd_norm": float(np.linalg.norm(a[:3]) * cfg.ee_step_m),
-            "cmd_x": float(a[0] * cfg.ee_step_m),
-            "cmd_y": float(a[1] * cfg.ee_step_m),
-            "cmd_z": float(a[2] * cfg.ee_step_m),
-            "err_norm": float(np.linalg.norm(e_pos)),
-            "err_x": float(e_pos[0]),
-            "err_y": float(e_pos[1]),
-            "err_z": float(e_pos[2]),
-            "lead_clamped": float(lead_clamped),
+            "cmd_norm": float(np.linalg.norm(cmd_delta)),
+            "cmd_x": float(cmd_delta[0]),
+            "cmd_y": float(cmd_delta[1]),
+            "cmd_z": float(cmd_delta[2]),
+            "cmd_speed_m_s": float(np.linalg.norm(velocity)),
+            "ik_step_norm": float(np.linalg.norm(e_pos)),
             "ori_capped": float(ori_capped),
             "ori_error_norm": float(np.linalg.norm(ori_error)),
             "ori_task_norm": float(np.linalg.norm(e_ori)),
@@ -266,10 +230,6 @@ class YamArm:
         ctrl[self._grip_act_id] = _GRIPPER_MAX_OPEN  # open at reset
         env.do_simulation(ctrl, n_frames)
         mujoco.mj_forward(m, d)
-
-        # Re-seed the integrated Cartesian setpoint at the settled TCP so it
-        # cannot carry a stale lead across episodes.
-        self._x_des = np.asarray(d.site_xpos[self._grasp_site_id], dtype=np.float64).copy()
 
         # tcp_center = mean of leftEndEffector / rightEndEffector sites
         env.init_tcp = env.tcp_center.copy()

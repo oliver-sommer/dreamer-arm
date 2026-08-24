@@ -28,9 +28,8 @@ class ArmConfig:
     name: str
     """Arm identifier: ``"yam"`` or ``"sawyer"``."""
 
-    ee_step_m: float = 0.05
-    """Per-action increment (m) to the accumulated TCP setpoint when action
-    magnitude is 1.0 — not a per-step displacement bound; see max_lead_m."""
+    max_ee_speed_m_s: float = 0.25
+    """Maximum Cartesian speed per axis at action magnitude 1.0 (m/s)."""
 
     damping: float = 0.10
     """DLS regularisation λ on the length-scaled task Jacobian (dimensionless
@@ -40,35 +39,37 @@ class ArmConfig:
     overshoot/reversal transients a reversing policy induces."""
 
     nullspace_gain: float = 1.0
-    """Posture-bias gain; pulls joints toward home configuration."""
+    """Posture-bias rate (1/s); pulls joints toward home configuration."""
 
     ori_gain: float = 1.0
-    """Feedback gain on orientation error in the DLS task vector."""
+    """Orientation feedback gain (1/s)."""
 
-    ori_weight: float = 0.3
+    max_ori_speed_rad_s: float = 1.0
+    """Angular-speed cap for orientation feedback (rad/s)."""
+
+    ori_weight: float = 0.0
     """Relative priority of orientation versus unit-scaled translation in
     the DLS objective.  Unlike ori_gain, zero truly disables the rotational
-    constraint.  A sub-unit default prevents orientation maintenance from
-    starving translation on this 6-DOF arm."""
+    constraint.  The YAM default is position-only because its restricted
+    wrist cannot preserve the home orientation across the task workspace."""
 
     joint_margin: float = 0.05
     """Soft joint-limit margin (rad)."""
 
-    max_joint_step: float = 1.0
-    """Per-step cap on max |dq_i| (rad), applied separately to the task and
-    posture-bias components (so the combined dq can reach up to 2x this in
-    the worst case); preserves IK direction, prevents near-singular or
-    orientation-dominated steps from slamming joints to limits.  Chosen via
-    sweep: the MuJoCo position servo only realises a few percent of a
-    commanded joint increment per 12.5ms control step, so a setpoint cap
-    anywhere near typical steady-state joint velocities starves the servo of
-    the lead it needs — this is a setpoint-target bound, not a realised
-    velocity bound."""
+    max_joint_speed_rad_s: float = 2.0
+    """Maximum joint speed used to bound the IK lookahead (rad/s).
 
-    max_lead_m: float = 0.25
-    """Leash (metres) bounding how far the accumulated TCP setpoint may lead
-    the actual TCP — the real per-step task-error bound (ee_step_m is only
-    the per-action increment to that setpoint).  Chosen via sweep."""
+    The task and posture components are capped separately before summing, so
+    their combined implied speed can reach twice this value in the worst case.
+    """
+
+    joint_target_horizon_s: float = 0.10
+    """Short lookahead used to turn Cartesian velocity into an IK displacement.
+
+    Position servos need a target ahead of the measured joints to produce
+    useful contact force; this horizon supplies that lead without retaining
+    state across controller steps.
+    """
 
     length_scale: float = 0.25
     """Characteristic length (metres) used to make the DLS Jacobian's

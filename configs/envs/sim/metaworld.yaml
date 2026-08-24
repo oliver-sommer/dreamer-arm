@@ -20,9 +20,7 @@ seed: 0
 # Observation image size [height, width].
 size: [64, 64]
 
-# Do not repeat Cartesian delta actions.  YamArm integrates every received
-# delta into its TCP setpoint, so repeating one policy action would multiply
-# the requested displacement and rapidly saturate the setpoint leash.
+# One policy action per controller step; XYZ is Cartesian velocity.
 action_repeat: 1
 
 # Maximum agent steps per episode.  With action_repeat=1 this preserves

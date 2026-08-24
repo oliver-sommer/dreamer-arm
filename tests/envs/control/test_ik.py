@@ -10,10 +10,8 @@ from dreamer_arm.envs.control.ik import IKConfig, _mat2quat, quat_log_error, sol
 
 def _make_cfg(**kwargs: Any) -> IKConfig:
     defaults: dict[str, Any] = {
-        "ee_step_m": 0.05,
         "damping": 0.05,
         "nullspace_gain": 1.0,
-        "ori_gain": 1.0,
         "joint_margin": 0.05,
     }
     defaults.update(kwargs)
@@ -70,6 +68,7 @@ def test_quat_log_error_nonzero() -> None:
 def test_solve_dls_joint_clamp() -> None:
     margin = 0.1
     limits = np.tile([-1.5, 1.5], (6, 1))
+    diagnostics: dict[str, float] = {}
     target = solve_dls(
         np.eye(6),
         np.ones(6) * 0.5,
@@ -77,13 +76,16 @@ def test_solve_dls_joint_clamp() -> None:
         np.zeros(6),
         limits,
         _make_cfg(joint_margin=margin),
+        diag=diagnostics,
     )
     assert np.all(target >= limits[:, 0] + margin - 1e-9)
     assert np.all(target <= limits[:, 1] - margin + 1e-9)
+    assert diagnostics["joint_limit_clamped"] == 1.0
+    assert any(diagnostics[f"joint_{i}_limit_clamped"] == 1.0 for i in range(1, 7))
 
 
 def test_orientation_weight_zero_releases_rotational_constraint() -> None:
-    """ori_gain=0 alone still constrains angular velocity; ori_weight=0 must not."""
+    """Zero orientation weight must remove the rotational constraint."""
     jacobian = np.zeros((6, 2))
     jacobian[0] = [1.0, 0.0]  # requested translation uses joint 0
     jacobian[3] = [1.0, 1.0]  # maintaining orientation couples both joints
@@ -102,7 +104,6 @@ def test_orientation_weight_zero_releases_rotational_constraint() -> None:
             nullspace_gain=0.0,
             max_joint_step=0.0,
             length_scale=1.0,
-            ori_gain=0.0,
             ori_weight=1.0,
         ),
     )
@@ -116,7 +117,6 @@ def test_orientation_weight_zero_releases_rotational_constraint() -> None:
             nullspace_gain=0.0,
             max_joint_step=0.0,
             length_scale=1.0,
-            ori_gain=0.0,
             ori_weight=0.0,
         ),
     )

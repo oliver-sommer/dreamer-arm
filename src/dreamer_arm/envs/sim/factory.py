@@ -274,7 +274,7 @@ def build_from_config(cfg: Any, *, viewer: bool = False) -> SyncVectorEnv:
     arm_cfg: ArmConfig | None = None
     if arm_node is not None:
         extra["arm"] = str(arm_node.name)
-        # Forward the *whole* arm group (ee_step_m, damping, ...) into the
+        # Forward the complete arm-controller group into the
         # controller — previously only `.name` made it through, so every IK
         # tuning knob in configs/envs/sim/arms/*.yaml was silently ignored.
         arm_cfg = ArmConfig(**OmegaConf.to_container(arm_node, resolve=True))

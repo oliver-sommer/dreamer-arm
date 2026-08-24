@@ -24,12 +24,6 @@ import numpy as np
 class IKConfig:
     """Tuning parameters for the DLS-IK controller."""
 
-    ee_step_m: float = 0.05
-    """Per-action increment (metres) to the accumulated TCP setpoint when
-    action magnitude == 1.0.  Not a per-step displacement bound — see
-    ``max_lead_m``, which is what actually limits ‖e_pos‖ (and therefore
-    ``dq``) at each control step."""
-
     damping: float = 0.10
     """DLS regularisation λ on the length-scaled task Jacobian (see
     ``length_scale``), where singular values are dimensionless and centred
@@ -40,10 +34,7 @@ class IKConfig:
     nullspace_gain: float = 1.0
     """Gain on the posture bias (q_home - q) projected into the null-space."""
 
-    ori_gain: float = 1.0
-    """Feedback gain on the orientation error component."""
-
-    ori_weight: float = 0.3
+    ori_weight: float = 0.0
     """Relative priority of the rotational task rows in the DLS objective.
 
     This must weight both the rotational Jacobian and error.  Scaling only
@@ -63,12 +54,6 @@ class IKConfig:
     summed (so a small posture correction never steals clamp headroom from
     the commanded task motion, and vice versa — though the combined dq can
     reach up to 2x this in the worst case).  ``0`` disables the clamp."""
-
-    max_lead_m: float = 0.25
-    """Leash (metres) on how far the accumulated TCP setpoint may lead the
-    actual TCP, i.e. a hard cap on ‖e_pos‖.  This — not ``ee_step_m`` — is
-    what bounds the per-step task error (and therefore ``dq``) once the
-    setpoint is integrated across steps rather than reset every step."""
 
     length_scale: float = 0.25
     """Characteristic length (metres) used to make the stacked position
@@ -232,9 +217,12 @@ def solve_dls(
     )
 
     if diag is not None:
+        joint_limit_mask = q_target != q_unclipped
         diag["dq_max"] = float(np.abs(dq).max())
         diag["dq_clamped"] = float(task_clamped)
-        diag["joint_limit_clamped"] = float(not np.array_equal(q_target, q_unclipped))
+        diag["joint_limit_clamped"] = float(np.any(joint_limit_mask))
+        for i, clamped in enumerate(joint_limit_mask, start=1):
+            diag[f"joint_{i}_limit_clamped"] = float(clamped)
         if sigma_min:
             try:
                 # Keep conditioning comparable across ori_weight ablations:
