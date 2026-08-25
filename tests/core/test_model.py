@@ -64,6 +64,12 @@ def _run_smoke(agent: Dreamer, batch_length: int, task_count: int = 0) -> None:
         assert policy_diag["post_mode"].shape == action.shape
         assert policy_diag["pre_mean"].shape == action.shape
         assert policy_diag["pre_std"].shape == action.shape
+        if "proprio" in next_state:
+            assert policy_diag["proprio_action_sensitivity"].shape == (_N,)
+            assert torch.isfinite(policy_diag["proprio_action_sensitivity"]).all()
+        if task_count:
+            assert policy_diag["task_id_action_sensitivity"].shape == (_N,)
+            assert torch.isfinite(policy_diag["task_id_action_sensitivity"]).all()
 
         td = TensorDict(
             {

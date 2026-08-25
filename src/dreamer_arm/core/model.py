@@ -182,9 +182,29 @@ class Dreamer(nn.Module):
 
         Evaluation calls this immediately after :meth:`act`, so it measures
         the same frozen world-model feature and actor parameters without a
-        second image-encoder pass.
+        second image-encoder pass. DINO-WM additionally reports counterfactual
+        action changes when task identity is changed or proprioception is
+        ablated while the visual state stays fixed. These directly detect the
+        conditioning-collapse failure that aggregate action variance misses.
         """
-        return self.ac.policy_diagnostics(self.frozen_wm.get_feat(dict(state)))
+        wm_state = dict(state)
+        diagnostics = self.ac.policy_diagnostics(self.frozen_wm.get_feat(wm_state))
+        baseline = diagnostics["post_mode"]
+
+        task_id = wm_state.get("task_id")
+        if task_id is not None and task_id.shape[-1] > 1:
+            counterfactual = dict(wm_state)
+            counterfactual["task_id"] = torch.roll(task_id, shifts=1, dims=-1)
+            task_action = self.ac.policy_diagnostics(self.frozen_wm.get_feat(counterfactual))["post_mode"]
+            diagnostics["task_id_action_sensitivity"] = (task_action - baseline).abs().mean(dim=-1)
+
+        proprio = wm_state.get("proprio")
+        if proprio is not None:
+            counterfactual = dict(wm_state)
+            counterfactual["proprio"] = torch.zeros_like(proprio)
+            proprio_action = self.ac.policy_diagnostics(self.frozen_wm.get_feat(counterfactual))["post_mode"]
+            diagnostics["proprio_action_sensitivity"] = (proprio_action - baseline).abs().mean(dim=-1)
+        return diagnostics
 
     def update(self, replay_buffer: Any) -> dict[str, torch.Tensor]:
         data, index, initial = replay_buffer.sample(self.replay_cache_keys)

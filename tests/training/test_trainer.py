@@ -22,7 +22,7 @@ def _make_trainer_cfg(**overrides: Any) -> TrainerConfig:
     defaults: dict[str, Any] = dict(  # noqa: C408
         steps=10,
         pretrain=0,
-        train_ratio=0.0,  # no updates by default in unit tests
+        replay_ratio=0.0,  # no replay updates by default in unit tests
         batch_size=2,
         batch_length=4,
         action_repeat=1,
@@ -279,6 +279,23 @@ def test_episode_score_logged() -> None:
     assert len(score_logs) >= 1, "Expected at least one episode/score log"
 
 
+def test_episode_reward_components_logged() -> None:
+    class _RewardDiagnosticEnv(_MockVectorEnv):
+        def step(self, actions):
+            obs, rewards, terms, truncs, info = super().step(actions)
+            for fin in info["final_info"]:
+                if fin is not None:
+                    fin["reward_diag"] = {"grasp_reward": 0.25}
+            return obs, rewards, terms, truncs, info
+
+    envs = _RewardDiagnosticEnv(num_envs=2, done_every=2)
+    logger = _MockLogger()
+    trainer = OnlineTrainer(_make_trainer_cfg(steps=4), _MockBuffer(), logger, envs, eval_envs=None)
+    trainer.begin(_MockAgent())
+
+    assert ("episode/reward_grasp_reward", 0.25) in logger.recorded
+
+
 def test_checkpoint_round_trip(tmp_path: Path) -> None:
     N = 1
     envs = _MockVectorEnv(num_envs=N, done_every=99)
@@ -303,7 +320,7 @@ def test_checkpoint_round_trip(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_train_ratio_accumulation() -> None:
+def test_replay_ratio_uses_sampled_transition_semantics() -> None:
     N = 2
     update_calls: list[int] = []
 
@@ -324,13 +341,14 @@ def test_train_ratio_accumulation() -> None:
     agent = _CountingAgent(num_envs=N)
 
     n_steps = 10
-    cfg = _make_trainer_cfg(steps=n_steps * N, train_ratio=1.0)
+    cfg = _make_trainer_cfg(steps=n_steps * N, replay_ratio=4.0)
     trainer = OnlineTrainer(cfg, buffer, logger, envs, eval_envs=None)
     trainer.begin(agent)
 
-    # Each outer step covers N env steps; train_ratio=1.0 → N credits per step
-    # → N updates per step, n_steps steps → n_steps * N total update calls
-    expected = n_steps * N
+    # Each update samples batch_size * batch_length = 8 transitions. With 20
+    # collected transitions and replay_ratio=4, the standard Dreamer budget is
+    # 20 * 4 / 8 = 10 optimizer updates (not 80 calls).
+    expected = 10
     assert len(update_calls) == expected, f"Expected {expected} update calls, got {len(update_calls)}"
 
 
@@ -349,7 +367,7 @@ def test_no_updates_during_prefill() -> None:
     logger = _MockLogger()
     agent = _CountingAgent(num_envs=N)
 
-    cfg = _make_trainer_cfg(steps=20 * N, train_ratio=2.0)
+    cfg = _make_trainer_cfg(steps=20 * N, replay_ratio=2.0)
     trainer = OnlineTrainer(cfg, buffer, logger, envs, eval_envs=None)
     trainer.begin(agent)
 
@@ -436,7 +454,7 @@ def test_heartbeat_reports_updates_once_training_starts(caplog: Any) -> None:
     envs = _MockVectorEnv(num_envs=N, done_every=99)
     agent = _MockAgent(num_envs=N)
 
-    cfg = _make_trainer_cfg(steps=4 * N, train_ratio=1.0, heartbeat_secs=1e-9)
+    cfg = _make_trainer_cfg(steps=4 * N, replay_ratio=4.0, heartbeat_secs=1e-9)
     trainer = OnlineTrainer(cfg, _FilledBuffer(), _MockLogger(), envs, eval_envs=None)
     with caplog.at_level("INFO", logger="dreamer_arm.training.trainer"):
         trainer.begin(agent)
@@ -451,7 +469,7 @@ def test_heartbeat_disabled_by_zero(caplog: Any) -> None:
     envs = _MockVectorEnv(num_envs=N, done_every=99)
     agent = _MockAgent(num_envs=N)
 
-    cfg = _make_trainer_cfg(steps=4 * N, train_ratio=1.0, heartbeat_secs=0.0)
+    cfg = _make_trainer_cfg(steps=4 * N, replay_ratio=4.0, heartbeat_secs=0.0)
     trainer = OnlineTrainer(cfg, _FilledBuffer(), _MockLogger(), envs, eval_envs=None)
     with caplog.at_level("INFO", logger="dreamer_arm.training.trainer"):
         trainer.begin(agent)
@@ -478,7 +496,7 @@ def test_pretrain_runs_once_after_prefill() -> None:
     envs = _MockVectorEnv(num_envs=N, done_every=99)
     agent = _CountingAgent(num_envs=N)
 
-    cfg = _make_trainer_cfg(steps=6 * N, train_ratio=0.0, pretrain=5)
+    cfg = _make_trainer_cfg(steps=6 * N, replay_ratio=0.0, pretrain=5)
     trainer = OnlineTrainer(cfg, _FilledBuffer(), _MockLogger(), envs, eval_envs=None)
     trainer.begin(agent)
 

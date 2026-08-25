@@ -21,7 +21,7 @@ env_num: 10
 
 # Longer runs for the harder multi-task problem.
 steps: 5000000
-train_ratio: 1.0
+replay_ratio: 256.0
 
 # Evaluate one episode per env slot (= one episode per task for MT10).
 eval_episode_num: 10

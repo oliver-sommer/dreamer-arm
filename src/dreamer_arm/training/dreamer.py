@@ -97,7 +97,7 @@ def _run(cfg: DictConfig) -> None:
     trainer_cfg = TrainerConfig(
         steps=int(cfg.trainer.steps),
         pretrain=int(cfg.trainer.pretrain),
-        train_ratio=float(cfg.trainer.train_ratio),
+        replay_ratio=float(cfg.trainer.replay_ratio),
         batch_size=int(cfg.trainer.batch_size),
         batch_length=int(cfg.trainer.batch_length),
         action_repeat=int(cfg.trainer.action_repeat),

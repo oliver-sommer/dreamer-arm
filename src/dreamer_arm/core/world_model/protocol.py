@@ -76,7 +76,8 @@ class WorldModel(Protocol):
           ``(B, T, ...)``. Used both as imagination start states and (for
           ``replay_cache_keys``) written back to the buffer.
         * ``losses`` — this model's own loss terms only (e.g. ``dyn``/``rep``
-          for RSSM, ``pred`` for DINO-WM). Reward/continue/actor/critic terms
+          for RSSM, modality-balanced ``pred`` for DINO-WM).
+          Reward/continue/actor/critic terms
           are computed by the agent from ``get_feat(state)`` and are not
           included here.
         * ``metrics`` — additional scalars to log as-is.

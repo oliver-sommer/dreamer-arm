@@ -74,6 +74,7 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     task_returns: dict[str, list[float]] = {}
     # YamArm controller diagnostics, averaged across eval episodes (YAM only).
     ctrl_diags: dict[str, list[float]] = {}
+    reward_diags: dict[str, list[float]] = {}
 
     obs_np = envs.reset(seed=EVAL_SEED)
     state = agent.get_initial_state(n)
@@ -92,6 +93,8 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     all_actions: list[np.ndarray] = []
     all_pre_means: list[np.ndarray] = []
     all_pre_stds: list[np.ndarray] = []
+    all_task_sensitivity: list[np.ndarray] = []
+    all_proprio_sensitivity: list[np.ndarray] = []
     task_ids_seen: set[int] = set()
     task_id_rows = 0
     task_id_valid_rows = 0
@@ -126,12 +129,18 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
             policy_diag = agent.policy_diagnostics(next_state)
         pre_mean_np = policy_diag.get("pre_mean")
         pre_std_np = policy_diag.get("pre_std")
+        task_sensitivity = policy_diag.get("task_id_action_sensitivity")
+        proprio_sensitivity = policy_diag.get("proprio_action_sensitivity")
         pre_mean_arr = pre_mean_np.detach().cpu().numpy() if pre_mean_np is not None else None
         pre_std_arr = pre_std_np.detach().cpu().numpy() if pre_std_np is not None else None
         if pre_mean_arr is not None:
             all_pre_means.append(pre_mean_arr.copy())
         if pre_std_arr is not None:
             all_pre_stds.append(pre_std_arr.copy())
+        if task_sensitivity is not None:
+            all_task_sensitivity.append(task_sensitivity.detach().cpu().numpy().copy())
+        if proprio_sensitivity is not None:
+            all_proprio_sensitivity.append(proprio_sensitivity.detach().cpu().numpy().copy())
 
         for i in range(n):
             if completed[i] == 0 and episode_steps[i] < ACTION_TRACE_STEPS:
@@ -157,6 +166,8 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
                 if fin is not None:
                     for k, v in fin.get("ctrl_diag", {}).items():
                         ctrl_diags.setdefault(k, []).append(float(v))
+                    for k, v in fin.get("reward_diag", {}).items():
+                        reward_diags.setdefault(k, []).append(float(v))
                 completed[i] += 1
                 episode_returns[i] = 0.0
                 episode_steps[i] = 0
@@ -213,6 +224,11 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
             metrics[f"eval/action_{label}_pre_mean"] = float(pre_means[:, index].mean())
             metrics[f"eval/action_{label}_pre_std"] = float(pre_stds[:, index].mean())
 
+    if all_task_sensitivity:
+        metrics["eval/action_task_id_sensitivity"] = float(np.concatenate(all_task_sensitivity).mean())
+    if all_proprio_sensitivity:
+        metrics["eval/action_proprio_sensitivity"] = float(np.concatenate(all_proprio_sensitivity).mean())
+
     trace_columns = ["task", "timestep"]
     trace_columns += [f"action_{label}" for label in _ACTION_LABELS]
     trace_columns += [f"pre_mean_{label}" for label in _ACTION_LABELS]
@@ -240,6 +256,8 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
 
     for diag_name, diag_vals in ctrl_diags.items():
         metrics[f"eval/ctrl_{diag_name}"] = float(np.mean(diag_vals))
+    for diag_name, diag_vals in reward_diags.items():
+        metrics[f"eval/reward_{diag_name}"] = float(np.mean(diag_vals))
 
     action_trace = ActionTrace(columns=trace_columns, rows=trace_rows) if trace_rows else None
     return EvalResult(

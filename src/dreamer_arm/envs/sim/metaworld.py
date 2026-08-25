@@ -27,6 +27,7 @@ episode.
 from __future__ import annotations
 
 import contextlib
+import numbers
 from typing import Any, ClassVar
 
 import gymnasium
@@ -121,6 +122,8 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         self._controller_metrics = ControllerMetrics(self._is_yam, self._grasp_site_id)
 
         self._episode_success: bool = False
+        self._reward_component_sums: dict[str, float] = {}
+        self._reward_component_counts: dict[str, int] = {}
         self._rng = np.random.default_rng()
 
         # Passive viewer (mjpython only; None when viewer=False)
@@ -155,6 +158,8 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         # Inner env reset (calls _reset_hand → YamArm.reset_hand → sets init_tcp)
         self._env.reset()
         self._episode_success = False
+        self._reward_component_sums.clear()
+        self._reward_component_counts.clear()
         self._controller_metrics.reset(self._env.data)
 
         self._rendering.reset(self._rng)
@@ -198,6 +203,7 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
 
         if float(inner_info.get("success", 0.0)) >= self._success_threshold:
             self._episode_success = True
+        self._accumulate_reward_info(inner_info)
 
         if self._mj_viewer is not None:
             self._mj_viewer.sync()
@@ -221,10 +227,30 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
 
     def _build_info(self) -> dict[str, Any]:
         info: dict[str, Any] = {"task_name": self._task_name, "success": self._episode_success}
+        if self._reward_component_sums:
+            info["reward_diag"] = {
+                key: total / self._reward_component_counts[key] for key, total in self._reward_component_sums.items()
+            }
         summary = self._controller_metrics.summary()
         if summary is not None:
             info["ctrl_diag"] = summary
         return info
+
+    def _accumulate_reward_info(self, inner_info: dict[str, Any]) -> None:
+        """Retain Meta-World's task reward terms for episode diagnostics.
+
+        The scalar reward remains completely unchanged.  Exposing the numeric
+        components makes it possible to see whether the model is exploiting a
+        dense shaping term while task success remains zero.
+        """
+        for key, value in inner_info.items():
+            if key == "success" or not isinstance(value, numbers.Real):
+                continue
+            numeric = float(value)
+            if not np.isfinite(numeric):
+                continue
+            self._reward_component_sums[key] = self._reward_component_sums.get(key, 0.0) + numeric
+            self._reward_component_counts[key] = self._reward_component_counts.get(key, 0) + 1
 
     def _get_obs_dict(self, render: bool = True) -> dict[str, np.ndarray]:
         if render or self._last_scene is None:

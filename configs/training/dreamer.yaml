@@ -77,7 +77,10 @@ trainer:
   checkpoint_buffer: true
   batch_size: ${batch_size}
   batch_length: ${batch_length}
-  train_ratio: ${envs.sim.train_ratio}
+  # Replayed transition samples per newly collected transition (DreamerV3
+  # convention). One optimizer update consumes batch_size * batch_length
+  # samples; this is deliberately not "update calls per env step".
+  replay_ratio: ${envs.sim.replay_ratio}
 
   update_log_every: 1000
   # Wall-clock console liveness line (seconds; 0 disables).  `update_log_every`

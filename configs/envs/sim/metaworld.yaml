@@ -32,8 +32,10 @@ time_limit: 250
 # Total post-repeat env steps to train for.
 steps: 1000000
 
-# Agent update calls per env step.
-train_ratio: 0.5
+# Replayed transition samples per newly collected transition. DreamerV3's
+# image-control recipes commonly use 256; with batch_size=16 and
+# batch_length=64 this means one update per four collected transitions.
+replay_ratio: 256.0
 
 # Eval episodes per eval pass (one full set covers all task variants).
 eval_episode_num: 10

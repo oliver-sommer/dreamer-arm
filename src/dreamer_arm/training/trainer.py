@@ -8,8 +8,10 @@ Design notes
 ------------
 * The trainer counts **post-action-repeat** env steps (one ``SyncVectorEnv.step``
   = 1 agent step = ``action_repeat`` inner physics steps).
-* Train ratio is fractional: each env step accrues ``train_ratio`` training
-  credits; whole credits are drained via ``agent.update`` calls.
+* Replay ratio follows the standard Dreamer definition: replayed transition
+  samples per newly collected transition. Each update consumes
+  ``batch_size * batch_length`` samples, so update-call credit is
+  ``replay_ratio / batch_steps`` per environment step.
 * Eval reuses the train envs (``eval_envs is train_envs``), so no extra EGL
   contexts are created.  Eval is triggered when the step counter crosses a
   multiple of ``eval_every`` or a one-shot ``eval_warmup_steps`` milestone,
@@ -53,7 +55,7 @@ class TrainerConfig:
 
     steps: int  # total environment steps to train for
     pretrain: int  # extra agent.update calls once the prefill is collected
-    train_ratio: float  # update calls per env step (fractional)
+    replay_ratio: float  # replayed transition samples per new env transition
     batch_size: int  # stored here for documentation / config round-trip
     batch_length: int  # stored here for documentation / config round-trip
     action_repeat: int  # inner steps per outer step (owned by SyncVectorEnv)
@@ -133,7 +135,10 @@ class OnlineTrainer:
         ep_return = np.zeros(N, dtype=np.float32)
         ep_len = np.zeros(N, dtype=np.int32)
 
-        prefill_min = N * (cfg.batch_length + 1)
+        batch_steps = cfg.batch_size * cfg.batch_length
+        # At least one full training batch, while still guaranteeing every
+        # vector slot has a long enough contiguous trajectory to sample.
+        prefill_min = max(cfg.batch_size * (cfg.batch_length + 1), N * (cfg.batch_length + 1))
         train_budget = 0.0
 
         env_step = start_step
@@ -176,6 +181,8 @@ class OnlineTrainer:
         )
         _training_started = False
         updates = 0
+        ratio_updates = 0
+        ratio_env_steps = 0
         self._hb_time = time.time()
 
         while env_step < cfg.steps:
@@ -253,6 +260,9 @@ class OnlineTrainer:
                     if fin is not None and "ctrl_diag" in fin:
                         for k, v in fin["ctrl_diag"].items():
                             self._logger.scalar(f"episode/ctrl_{k}", float(v))
+                    if fin is not None and "reward_diag" in fin:
+                        for k, v in fin["reward_diag"].items():
+                            self._logger.scalar(f"episode/reward_{k}", float(v))
                     ep_return[i] = 0.0
                     ep_len[i] = 0
 
@@ -275,16 +285,18 @@ class OnlineTrainer:
                     log.info("prefill complete at step %d; training updates started", env_step)
                     _training_started = True
                     # Warm the model on the prefill before collection continues
-                    # at the online train_ratio.
+                    # at the online replay ratio.
                     for _ in range(cfg.pretrain):
                         agent.update(self._buffer)
                         updates += 1
                         self._heartbeat(env_step, updates, prefill_min)
-                train_budget += cfg.train_ratio * N
+                ratio_env_steps += N
+                train_budget += cfg.replay_ratio * N / batch_steps
                 while train_budget >= 1.0:
                     metrics = agent.update(self._buffer)
                     train_budget -= 1.0
                     updates += 1
+                    ratio_updates += 1
                     # defer=True: keep these as tensors until the next
                     # logger.write() instead of syncing every update -- only
                     # the last update's metrics before a write are ever read,
@@ -300,6 +312,10 @@ class OnlineTrainer:
 
             if env_step - _last_log >= cfg.update_log_every:
                 _last_log = (env_step // cfg.update_log_every) * cfg.update_log_every
+                self._logger.scalar("train/replay_ratio_configured", cfg.replay_ratio)
+                if ratio_env_steps:
+                    actual_ratio = ratio_updates * batch_steps / ratio_env_steps
+                    self._logger.scalar("train/replay_ratio_actual", actual_ratio)
                 self._logger.write(env_step, fps=True)
 
             if (

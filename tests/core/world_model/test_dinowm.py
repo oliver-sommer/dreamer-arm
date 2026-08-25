@@ -45,15 +45,18 @@ def test_dinowm_loss_shapes_and_gradient(tiny_dinowm_cfg) -> None:  # type: igno
     dinowm = DinoWM(tiny_dinowm_cfg, _shapes(), act_dim=4, num_patches=4, embed_dim=384)
     b, t = 2, 6
     tokens = torch.randn(b, t, 4, dinowm.tok_dim)
+    proprio = torch.randn(b, t, dinowm.proprio_dim)
     action = torch.randn(b, t, 4)
 
-    state, pred_loss = dinowm.loss(tokens, action)
+    state, visual_loss, proprio_loss = dinowm.loss(tokens, proprio, action)
     num_windows = t - dinowm.context
-    assert pred_loss.shape == (b, num_windows)
+    assert visual_loss.shape == (b, num_windows)
+    assert proprio_loss.shape == (b, num_windows)
     assert state["tokens"].shape == (b, num_windows, dinowm.context, 4, dinowm.tok_dim)
+    assert state["proprio"].shape == (b, num_windows, dinowm.context, dinowm.proprio_dim)
     assert state["actions_out"].shape == (b, num_windows, dinowm.context - 1, dinowm.action_dim_embed)
 
-    pred_loss.mean().backward()
+    (visual_loss.mean() + proprio_loss.mean()).backward()
     grads = [p.grad for p in dinowm.predictor.parameters()]
     assert grads, "predictor has no parameters"
     assert any(g is not None for g in grads)
@@ -68,6 +71,7 @@ def test_dinowm_img_step_gradient_flows_to_action(tiny_dinowm_cfg) -> None:  # t
 
     next_state = dinowm.img_step(state, action)
     assert next_state["tokens"].shape == state["tokens"].shape
+    assert next_state["proprio"].shape == state["proprio"].shape
     assert next_state["actions_out"].shape == state["actions_out"].shape
 
     feat = dinowm.get_feat(next_state)
@@ -80,7 +84,7 @@ def test_dinowm_img_step_gradient_flows_to_action(tiny_dinowm_cfg) -> None:  # t
 def test_feat_pool_flatten_matches_expected_size(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]
     tiny_dinowm_cfg.feat_pool = "flatten"
     dinowm = DinoWM(tiny_dinowm_cfg, _shapes(), act_dim=4, num_patches=4, embed_dim=384)
-    assert dinowm.feat_size == dinowm.tok_dim * 4
+    assert dinowm.feat_size == dinowm.tok_dim * 4 + dinowm.proprio_dim
     state = dinowm.initial(2, torch.device("cpu"))
     feat = dinowm.get_feat(state)
     assert feat.shape == (2, dinowm.feat_size)
@@ -98,20 +102,23 @@ def test_dinowm_loss_is_chunk_invariant(tiny_dinowm_cfg) -> None:  # type: ignor
     dinowm = DinoWM(tiny_dinowm_cfg, _shapes(), act_dim=4, num_patches=4, embed_dim=384)
     b, t = 2, 8
     tokens = torch.randn(b, t, 4, dinowm.tok_dim)
+    proprio = torch.randn(b, t, dinowm.proprio_dim)
     action = torch.randn(b, t, 4)
 
     results = []
     for chunk in (1, 64):
         dinowm.zero_grad(set_to_none=True)
         dinowm.window_chunk = chunk
-        state, pred_loss = dinowm.loss(tokens, action)
+        state, visual_loss, proprio_loss = dinowm.loss(tokens, proprio, action)
+        pred_loss = visual_loss + proprio_loss
         pred_loss.mean().backward()
         grad = torch.cat([p.grad.reshape(-1) for p in dinowm.predictor.parameters() if p.grad is not None])
-        results.append((pred_loss.detach(), state["tokens"], state["actions_out"], grad.clone()))
+        results.append((pred_loss.detach(), state["tokens"], state["proprio"], state["actions_out"], grad.clone()))
 
-    (loss_a, tok_a, act_a, grad_a), (loss_b, tok_b, act_b, grad_b) = results
+    (loss_a, tok_a, prop_a, act_a, grad_a), (loss_b, tok_b, prop_b, act_b, grad_b) = results
     assert torch.allclose(loss_a, loss_b, atol=1e-6), (loss_a, loss_b)
     assert torch.equal(tok_a, tok_b)
+    assert torch.equal(prop_a, prop_b)
     assert torch.equal(act_a, act_b)
     assert torch.allclose(grad_a, grad_b, atol=1e-5)
 
@@ -126,8 +133,9 @@ def test_task_id_is_exact_and_persistent_through_imagination(tiny_dinowm_cfg) ->
     task_id[0, :, 0] = 1.0
     task_id[1, :, 2] = 1.0
     tokens = torch.randn(b, t, 4, dinowm.tok_dim)
+    proprio = torch.randn(b, t, dinowm.proprio_dim)
 
-    state, _ = dinowm.loss(tokens, torch.randn(b, t, 4), task_id)
+    state, _, _ = dinowm.loss(tokens, proprio, torch.randn(b, t, 4), task_id)
     expected = task_id[:, dinowm.context :]
     assert torch.equal(state["task_id"], expected)
 
@@ -140,4 +148,17 @@ def test_task_id_is_exact_and_persistent_through_imagination(tiny_dinowm_cfg) ->
     conditioned = {**next_state, "tokens": same_tokens}
     feat = dinowm.get_feat(conditioned)
     assert torch.equal(feat[:, -3:], start["task_id"])
+    assert not torch.equal(feat[0], feat[1])
+
+
+def test_proprio_is_explicit_in_actor_feature(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]
+    """Robot state cannot collapse behind a learned auxiliary embedder."""
+    dinowm = DinoWM(tiny_dinowm_cfg, _shapes(), act_dim=4, num_patches=4, embed_dim=384)
+    state = dinowm.initial(2, torch.device("cpu"))
+    state["tokens"][1] = state["tokens"][0]
+    state["proprio"][1, -1] = 1.0
+
+    feat = dinowm.get_feat(state)
+    assert torch.equal(feat[0, : dinowm.tok_dim], feat[1, : dinowm.tok_dim])
+    assert torch.equal(feat[:, -dinowm.proprio_dim :], state["proprio"][:, -1])
     assert not torch.equal(feat[0], feat[1])

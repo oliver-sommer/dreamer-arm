@@ -26,6 +26,7 @@ def test_sticky_success(monkeypatch: pytest.MonkeyPatch) -> None:
     import metaworld
 
     monkeypatch.setattr(metaworld_env, "SceneRenderer", _Renderer)
+    metaworld.set_active_arm("yam")
     benchmark = metaworld.MT1("door-open-v3", seed=0)
     env_cls = next(iter(benchmark.train_classes.values()))
     inner = env_cls(render_mode=None)
@@ -38,5 +39,7 @@ def test_sticky_success(monkeypatch: pytest.MonkeyPatch) -> None:
         env._episode_success = True
         *_, next_info = env.step(np.zeros(4, dtype=np.float32))
         assert next_info["success"]
+        assert next_info["reward_diag"]
+        assert all(np.isfinite(value) for value in next_info["reward_diag"].values())
     finally:
         env.close()

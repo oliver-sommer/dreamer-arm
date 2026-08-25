@@ -146,7 +146,6 @@ def tiny_dinowm_cfg() -> Any:
     return _ns(
         {
             "context": 3,
-            "extra_dim": 4,
             "action_dim_embed": 4,
             "feat_pool": "mean",
             "cnn_keys": "scene",

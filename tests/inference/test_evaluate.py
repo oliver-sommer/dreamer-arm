@@ -110,6 +110,29 @@ def test_evaluate_logs_rewards_and_first_twenty_deterministic_actions() -> None:
     assert all(row[2:6] == [0.0, 0.0, 0.0, 0.0] for row in result.action_trace.rows)
 
 
+def test_evaluate_aggregates_conditioning_and_reward_diagnostics() -> None:
+    class _DiagnosticAgent(_MockAgent):
+        def policy_diagnostics(self, state):
+            n = state.batch_size[0]
+            return {
+                "task_id_action_sensitivity": torch.full((n,), 0.25),
+                "proprio_action_sensitivity": torch.full((n,), 0.5),
+            }
+
+    class _DiagnosticEnv(_MockVectorEnv):
+        def step(self, actions):
+            obs, rew, terms, truncs, info = super().step(actions)
+            for fin in info["final_info"]:
+                if fin is not None:
+                    fin["reward_diag"] = {"in_place_reward": 0.75}
+            return obs, rew, terms, truncs, info
+
+    result = evaluate(_DiagnosticAgent(), _DiagnosticEnv(done_every=2), episodes=2)
+    assert result.metrics["eval/action_task_id_sensitivity"] == pytest.approx(0.25)
+    assert result.metrics["eval/action_proprio_sensitivity"] == pytest.approx(0.5)
+    assert result.metrics["eval/reward_in_place_reward"] == pytest.approx(0.75)
+
+
 def test_actor_parameter_metrics_prove_live_frozen_sync_and_weight_changes() -> None:
     class _ActorAgent(nn.Module):
         def __init__(self) -> None:

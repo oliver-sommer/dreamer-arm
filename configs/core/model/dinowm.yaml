@@ -35,9 +35,6 @@ core:
     dinowm:
       # Fixed context window (frames) the causal predictor conditions on.
       context: 3
-      # Extra per-timestep modality (proprio/task-id) embedding width, tiled
-      # per patch and concatenated to the frozen encoder's 384-d patch tokens.
-      extra_dim: 10
       # Action embedding width, tiled per patch and concatenated only inside
       # the predictor (discarded from its output).
       action_dim_embed: 10
@@ -64,8 +61,9 @@ core:
         dim_head: 64
         mlp_dim: 2048
 
-    # DINO-WM's own `pred` loss (teacher-forced next-frame-token MSE) is its
-    # entire representation loss -- no dyn/rep/recon/barlow terms.
+    # DINO-WM's `pred` loss is the equally weighted sum of visual-token and
+    # explicit proprio-state prediction MSE. Task identity is static context,
+    # never a prediction target.
     loss_scales:
       rew: 1.0
       con: 1.0

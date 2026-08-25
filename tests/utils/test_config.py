@@ -222,7 +222,7 @@ def test_single_task_group_requires_a_task() -> None:
         ("envs.sim.env_num=0", "envs.sim.env_num must be positive"),
         ("envs.sim.action_repeat=0", "envs.sim.action_repeat must be positive"),
         ("core.buffer.max_size=10", "buffer.max_size"),
-        ("trainer.train_ratio=-1", "trainer.train_ratio must be non-negative"),
+        ("trainer.replay_ratio=-1", "trainer.replay_ratio must be non-negative"),
         ("trainer.eval_warmup_steps=[0,1000]", "eval_warmup_steps"),
         ("logging.wandb.mode=sometimes", "Unsupported logging.wandb.mode"),
     ],
