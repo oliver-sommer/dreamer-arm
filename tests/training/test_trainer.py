@@ -175,6 +175,7 @@ class _MockLogger:
     def __init__(self) -> None:
         self.recorded: list[tuple[str, float]] = []
         self.videos: list[str] = []
+        self.tables: list[str] = []
 
     def scalar(self, name: str, value: Any) -> None:
         self.recorded.append((name, float(value)))
@@ -185,6 +186,9 @@ class _MockLogger:
 
     def video(self, name: str, frames: Any) -> None:
         self.videos.append(name)
+
+    def table(self, name: str, columns: list[str], rows: list[list[Any]]) -> None:
+        self.tables.append(name)
 
     def write(self, step: int, fps: bool = False) -> None:
         pass

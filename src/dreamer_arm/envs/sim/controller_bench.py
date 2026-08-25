@@ -40,7 +40,8 @@ Composition root for ``configs/envs/sim/controller_bench.yaml``. Modes
 
 ``sweep=true`` runs the mode's evaluation (``probe`` or ``iid``) across a
 small grid of controller speed, damping, joint-speed, nullspace, orientation,
-and lookahead settings, printing one summary row per field/value combination.
+following-error, and lookahead settings, printing one summary row per
+field/value combination.
 """
 
 from __future__ import annotations
@@ -65,6 +66,7 @@ _AXIS_DIRS: tuple[np.ndarray, ...] = tuple(
 # (`envs.sim.arms.*`) config.
 _SWEEP_GRID: dict[str, tuple[float, ...]] = {
     "max_ee_speed_m_s": (0.15, 0.25, 0.40),
+    "max_lag_m": (0.01, 0.02, 0.035, 0.06),
     "damping": (0.05, 0.10, 0.15),
     "max_joint_speed_rad_s": (1.0, 2.0, 3.0),
     "nullspace_gain": (0.5, 1.0),
@@ -132,6 +134,30 @@ def _tcp(inner: Any, gid: int) -> np.ndarray:
     return np.asarray(inner.data.site_xpos[gid], dtype=np.float64).copy()
 
 
+def _blocked_reversal_steps(inner: Any, arm: Any, gid: int, max_steps: int = 40) -> float:
+    """Measure worst-case reversal after a blockage saturates target lag."""
+
+    inner.reset()
+    original_do_simulation = inner.do_simulation
+    inner.do_simulation = lambda _ctrl, _frames: None
+    try:
+        forward = np.array([1.0, 0.0, 0.0, -1.0], dtype=np.float32)
+        for _ in range(100):
+            arm.actuate(inner, forward)
+    finally:
+        inner.do_simulation = original_do_simulation
+
+    reverse = np.array([-1.0, 0.0, 0.0, -1.0], dtype=np.float32)
+    previous_x = float(_tcp(inner, gid)[0])
+    for step in range(1, max_steps + 1):
+        inner.step(reverse)
+        current_x = float(_tcp(inner, gid)[0])
+        if current_x < previous_x - 1e-5:
+            return float(step)
+        previous_x = current_x
+    return float(max_steps)
+
+
 def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int, n_dirs: int) -> dict[str, Any]:
     """Hold each axis + ``n_dirs`` random unit directions for ``horizon`` steps."""
     inner, arm, gid = _build_env(arm_cfg, arm_name, task, seed)
@@ -183,8 +209,24 @@ def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int,
                 "frac_ori_capped": ori_capped / n if n else 0.0,
             }
         )
-    inner.close()
 
+        # Reversal transient after the held command has had enough time to
+        # stretch the retained-target leash or reach a workspace boundary.
+        # Count controller steps until measured TCP motion follows the reversed
+        # command. This is intentionally a physical response metric, not merely
+        # a check that the reference velocity changed sign.
+        reverse_action = action.copy()
+        reverse_action[:3] *= -1.0
+        reversal_steps = 40
+        previous_tcp = _tcp(inner, gid)
+        for reverse_step in range(1, reversal_steps + 1):
+            inner.step(reverse_action)
+            tcp = _tcp(inner, gid)
+            if float((tcp - previous_tcp) @ direction) < -1e-5:
+                reversal_steps = reverse_step
+                break
+            previous_tcp = tcp
+        rows[-1]["reversal_steps"] = float(reversal_steps)
     agg_keys = (
         "track_mean",
         "track_tail_mean",
@@ -195,6 +237,10 @@ def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int,
         "frac_ori_capped",
     )
     agg = {k: float(np.mean([row[k] for row in rows])) for k in agg_keys}
+    agg["reversal_steps_mean"] = float(np.mean([row["reversal_steps"] for row in rows]))
+    agg["reversal_steps_max"] = float(np.max([row["reversal_steps"] for row in rows]))
+    agg["blocked_reversal_steps"] = _blocked_reversal_steps(inner, arm, gid)
+    inner.close()
     return {"rows": rows, "agg": agg}
 
 
@@ -210,7 +256,7 @@ def run_probe(cfg: DictConfig) -> dict[str, float]:
     )
     log.info("probe: task=%s horizon=%d arm_cfg=%s", cfg.envs.sim.task, cfg.horizon, arm_cfg)
     log.info(
-        "  %-19s %10s %10s %8s %8s %8s %8s %8s",
+        "  %-19s %10s %10s %8s %8s %8s %8s %8s %8s",
         "direction",
         "track",
         "track_tl",
@@ -219,11 +265,12 @@ def run_probe(cfg: DictConfig) -> dict[str, float]:
         "dq_clmp",
         "jnt_clmp",
         "ori_cap",
+        "rev_step",
     )
     for row in result["rows"]:
         d = row["direction"]
         log.info(
-            "  [%+.2f %+.2f %+.2f]  %10.4f %10.4f %8.4f %8.2f %8.2f %8.2f %8.2f",
+            "  [%+.2f %+.2f %+.2f]  %10.4f %10.4f %8.4f %8.2f %8.2f %8.2f %8.2f %8.0f",
             d[0],
             d[1],
             d[2],
@@ -234,10 +281,11 @@ def run_probe(cfg: DictConfig) -> dict[str, float]:
             row["frac_dq_clamped"],
             row["frac_joint_limit_clamped"],
             row["frac_ori_capped"],
+            row["reversal_steps"],
         )
     agg = result["agg"]
     log.info(
-        "  %-19s %10.4f %10.4f %8.4f %8.2f %8.2f %8.2f %8.2f",
+        "  %-19s %10.4f %10.4f %8.4f %8.2f %8.2f %8.2f %8.2f %8.2f",
         "MEAN",
         agg["track_mean"],
         agg["track_tail_mean"],
@@ -246,6 +294,11 @@ def run_probe(cfg: DictConfig) -> dict[str, float]:
         agg["frac_dq_clamped"],
         agg["frac_joint_limit_clamped"],
         agg["frac_ori_capped"],
+        agg["reversal_steps_mean"],
+    )
+    log.info(
+        "  blocked reversal after saturated target lag: %.0f control steps",
+        agg["blocked_reversal_steps"],
     )
     return agg
 
@@ -419,8 +472,11 @@ def run_coverage(cfg: DictConfig) -> dict[str, float]:
                 inner.reset()
                 sig_tail: list[float] = []
                 for t in range(servo_steps):
-                    tcp = _tcp(inner, gid)
-                    a = np.clip((target - tcp) / 0.01, -1.0, 1.0)
+                    reference = getattr(arm, "_p_target", None)
+                    if reference is None:
+                        reference = _tcp(inner, gid)
+                    dt = float(inner.model.opt.timestep) * int(inner.frame_skip)
+                    a = np.clip((target - reference) / (dt * arm_cfg.max_ee_speed_m_s), -1.0, 1.0)
                     inner.step(np.array([*a, -1.0], dtype=np.float32))
                     diag = arm.last_diagnostics
                     if diag and t >= servo_steps - 30:
@@ -466,11 +522,15 @@ def _advance_push_reference(
     ori_error_max = 0.0
     joint_limit_clamps = 0
     for _step in range(1, budget + 1):
-        delta = target - _tcp(inner, gid)
-        distance = float(np.linalg.norm(delta))
+        tcp_before = _tcp(inner, gid)
+        reference = getattr(arm, "_p_target", None)
+        if reference is None:
+            reference = tcp_before
+        reference_delta = target - reference
         requested_step = np.zeros(3)
-        if distance > 0.0:
-            requested_step = delta * min(1.0, reference_step_m / distance)
+        reference_distance = float(np.linalg.norm(reference_delta))
+        if reference_distance > 0.0:
+            requested_step = reference_delta * min(1.0, reference_step_m / reference_distance)
 
         # This is intentionally a controller/mechanics diagnostic, not an
         # agent policy.  It retains the complete IK, joint-servo, collision,
@@ -481,7 +541,7 @@ def _advance_push_reference(
         success = success or float(info.get("success", 0.0)) >= 1.0
         tcp = _tcp(inner, gid)
         error = float(np.linalg.norm(tcp - target))
-        settled = settled + 1 if distance <= reference_step_m and error < 0.012 else 0
+        settled = settled + 1 if reference_distance <= reference_step_m and error < 0.012 else 0
 
         tcp_z = float(tcp[2])
         tcp_z_min = min(tcp_z_min, tcp_z)

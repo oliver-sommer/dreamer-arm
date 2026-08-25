@@ -1,4 +1,4 @@
-"""YAM arm control seam — DLS-IK actuation via Meta-World hooks.
+"""YAM arm control seam — retained Cartesian target and DLS-IK actuation.
 
 The YAM arm has 6 position-actuated joints (``joint1``…``joint6``) plus a
 ``gripper`` actuator driving the ``left_finger`` slide joint (``right_finger``
@@ -6,8 +6,9 @@ is mirrored via an equality constraint).
 
 Control contract:
 - XYZ actions are bounded Cartesian velocities.
-- Each call computes IK from measured joints; no Cartesian target is retained.
-- A short joint-position lookahead preserves position-servo contact authority.
+- Each call rate-integrates velocity into a retained grasp-site position target.
+- Workspace and following-error clamps prevent unreachable-target windup.
+- Zero velocity holds the commanded pose instead of following disturbances.
 - Damped IK, posture bias, and soft joint limits bound the solve.
 - Orientation is optional and disabled by default for the restricted wrist.
 - The gripper action remains a direct bounded position command.
@@ -15,6 +16,7 @@ Control contract:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +35,8 @@ _GRASP_SITE_NAME = "grasp_site"
 _GRIPPER_ACT_NAME = "gripper"
 _GRIPPER_MAX_OPEN = 0.041  # ctrlrange hi = fully open
 
+log = logging.getLogger(__name__)
+
 
 class YamArm:
     """Arm control seam for the YAM 6-DOF manipulator."""
@@ -48,9 +52,15 @@ class YamArm:
         self._grasp_site_id: int | None = None
         self._q_home: np.ndarray | None = None  # (6,) home joint angles
         self._quat_home: np.ndarray | None = None  # (4,) [w,x,y,z] home EE orientation
+        self._p_target: np.ndarray | None = None  # (3,) retained grasp-site position target
+        self._ws_low: np.ndarray | None = None  # (3,) Cartesian workspace lower bound
+        self._ws_high: np.ndarray | None = None  # (3,) Cartesian workspace upper bound
         self._ik_cfg: IKConfig | None = None  # built once in attach(); cfg is immutable
         self._jacp: np.ndarray | None = None  # (3, m.nv) Jacobian scratch, reused every step
         self._jacr: np.ndarray | None = None  # (3, m.nv) Jacobian scratch, reused every step
+        self._velocity = np.zeros(3)  # Cartesian velocity scratch
+        self._p_cmd = np.zeros(3)  # unclamped/projected target scratch
+        self._target_lag = np.zeros(3)  # target-minus-measurement scratch
         self._last_diagnostics: dict[str, float] | None = None
 
     @property
@@ -96,6 +106,15 @@ class YamArm:
 
         # Cache immutable config and fixed-size scratch arrays across 80 Hz calls.
         cfg = self._cfg
+        if not np.isfinite(cfg.max_lag_m) or cfg.max_lag_m <= 0.0:
+            raise ValueError(f"max_lag_m must be finite and positive, got {cfg.max_lag_m!r}")
+        self._ws_low, self._ws_high, bounds_source = self._resolve_workspace_bounds(env)
+        log.info(
+            "YAM Cartesian workspace source=%s low=%s high=%s",
+            bounds_source,
+            self._ws_low,
+            self._ws_high,
+        )
         self._ik_cfg = IKConfig(
             damping=cfg.damping,
             nullspace_gain=cfg.nullspace_gain * cfg.joint_target_horizon_s,
@@ -129,6 +148,8 @@ class YamArm:
         assert self._grasp_site_id is not None
         assert self._q_home is not None
         assert self._quat_home is not None
+        assert self._ws_low is not None
+        assert self._ws_high is not None
         assert self._jnt_range is not None
         assert self._ik_cfg is not None
         assert self._jacp is not None
@@ -141,15 +162,35 @@ class YamArm:
         # Guard: if physics has already blown up (NaN/Inf), do not propagate
         # invalid values into actuator controls.
         if not np.all(np.isfinite(q)) or not np.all(np.isfinite(tcp)):
+            # A failed command never reached the plant, so discard its target
+            # update and resynchronise to a usable measured TCP.  If TCP itself
+            # is invalid, retain the last finite target rather than storing NaN.
+            self._resync_target(tcp)
             mujoco.mj_forward(m, d)
             return
 
-        # Interpret policy XYZ as Cartesian velocity.  The IK solve uses a
-        # short stateless lookahead so reversing the action reverses the joint
-        # target immediately, with no unreachable Cartesian target to unwind.
+        if self._p_target is None:
+            # reset_hand normally establishes the target.  Lazily initialising
+            # here keeps the hook safe if an external caller actuates directly.
+            self._p_target = tcp.copy()
+
+        # Interpret policy XYZ as a physical Cartesian velocity and integrate
+        # it using the actual 80 Hz control interval.  The workspace projection
+        # matches Meta-World's Sawyer mocap bounds; the following-error leash is
+        # tracking anti-windup, bounding any transient that contact can store.
         control_dt = float(m.opt.timestep) * int(env.frame_skip)
-        velocity = a[:3] * cfg.max_ee_speed_m_s
-        e_pos = velocity * cfg.joint_target_horizon_s
+        np.multiply(a[:3], cfg.max_ee_speed_m_s, out=self._velocity)
+        np.multiply(self._velocity, control_dt, out=self._p_cmd)
+        self._p_cmd += self._p_target
+        ws_clamped = bool(np.any((self._p_cmd < self._ws_low) | (self._p_cmd > self._ws_high)))
+        np.clip(self._p_cmd, self._ws_low, self._ws_high, out=self._p_cmd)
+        self._target_lag[:] = self._p_cmd
+        self._target_lag -= tcp
+        lag_clamped = bool(np.any(np.abs(self._target_lag) > cfg.max_lag_m))
+        np.clip(self._target_lag, -cfg.max_lag_m, cfg.max_lag_m, out=self._target_lag)
+        self._p_target[:] = tcp
+        self._p_target += self._target_lag
+        e_pos = self._target_lag
 
         ik_cfg = self._ik_cfg
         ori_error = quat_log_error(d.site_xmat[self._grasp_site_id], self._quat_home)
@@ -173,6 +214,7 @@ class YamArm:
         J = np.vstack([self._jacp[:, self._arm_dadr], self._jacr[:, self._arm_dadr]])  # (6,6)
 
         if not np.all(np.isfinite(J)):
+            self._resync_target(tcp)
             mujoco.mj_forward(m, d)
             return
 
@@ -180,15 +222,18 @@ class YamArm:
         # trainer can log episode aggregates: singularity, orientation fighting,
         # joint-velocity saturation, commanded vs achieved TCP motion).
         # cmd_* describes the physical displacement requested during this
-        # control interval; ik_step_norm is the longer position-servo lookahead.
-        cmd_delta = velocity * control_dt
+        # control interval. ik_step_norm remains backward compatible and now
+        # equals the retained target lag used as the translational IK task.
         diag: dict[str, float] = {
-            "cmd_norm": float(np.linalg.norm(cmd_delta)),
-            "cmd_x": float(cmd_delta[0]),
-            "cmd_y": float(cmd_delta[1]),
-            "cmd_z": float(cmd_delta[2]),
-            "cmd_speed_m_s": float(np.linalg.norm(velocity)),
+            "cmd_norm": float(np.linalg.norm(self._velocity) * control_dt),
+            "cmd_x": float(self._velocity[0] * control_dt),
+            "cmd_y": float(self._velocity[1] * control_dt),
+            "cmd_z": float(self._velocity[2] * control_dt),
+            "cmd_speed_m_s": float(np.linalg.norm(self._velocity)),
             "ik_step_norm": float(np.linalg.norm(e_pos)),
+            "target_lag_norm": float(np.linalg.norm(e_pos)),
+            "lag_clamped": float(lag_clamped),
+            "ws_clamped": float(ws_clamped),
             "ori_capped": float(ori_capped),
             "ori_error_norm": float(np.linalg.norm(ori_error)),
             "ori_task_norm": float(np.linalg.norm(e_ori)),
@@ -200,6 +245,9 @@ class YamArm:
 
         # Guard: DLS result should be finite (bounded by joint clamp + λ).
         if not np.all(np.isfinite(q_target)):
+            self._resync_target(tcp)
+            diag["target_lag_norm"] = 0.0
+            diag["ik_step_norm"] = 0.0
             mujoco.mj_forward(m, d)
             return
 
@@ -209,6 +257,41 @@ class YamArm:
         ctrl[self._arm_act_ids] = q_target
         ctrl[self._grip_act_id] = g_ctrl
         env.do_simulation(ctrl, env.frame_skip)
+
+    def _resolve_workspace_bounds(self, env: Any) -> tuple[np.ndarray, np.ndarray, str]:
+        """Prefer Meta-World's task bounds, then config, else unbounded."""
+
+        env_low = getattr(env, "mocap_low", None)
+        env_high = getattr(env, "mocap_high", None)
+        if env_low is not None and env_high is not None:
+            return (*self._validate_workspace_bounds(env_low, env_high, "env.mocap_low/high"), "environment")
+
+        cfg_low = self._cfg.workspace_low
+        cfg_high = self._cfg.workspace_high
+        if (cfg_low is None) != (cfg_high is None):
+            raise ValueError("workspace_low and workspace_high must be supplied together")
+        if cfg_low is not None and cfg_high is not None:
+            return (*self._validate_workspace_bounds(cfg_low, cfg_high, "ArmConfig"), "config")
+
+        return np.full(3, -np.inf), np.full(3, np.inf), "unbounded"
+
+    @staticmethod
+    def _validate_workspace_bounds(low: Any, high: Any, source: str) -> tuple[np.ndarray, np.ndarray]:
+        low_arr = np.asarray(low, dtype=np.float64)
+        high_arr = np.asarray(high, dtype=np.float64)
+        if low_arr.shape != (3,) or high_arr.shape != (3,):
+            raise ValueError(f"{source} workspace bounds must both have shape (3,)")
+        if not np.all(np.isfinite(low_arr)) or not np.all(np.isfinite(high_arr)):
+            raise ValueError(f"{source} workspace bounds must be finite")
+        if np.any(low_arr > high_arr):
+            raise ValueError(f"{source} workspace lower bound exceeds upper bound")
+        return low_arr.copy(), high_arr.copy()
+
+    def _resync_target(self, tcp: np.ndarray) -> None:
+        """Roll a failed command back to measured state without storing NaNs."""
+
+        if np.all(np.isfinite(tcp)):
+            self._p_target = tcp.copy()
 
     def reset_hand(self, env: Any, steps: int) -> None:
         """Servo to home pose and set ``env.init_tcp``.
@@ -230,6 +313,10 @@ class YamArm:
         ctrl[self._grip_act_id] = _GRIPPER_MAX_OPEN  # open at reset
         env.do_simulation(ctrl, n_frames)
         mujoco.mj_forward(m, d)
+
+        # The controlled point is grasp_site.  Meta-World's tcp_center below is
+        # the mean of the finger sites and is intentionally a different point.
+        self._p_target = np.asarray(d.site_xpos[self._grasp_site_id], dtype=np.float64).copy()
 
         # tcp_center = mean of leftEndEffector / rightEndEffector sites
         env.init_tcp = env.tcp_center.copy()

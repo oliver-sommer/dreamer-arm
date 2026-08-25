@@ -2,6 +2,11 @@
 # YAM 6-DOF arm — DLS-IK control parameters.
 #
 # max_ee_speed_m_s: maximum Cartesian speed per axis at action magnitude 1
+# max_lag_m:       per-axis anti-windup leash between retained target and TCP;
+#                  0.035 m preserves the former 0.35 m/s * 0.10 s servo lead
+# workspace_low/high: fallback XYZ workspace bounds [m]; Meta-World's
+#                  mocap_low/high are preferred for Sawyer parity, and null
+#                  leaves the workspace unbounded when env bounds are absent
 # damping:         DLS regularisation λ on the length-scaled task Jacobian;
 #                  bounds ‖dq‖ near true kinematic degeneracies
 # nullspace_gain:  strength of home-pose pull in the arm's nullspace
@@ -10,13 +15,16 @@
 #                  0 genuinely disables the orientation constraint
 # joint_margin:    keep joints this far from their hard limits [rad]
 # max_joint_speed_rad_s: speed used to cap the IK joint-target lookahead
-# joint_target_horizon_s: stateless position-servo lookahead duration
+# joint_target_horizon_s: time scale for nullspace gain and joint-step limits
 # length_scale:    characteristic length [metres] used to make the DLS
 #                  Jacobian's position and orientation rows unit-consistent
 # settle_steps:    physics steps to servo to home pose at each reset
 
 name: yam
 max_ee_speed_m_s: 0.35
+max_lag_m: 0.035
+workspace_low: null
+workspace_high: null
 damping: 0.10
 nullspace_gain: 1.0
 ori_gain: 1.0

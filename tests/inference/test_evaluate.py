@@ -95,9 +95,19 @@ def test_evaluate_logs_rewards_and_first_twenty_deterministic_actions() -> None:
 
     assert result.metrics["eval/return/mock"] == 25.0
     assert result.metrics["eval/return_mean"] == 25.0
-    trace_keys = [key for key in result.metrics if key.startswith("eval/action_trace/mock/") and key.endswith("_x")]
-    assert len(trace_keys) == ACTION_TRACE_STEPS
-    assert all(result.metrics[key] == 0.0 for key in trace_keys)
+    assert not any(key.startswith("eval/action_trace/") for key in result.metrics)
+    assert result.action_trace is not None
+    assert len(result.action_trace.rows) == ACTION_TRACE_STEPS
+    assert result.action_trace.columns[:6] == [
+        "task",
+        "timestep",
+        "action_x",
+        "action_y",
+        "action_z",
+        "action_gripper",
+    ]
+    assert all(row[0] == "mock" for row in result.action_trace.rows)
+    assert all(row[2:6] == [0.0, 0.0, 0.0, 0.0] for row in result.action_trace.rows)
 
 
 def test_actor_parameter_metrics_prove_live_frozen_sync_and_weight_changes() -> None:
@@ -150,3 +160,4 @@ def test_trainer_forwards_eval_metrics_to_the_logger() -> None:
     assert logged["eval/success_mean"] == 0.0
     assert logged["eval/success/mock"] == 0.0
     assert logger.videos == ["eval/video"]
+    assert logger.tables == ["eval/action_trace"]
