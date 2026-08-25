@@ -37,6 +37,9 @@ class ControllerMetrics:
         self._joint_limit_clamped_by_joint = np.zeros(6, dtype=np.int64)
         self._dq_max_sum = 0.0
         self._ik_step_sum = 0.0
+        self._target_lag_sum = 0.0
+        self._lag_clamped = 0
+        self._ws_clamped = 0
         self._cmd_speed_sum = 0.0
         self._cmd_axis_sum = np.zeros(3, dtype=np.float64)
         self._cmd_axis_abs_sum = np.zeros(3, dtype=np.float64)
@@ -66,6 +69,9 @@ class ControllerMetrics:
             self._joint_limit_clamped_by_joint[i] += int(diagnostics.get(f"joint_{i + 1}_limit_clamped", 0.0) > 0.0)
         self._dq_max_sum += float(diagnostics.get("dq_max", 0.0))
         self._ik_step_sum += float(diagnostics.get("ik_step_norm", 0.0))
+        self._target_lag_sum += float(diagnostics.get("target_lag_norm", 0.0))
+        self._lag_clamped += int(diagnostics.get("lag_clamped", 0.0) > 0.0)
+        self._ws_clamped += int(diagnostics.get("ws_clamped", 0.0) > 0.0)
         self._cmd_speed_sum += float(diagnostics.get("cmd_speed_m_s", 0.0))
         for i, axis in enumerate("xyz"):
             cmd = float(diagnostics.get(f"cmd_{axis}", 0.0))
@@ -107,6 +113,9 @@ class ControllerMetrics:
             "frac_joint_limit_clamped": self._joint_limit_clamped / self._n,
             "dq_max_mean": self._dq_max_sum / self._n,
             "ik_step_norm_mean": self._ik_step_sum / self._n,
+            "target_lag_norm_mean": self._target_lag_sum / self._n,
+            "frac_lag_clamped": self._lag_clamped / self._n,
+            "frac_ws_clamped": self._ws_clamped / self._n,
             "cmd_speed_m_s_mean": self._cmd_speed_sum / self._n,
             "ori_error_norm_mean": self._ori_error_sum / self._n,
             "ori_task_norm_mean": self._ori_task_sum / self._n,

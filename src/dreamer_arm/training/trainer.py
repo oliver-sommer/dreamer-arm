@@ -373,6 +373,12 @@ class OnlineTrainer:
             result = evaluate(agent, self._eval_envs, self._cfg.eval_episode_num)
             if result.video is not None:
                 self._logger.video("eval/video", result.video)
+            if result.action_trace is not None:
+                self._logger.table(
+                    "eval/action_trace",
+                    result.action_trace.columns,
+                    result.action_trace.rows,
+                )
             self._logger.scalars(result.metrics)
             self._logger.write(env_step, fps=False)
 

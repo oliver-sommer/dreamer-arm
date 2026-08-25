@@ -31,6 +31,29 @@ class ArmConfig:
     max_ee_speed_m_s: float = 0.35
     """Maximum Cartesian speed per axis at action magnitude 1.0 (m/s)."""
 
+    max_lag_m: float = 0.035
+    """Maximum retained-target tracking error per Cartesian axis (m).
+
+    This anti-windup leash preserves contact authority without allowing an
+    obstructed or unreachable target to drift arbitrarily far from the arm.
+    The default matches ``max_ee_speed_m_s * joint_target_horizon_s``.
+    """
+
+    workspace_low: tuple[float, float, float] | None = None
+    """Fallback Cartesian workspace lower bound ``(x, y, z)`` in metres.
+
+    YAM prefers the attached Meta-World environment's ``mocap_low`` bound;
+    this value is used only when the environment exposes no bound.
+    ``None`` together with ``workspace_high=None`` leaves it unbounded.
+    """
+
+    workspace_high: tuple[float, float, float] | None = None
+    """Fallback Cartesian workspace upper bound ``(x, y, z)`` in metres.
+
+    Must be supplied together with ``workspace_low``.  See that field for
+    environment-first resolution semantics.
+    """
+
     damping: float = 0.10
     """DLS regularisation λ on the length-scaled task Jacobian (dimensionless
     singular values, see length_scale), where the YAM home spectrum's
@@ -64,11 +87,10 @@ class ArmConfig:
     """
 
     joint_target_horizon_s: float = 0.10
-    """Short lookahead used to turn Cartesian velocity into an IK displacement.
+    """Time scale used for nullspace gain and joint-target step limits.
 
-    Position servos need a target ahead of the measured joints to produce
-    useful contact force; this horizon supplies that lead without retaining
-    state across controller steps.
+    Cartesian translation uses the retained target's tracking error instead;
+    ``max_lag_m`` now bounds that servo lead directly.
     """
 
     length_scale: float = 0.25

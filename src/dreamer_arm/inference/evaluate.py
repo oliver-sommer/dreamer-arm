@@ -31,6 +31,14 @@ _ACTION_LABELS = ("x", "y", "z", "gripper")
 
 
 @dataclass
+class ActionTrace:
+    """Tabular deterministic action trace for one evaluation pass."""
+
+    columns: list[str] = field(default_factory=list)
+    rows: list[list[str | int | float]] = field(default_factory=list)
+
+
+@dataclass
 class EvalResult:
     """Outcome of one evaluation pass.
 
@@ -38,10 +46,14 @@ class EvalResult:
         metrics: Ready-to-log scalars, already namespaced under ``eval/``.
         video:   ``(T, H, W, C)`` frames from env 0's first episode, or
                  ``None`` when the envs expose no ``scene`` observation.
+        action_trace: One compact table containing the first deterministic
+                      actions for every task, rather than hundreds of scalar
+                      series that W&B renders as separate charts.
     """
 
     metrics: dict[str, float] = field(default_factory=dict)
     video: np.ndarray | None = None
+    action_trace: ActionTrace | None = None
 
 
 def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
@@ -201,33 +213,40 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
             metrics[f"eval/action_{label}_pre_mean"] = float(pre_means[:, index].mean())
             metrics[f"eval/action_{label}_pre_std"] = float(pre_stds[:, index].mean())
 
+    trace_columns = ["task", "timestep"]
+    trace_columns += [f"action_{label}" for label in _ACTION_LABELS]
+    trace_columns += [f"pre_mean_{label}" for label in _ACTION_LABELS]
+    trace_columns += [f"pre_std_{label}" for label in _ACTION_LABELS]
+    trace_rows: list[list[str | int | float]] = []
     traced_tasks: set[str] = set()
     for slot, task_name in enumerate(slot_task_names):
         if task_name is None:
             task_name = f"env_{slot}"
-        safe_name = task_name.replace("-", "_").replace(" ", "_")
-        if safe_name in traced_tasks:
+        if task_name in traced_tasks:
             continue
-        traced_tasks.add(safe_name)
+        traced_tasks.add(task_name)
         trace = np.asarray(slot_actions[slot])
         for step, action in enumerate(trace):
-            for index, value in enumerate(action):
-                label = _ACTION_LABELS[index] if index < len(_ACTION_LABELS) else str(index)
-                metrics[f"eval/action_trace/{safe_name}/t{step:02d}_{label}"] = float(value)
-        if slot_pre_means[slot] and slot_pre_stds[slot]:
-            task_pre_mean = np.asarray(slot_pre_means[slot]).mean(axis=0)
-            task_pre_std = np.asarray(slot_pre_stds[slot]).mean(axis=0)
-            for index in range(task_pre_mean.shape[-1]):
-                label = _ACTION_LABELS[index] if index < len(_ACTION_LABELS) else str(index)
-                metrics[f"eval/action_trace/{safe_name}/pre_mean_{label}"] = float(task_pre_mean[index])
-                metrics[f"eval/action_trace/{safe_name}/pre_std_{label}"] = float(task_pre_std[index])
+            pre_mean = slot_pre_means[slot][step] if step < len(slot_pre_means[slot]) else np.full(len(action), np.nan)
+            pre_std = slot_pre_stds[slot][step] if step < len(slot_pre_stds[slot]) else np.full(len(action), np.nan)
+            trace_rows.append(
+                [task_name, step]
+                + [float(value) for value in action]
+                + [float(value) for value in pre_mean]
+                + [float(value) for value in pre_std]
+            )
 
     metrics.update(_actor_parameter_metrics(agent))
 
     for diag_name, diag_vals in ctrl_diags.items():
         metrics[f"eval/ctrl_{diag_name}"] = float(np.mean(diag_vals))
 
-    return EvalResult(metrics=metrics, video=np.stack(video_frames) if video_frames else None)
+    action_trace = ActionTrace(columns=trace_columns, rows=trace_rows) if trace_rows else None
+    return EvalResult(
+        metrics=metrics,
+        video=np.stack(video_frames) if video_frames else None,
+        action_trace=action_trace,
+    )
 
 
 def _actor_parameter_metrics(agent: Any) -> dict[str, float]:

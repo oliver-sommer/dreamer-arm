@@ -1,4 +1,4 @@
-"""Weights & Biases metric sink (scalars, videos, histograms).
+"""Weights & Biases metric sink (scalars, videos, histograms, tables).
 
 Replaces the reference repo's TensorBoard + JSONL + stdout mix with a single
 W&B-only sink. The logger buffers metrics between :meth:`write` calls so the
@@ -93,6 +93,7 @@ class WandbLogger:
         self._videos: dict[str, np.ndarray] = {}
         self._images: dict[str, np.ndarray] = {}
         self._histograms: dict[str, np.ndarray] = {}
+        self._tables: dict[str, tuple[list[str], list[list[Any]]]] = {}
         self._last_step: int | None = None
         self._last_time: float | None = None
         self._max_logged_step: int | None = None
@@ -183,6 +184,10 @@ class WandbLogger:
     def histogram(self, name: str, values: _Array) -> None:
         self._histograms[name] = _to_numpy(values)
 
+    def table(self, name: str, columns: list[str], rows: list[list[Any]]) -> None:
+        """Buffer structured rows as one W&B table instead of N scalar keys."""
+        self._tables[name] = (list(columns), [list(row) for row in rows])
+
     def write(self, step: int, fps: bool = False) -> None:
         self._flush_pending()
 
@@ -205,6 +210,8 @@ class WandbLogger:
             payload[name] = wandb.Image(arr)
         for name, arr in self._histograms.items():
             payload[name] = wandb.Histogram(arr.tolist())
+        for name, (columns, rows) in self._tables.items():
+            payload[name] = wandb.Table(columns=columns, data=rows)
         now = time.time()
         if payload:
             wandb.log(payload, step=step)
@@ -216,6 +223,7 @@ class WandbLogger:
         self._videos.clear()
         self._images.clear()
         self._histograms.clear()
+        self._tables.clear()
 
     def keepalive(self, step: int) -> None:
         """Send an empty wandb.log if no log has been sent recently."""

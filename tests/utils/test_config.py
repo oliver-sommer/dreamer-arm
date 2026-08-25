@@ -198,6 +198,9 @@ def test_default_policy_rate_preserves_metaworld_horizon() -> None:
     assert cfg.envs.sim.action_repeat == 2  # 80 Hz controller / 2 = 40 Hz policy
     assert cfg.envs.sim.time_limit == 250
     assert cfg.envs.sim.action_repeat * cfg.envs.sim.time_limit == 500
+    assert cfg.envs.sim.arms.max_lag_m == pytest.approx(0.035)
+    assert cfg.envs.sim.arms.workspace_low is None
+    assert cfg.envs.sim.arms.workspace_high is None
 
 
 def test_default_eval_warmup_schedule() -> None:
