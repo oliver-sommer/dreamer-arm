@@ -84,8 +84,15 @@ class WandbLogger:
             mode=mode,  # type: ignore[arg-type]
             config=dict(config) if config is not None else None,
             dir=str(logdir) if logdir is not None else None,
-            reinit=True,
+            reinit="finish_previous",
         )
+        # W&B's internal row counter must increase on every log call, but
+        # train and eval can legitimately emit separate rows for the same
+        # environment transition (for example, both at the 2.5k milestone).
+        # Use an explicit semantic axis instead of falsifying the environment
+        # step to dodge W&B's monotonically-increasing internal counter.
+        self._run.define_metric("env_step", hidden=True)
+        self._run.define_metric("*", step_metric="env_step")
         self._video_fps = video_fps
         self._warned_no_ffmpeg = False
         self._scalars: dict[str, _Scalar] = {}
@@ -96,7 +103,6 @@ class WandbLogger:
         self._tables: dict[str, tuple[list[str], list[list[Any]]]] = {}
         self._last_step: int | None = None
         self._last_time: float | None = None
-        self._max_logged_step: int | None = None
         self._last_log_time: float = time.time()
         self._keepalive_secs: float = 60.0
 
@@ -191,15 +197,9 @@ class WandbLogger:
     def write(self, step: int, fps: bool = False) -> None:
         self._flush_pending()
 
-        # wandb silently drops any log whose step <= the previous committed step.
-        # Nudge by 1 on collision so eval payloads (including video) always land.
-        if self._max_logged_step is not None and step <= self._max_logged_step:
-            step = self._max_logged_step + 1
-        self._max_logged_step = step
-
         fps_value = self._compute_fps(step) if fps else None
         log.info(self._console_line(step))
-        payload: dict[str, Any] = dict(self._scalars)
+        payload: dict[str, Any] = {"env_step": step, **self._scalars}
         if fps_value is not None:
             payload["fps/fps"] = fps_value
         for name, arr in self._videos.items():
@@ -213,11 +213,11 @@ class WandbLogger:
         for name, (columns, rows) in self._tables.items():
             payload[name] = wandb.Table(columns=columns, data=rows)
         now = time.time()
-        if payload:
-            wandb.log(payload, step=step)
-            self._last_log_time = now
-        elif now - self._last_log_time >= self._keepalive_secs:
-            wandb.log({}, step=step)
+        # Do not pass W&B's reserved ``step=`` argument here. Its internal
+        # history row remains monotonic while ``env_step`` can correctly be
+        # equal across separate train/eval records.
+        if len(payload) > 1 or now - self._last_log_time >= self._keepalive_secs:
+            wandb.log(payload)
             self._last_log_time = now
         self._scalars.clear()
         self._videos.clear()
@@ -229,7 +229,7 @@ class WandbLogger:
         """Send an empty wandb.log if no log has been sent recently."""
         now = time.time()
         if now - self._last_log_time >= self._keepalive_secs:
-            wandb.log({}, step=step)
+            wandb.log({"env_step": step})
             self._last_log_time = now
 
     def finish(self) -> None:

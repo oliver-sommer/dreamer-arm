@@ -144,14 +144,31 @@ def test_write_flushes_pending_deferred_scalars(monkeypatch: Any) -> None:
 def test_table_is_buffered_as_one_wandb_payload_and_cleared(monkeypatch: Any) -> None:
     logger = _make_logger()
     captured: dict[str, Any] = {}
-    monkeypatch.setattr("dreamer_arm.utils.tracking.wandb.log", lambda payload, step: captured.update(payload))
+    monkeypatch.setattr("dreamer_arm.utils.tracking.wandb.log", lambda payload: captured.update(payload))
     logger.table("eval/action_trace", ["task", "timestep", "action_x"], [["reach", 0, 0.25]])
 
     logger.write(step=0)
 
-    assert list(captured) == ["eval/action_trace"]
+    assert list(captured) == ["env_step", "eval/action_trace"]
+    assert captured["env_step"] == 0
     assert captured["eval/action_trace"].columns == ["task", "timestep", "action_x"]
     assert logger._tables == {}
+
+
+def test_write_preserves_duplicate_environment_steps(monkeypatch: Any) -> None:
+    """Train and eval rows at one transition count must share the true x value."""
+    logger = _make_logger()
+    rows: list[dict[str, Any]] = []
+    monkeypatch.setattr("dreamer_arm.utils.tracking.wandb.log", lambda payload: rows.append(dict(payload)))
+
+    logger.scalar("train/loss", 1.0)
+    logger.write(step=2500)
+    logger.scalar("eval/success_mean", 0.0)
+    logger.write(step=2500)
+
+    assert [row["env_step"] for row in rows] == [2500, 2500]
+    assert rows[0]["train/loss"] == 1.0
+    assert rows[1]["eval/success_mean"] == 0.0
 
 
 def test_encode_video_returns_none_when_ffmpeg_missing(monkeypatch: Any) -> None:

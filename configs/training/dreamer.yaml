@@ -60,7 +60,10 @@ trainer:
   # Additional one-shot evaluations during the early learning transient.
   # Each runs before the first collection step after its milestone; milestones
   # at or below a resumed checkpoint's step are not replayed.
-  eval_warmup_steps: [1000, 2500, 5000, 10000, 15000]
+  # The prefill is 1,040 transitions with the defaults, so a 1k evaluation
+  # would be an exact repeat of the untrained step-0 baseline. Start after
+  # optimisation has actually begun.
+  eval_warmup_steps: [2500, 5000, 10000, 15000]
   # Agent checkpoint cadence (env steps).  Refreshes <logdir>/latest.pt
   # (~a few hundred MB: weights+optimiser), atomically replaced each time.
   checkpoint_every: 50000

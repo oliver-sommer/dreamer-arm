@@ -205,7 +205,13 @@ def test_default_policy_rate_preserves_metaworld_horizon() -> None:
 
 def test_default_eval_warmup_schedule() -> None:
     cfg = _compose("training/dreamer", [])
-    assert list(cfg.trainer.eval_warmup_steps) == [1000, 2500, 5000, 10000, 15000]
+    assert list(cfg.trainer.eval_warmup_steps) == [2500, 5000, 10000, 15000]
+
+
+def test_dinowm_disables_monolithic_inductor_compile() -> None:
+    cfg = _compose("training/dreamer", ["core/model=dinowm"])
+    assert cfg.core.model.wm == "dinowm"
+    assert cfg.core.model.compile is False
 
 
 def test_single_task_group_requires_a_task() -> None:

@@ -26,6 +26,13 @@ core:
   model:
     wm: dinowm
 
+    # A DINO-WM update contains the frame-window predictor loop plus the full
+    # imagination rollout. Capturing that entire dynamic update as one
+    # Inductor graph creates a scheduler graph too large for Inductor's fusion
+    # pass on CUDA. Eager execution is the supported, correctness-first path
+    # until the update is split into independently compilable regions.
+    compile: false
+
     # Token-space imagination is far more expensive per start than the
     # RSSM's 2560-d vector -- see the plan's Cost table. Mandatory
     # (validate_config and build_world_model both reject wm=dinowm with
