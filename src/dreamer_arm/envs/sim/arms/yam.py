@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 import mujoco
 import numpy as np
 
+from dreamer_arm.envs.action import ActionSpec
 from dreamer_arm.envs.control.ik import IKConfig, quat_log_error, solve_dls
 from dreamer_arm.envs.control.metrics import ServoState
 from dreamer_arm.envs.sim.arms.base import ArmConfig
@@ -179,7 +180,7 @@ class YamArm:
         # matches Meta-World's Sawyer mocap bounds; the following-error leash is
         # tracking anti-windup, bounding any transient that contact can store.
         control_dt = float(m.opt.timestep) * int(env.frame_skip)
-        np.multiply(a[:3], cfg.max_ee_speed_m_s, out=self._velocity)
+        np.multiply(a[ActionSpec.CARTESIAN], cfg.max_ee_speed_m_s, out=self._velocity)
         np.multiply(self._velocity, control_dt, out=self._p_cmd)
         self._p_cmd += self._p_target
         ws_clamped = bool(np.any((self._p_cmd < self._ws_low) | (self._p_cmd > self._ws_high)))
@@ -251,7 +252,7 @@ class YamArm:
             mujoco.mj_forward(m, d)
             return
 
-        g_ctrl = float(_GRIPPER_MAX_OPEN * (1.0 - float(a[3])) / 2.0)
+        g_ctrl = float(_GRIPPER_MAX_OPEN * (1.0 - float(a[ActionSpec.GRIPPER])) / 2.0)
 
         ctrl = d.ctrl.copy()
         ctrl[self._arm_act_ids] = q_target

@@ -64,6 +64,8 @@ entrypoint configs sit beside the subsystem they launch.
 src/dreamer_arm/
   core/               model + algorithm: agent, world models, networks, losses, buffer, optim
   envs/               shared wrappers plus interchangeable environment backends
+    action.py          shared normalized policy-action contract
+    observation.py     shared camera/proprioception/task observation contract
     control/           backend-independent Cartesian IK and controller metrics
     sim/               MuJoCo / Meta-World envs, arm adapters, rendering, and controller bench
     hardware/          reserved for physical-robot integration

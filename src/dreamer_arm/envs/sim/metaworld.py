@@ -6,7 +6,8 @@ non-privileged modalities that the Dreamer encoder can consume:
   ``scene``      - uint8 RGB (H, W, 3) from our own ``mujoco.Renderer``
   ``wrist_image``- uint8 RGB (H, W, 3) from the wrist camera (optional)
   ``proprio``    - float32 (10,): arm joint angles (6), gripper opening (1),
-                   TCP xyz (3).  For Sawyer the joint-angle slots are zeroed.
+                   controlled-tool xyz (3). For Sawyer the joint-angle slots
+                   are zeroed.
   ``task_id``    - float32 one-hot (num_tasks,) for multi-task runs (optional)
 
 The privileged ``state`` returned by ``env._get_obs()`` is **never** fed to
@@ -33,14 +34,14 @@ from typing import Any, ClassVar
 import gymnasium
 import mujoco
 import numpy as np
-from gymnasium import spaces
 
+from dreamer_arm.envs.action import ACTION_SPEC
 from dreamer_arm.envs.control.metrics import ControllerMetrics
+from dreamer_arm.envs.observation import ObservationSpec
 from dreamer_arm.envs.sim.arms.base import Arm
 from dreamer_arm.envs.sim.rendering import SceneRenderer
 
 _ARM_JOINT_NAMES = [f"joint{i}" for i in range(1, 7)]
-_PROPRIO_DIM = 10  # 6 joint angles + 1 gripper open + 3 TCP xyz
 
 
 class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
@@ -68,13 +69,18 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         viewer: bool = False,
     ) -> None:
         super().__init__()
-        self._arm = arm
         self._arm_plugin = arm_plugin
-        self._size = size
         self._wrist_camera = wrist_camera
         self._task_idx = task_idx
-        self._num_tasks = num_tasks
         self._success_threshold = success_threshold
+        if (task_idx is None) != (num_tasks is None):
+            raise ValueError("task_idx and num_tasks must be supplied together")
+        self._action_spec = ACTION_SPEC
+        self._observation_spec = ObservationSpec(
+            image_size=size,
+            wrist_image=wrist_camera is not None,
+            task_count=num_tasks,
+        )
 
         self._env = env
         env.set_task(task)
@@ -133,18 +139,8 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
 
             self._mj_viewer = _mjv.launch_passive(env.model, env.data)
 
-        # Observation & action spaces
-        H, W = size
-        obs_dict: dict[str, spaces.Space[Any]] = {
-            "scene": spaces.Box(0, 255, (H, W, 3), dtype=np.uint8),
-            "proprio": spaces.Box(-np.inf, np.inf, (_PROPRIO_DIM,), dtype=np.float32),
-        }
-        if wrist_camera is not None:
-            obs_dict["wrist_image"] = spaces.Box(0, 255, (H, W, 3), dtype=np.uint8)
-        if task_idx is not None and num_tasks is not None:
-            obs_dict["task_id"] = spaces.Box(0.0, 1.0, (num_tasks,), dtype=np.float32)
-        self.observation_space: spaces.Dict = spaces.Dict(obs_dict)
-        self.action_space: spaces.Box = spaces.Box(-1.0, 1.0, (4,), dtype=np.float32)
+        self.observation_space = self._observation_spec.make_space()
+        self.action_space = self._action_spec.make_space()
 
     def reset(
         self,
@@ -182,8 +178,8 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         but the last is immediately overwritten and its rendered pixels are
         never read -- see ``wrappers.py``.
         """
-        action = np.asarray(action, dtype=np.float32)
         try:
+            action = self._action_spec.coerce(action)
             _, reward, terminated, truncated, inner_info = self._env.step(action)
         except (ValueError, RuntimeError):
             # Physics instability (NaN positions) propagated into reward computation.
@@ -255,33 +251,33 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
     def _get_obs_dict(self, render: bool = True) -> dict[str, np.ndarray]:
         if render or self._last_scene is None:
             self._last_scene = self._render_scene()
-        obs: dict[str, np.ndarray] = {
-            "scene": self._last_scene,
-            "proprio": self._get_proprio(),
-        }
-        if self._wrist_camera is not None:
-            if render or self._last_wrist is None:
-                self._last_wrist = self._render_wrist()
-            obs["wrist_image"] = self._last_wrist
-        if self._task_idx is not None and self._num_tasks is not None:
-            one_hot = np.zeros(self._num_tasks, dtype=np.float32)
-            one_hot[self._task_idx] = 1.0
-            obs["task_id"] = one_hot
-        return obs
+        if self._wrist_camera is not None and (render or self._last_wrist is None):
+            self._last_wrist = self._render_wrist()
 
-    def _get_proprio(self) -> np.ndarray:
         d = self._env.data
         joints = (
             d.qpos[self._arm_qadr].astype(np.float32) if self._arm_qadr is not None else np.zeros(6, dtype=np.float32)
         )
         lc = np.asarray(d.body("leftclaw").xpos)
         rc = np.asarray(d.body("rightclaw").xpos)
-        gripper_open = np.array(
-            [float(np.clip(np.linalg.norm(rc - lc) / 0.1, 0.0, 1.0))],
-            dtype=np.float32,
+        gripper_open = float(np.linalg.norm(rc - lc) / 0.1)
+        # The shared contract names the Cartesian point controlled by each
+        # backend. YAM controls grasp_site; Sawyer's upstream mocap path and
+        # rewards use the mean of its two finger sites (tcp_center).
+        tool_position = (
+            np.asarray(d.site_xpos[self._grasp_site_id], dtype=np.float32)
+            if self._is_yam
+            else np.asarray(self._env.tcp_center, dtype=np.float32)
         )
-        tcp = np.asarray(d.body("hand").xpos, dtype=np.float32)
-        return np.concatenate([joints, gripper_open, tcp])
+        assert self._last_scene is not None
+        return self._observation_spec.make(
+            scene=self._last_scene,
+            joint_positions=joints,
+            gripper_open=gripper_open,
+            tool_position=tool_position,
+            wrist_image=self._last_wrist,
+            task_index=self._task_idx,
+        )
 
     def _render_scene(self) -> np.ndarray:
         return self._rendering.render_scene()
