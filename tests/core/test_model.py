@@ -22,13 +22,14 @@ _H = _W = 32
 _N = 2
 
 
-def _obs_space() -> spaces.Dict:
-    return spaces.Dict(
-        {
-            "scene": spaces.Box(0, 255, (_H, _W, 3), dtype=np.uint8),
-            "proprio": spaces.Box(-np.inf, np.inf, (7,), dtype=np.float32),
-        }
-    )
+def _obs_space(task_count: int = 0) -> spaces.Dict:
+    obs: dict[str, spaces.Space] = {
+        "scene": spaces.Box(0, 255, (_H, _W, 3), dtype=np.uint8),
+        "proprio": spaces.Box(-np.inf, np.inf, (7,), dtype=np.float32),
+    }
+    if task_count:
+        obs["task_id"] = spaces.Box(0.0, 1.0, (task_count,), dtype=np.float32)
+    return spaces.Dict(obs)
 
 
 def _act_space() -> spaces.Box:
@@ -42,7 +43,7 @@ def _compose(config_name: str, overrides: list[str]):  # type: ignore[no-untyped
     return cfg
 
 
-def _run_smoke(agent: Dreamer, batch_length: int) -> None:
+def _run_smoke(agent: Dreamer, batch_length: int, task_count: int = 0) -> None:
     buffer = ReplayBuffer(
         BufferConfig(max_size=256, batch_size=_N, batch_length=batch_length, device="cpu", storage_device="cpu")
     )
@@ -55,13 +56,20 @@ def _run_smoke(agent: Dreamer, batch_length: int) -> None:
             "proprio": torch.randn(_N, 7),
             "is_first": torch.tensor([t == 0] * _N),
         }
+        if task_count:
+            obs["task_id"] = torch.nn.functional.one_hot(torch.arange(_N) % task_count, num_classes=task_count).float()
         action, next_state = agent.act(obs, state, eval_mode=False)
         assert torch.isfinite(action).all()
+        policy_diag = agent.policy_diagnostics(next_state)
+        assert policy_diag["post_mode"].shape == action.shape
+        assert policy_diag["pre_mean"].shape == action.shape
+        assert policy_diag["pre_std"].shape == action.shape
 
         td = TensorDict(
             {
                 "scene": obs["scene"],
                 "proprio": obs["proprio"],
+                **({"task_id": obs["task_id"]} if task_count else {}),
                 "action": action.detach(),
                 "reward": torch.randn(_N, 1),
                 "is_first": obs["is_first"],
@@ -86,6 +94,7 @@ def test_rssm_agent_acts_and_updates() -> None:
     cfg = _compose(
         "training/dreamer",
         [
+            "core/model=r2dreamer",
             "envs/sim=metaworld",
             "envs.sim.task=door-open",
             "envs.sim.size=[32,32]",
@@ -124,11 +133,38 @@ def test_dinowm_agent_acts_and_updates() -> None:
     _run_smoke(agent, batch_length=8)
 
 
+def test_dinowm_multitask_agent_preserves_task_id_end_to_end() -> None:
+    task_count = 10
+    cfg = _compose(
+        "training/dreamer",
+        [
+            "core/model=dinowm",
+            "envs.sim.size=[32,32]",
+            "core.model.dinowm.encoder.pretrained=false",
+            "core.model.dinowm.encoder.image_size=32",
+            "core.model.dinowm.context=3",
+            "core.model.dinowm.predictor.depth=1",
+            "core.model.dinowm.predictor.heads=2",
+            "core.model.dinowm.predictor.dim_head=8",
+            "core.model.dinowm.predictor.mlp_dim=16",
+            "core.model.imag_starts=4",
+            "core.model.imag_horizon=3",
+            "device=cpu",
+            "core.model.compile=false",
+        ],
+    )
+    agent = Dreamer(cfg.core.model, _obs_space(task_count), _act_space())
+    state = agent.get_initial_state(_N)
+    assert "task_id" in state
+    _run_smoke(agent, batch_length=8, task_count=task_count)
+
+
 def test_to_and_checkpoint_round_trip_preserve_frozen_views() -> None:
     """`.to()` and checkpoint load must rebuild frozen views from the moved/loaded weights."""
     cfg = _compose(
         "training/dreamer",
         [
+            "core/model=r2dreamer",
             "envs/sim=metaworld",
             "envs.sim.task=door-open",
             "envs.sim.size=[32,32]",

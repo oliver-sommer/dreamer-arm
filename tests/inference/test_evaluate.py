@@ -9,8 +9,17 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
+from torch import nn
 
-from dreamer_arm.inference.evaluate import EVAL_SEED, EvalResult, evaluate
+from dreamer_arm.core.frozen import freeze_clone
+from dreamer_arm.inference.evaluate import (
+    ACTION_TRACE_STEPS,
+    EVAL_SEED,
+    EvalResult,
+    _actor_parameter_metrics,
+    evaluate,
+)
 from dreamer_arm.training.trainer import OnlineTrainer
 from tests.training.test_trainer import (
     _make_trainer_cfg,
@@ -76,6 +85,39 @@ def test_evaluate_rounds_up_to_whole_rounds() -> None:
     result = evaluate(_MockAgent(num_envs=4), envs, episodes=5)
     # ceil(5/4) = 2 rounds across 4 envs = 8 episodes, all from task "mock".
     assert result.metrics["eval/success/mock"] == 0.0
+    assert result.metrics["eval/episodes_completed"] == 8.0
+    assert result.metrics["eval/task_count"] == 1.0
+
+
+def test_evaluate_logs_rewards_and_first_twenty_deterministic_actions() -> None:
+    envs = _MockVectorEnv(num_envs=2, done_every=25)
+    result = evaluate(_MockAgent(num_envs=2), envs, episodes=2)
+
+    assert result.metrics["eval/return/mock"] == 25.0
+    assert result.metrics["eval/return_mean"] == 25.0
+    trace_keys = [key for key in result.metrics if key.startswith("eval/action_trace/mock/") and key.endswith("_x")]
+    assert len(trace_keys) == ACTION_TRACE_STEPS
+    assert all(result.metrics[key] == 0.0 for key in trace_keys)
+
+
+def test_actor_parameter_metrics_prove_live_frozen_sync_and_weight_changes() -> None:
+    class _ActorAgent(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ac = nn.Module()
+            self.ac.actor = nn.Linear(3, 2)
+            self.ac._frozen_actor = freeze_clone(self.ac.actor)
+
+    agent = _ActorAgent()
+    before = _actor_parameter_metrics(agent)
+    with torch.no_grad():
+        agent.ac.actor.weight.add_(0.25)
+    after = _actor_parameter_metrics(agent)
+
+    assert after["eval/actor_param_checksum"] != before["eval/actor_param_checksum"]
+    assert after["eval/actor_param_norm"] != before["eval/actor_param_norm"]
+    assert after["eval/actor_live_frozen_max_diff"] == 0.0
+    assert after["eval/actor_live_frozen_shared_fraction"] == 1.0
 
 
 @pytest.mark.parametrize("episodes", [1, 2, 4])

@@ -28,14 +28,11 @@ from dreamer_arm.utils.tensor import tensorstats, to_f32
 def sanitize_action(action: torch.Tensor, discrete: bool) -> torch.Tensor:
     """Scrub + clamp a continuous action to the space the env executes.
 
-    bounded_normal bounds only the *mean* (tanh); samples add Gaussian
-    noise and are unbounded — they reached ±4 in practice (4x the EE
-    controller's design velocity, 16x the jerk-penalty calibration).  The
-    env clamps to [-1, 1] on execution, so anything that conditions on an
+    Continuous policy distributions are expected to be bounded already, but
+    this remains the final contract guard: anything that conditions on an
     action — the replay buffer, the world model's prev_action, and the
-    imagination rollout the actor/critic train on — must see the *same*
-    clamped value, or the policy is trained against a distribution the env
-    never runs.
+    imagination rollout the actor/critic train on — must see exactly the
+    [-1, 1] value the environment executes.
 
     nan_to_num first: MPS occasionally produces a non-finite sample, and a
     single NaN action NaNs every downstream latent and loss (this was the
@@ -151,6 +148,16 @@ class ActorCritic(nn.Module):
         action_dist = self._frozen_actor(feat)
         action = action_dist.mode if eval_mode else action_dist.rsample()
         return sanitize_action(action, self.act_discrete)
+
+    @torch.no_grad()
+    def policy_diagnostics(self, feat: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Expose actor values on the exact frozen rollout path used by ``act``."""
+        dist = self._frozen_actor(feat)
+        diagnostics = {"post_mode": sanitize_action(dist.mode, self.act_discrete)}
+        if not self.act_discrete and hasattr(dist, "pre_mean") and hasattr(dist, "pre_std"):
+            diagnostics["pre_mean"] = dist.pre_mean
+            diagnostics["pre_std"] = dist.pre_std
+        return diagnostics
 
     def _gather_imag_starts(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Flatten a ``(B, T, ...)`` posterior trajectory into imagination starts.
@@ -278,6 +285,9 @@ class ActorCritic(nn.Module):
                 metrics[f"action_{label}_mean"] = component.mean()
                 metrics[f"action_{label}_std"] = component.std()
                 metrics[f"action_{label}_frac_saturated"] = (component.abs() >= 1.0 - 1e-6).float().mean()
+                if hasattr(policy, "pre_mean") and hasattr(policy, "pre_std"):
+                    metrics[f"action_{label}_pre_mean"] = policy.pre_mean[..., index].mean()
+                    metrics[f"action_{label}_pre_std"] = policy.pre_std[..., index].mean()
 
         rep_last = to_f32(data["is_last"]).unsqueeze(-1)
         rep_term = to_f32(data["is_terminal"]).unsqueeze(-1)

@@ -4,7 +4,7 @@ The world model is selected by ``config.wm`` (``"rssm"`` default, or
 ``"dinowm"``; see :mod:`dreamer_arm.core.world_model`). For the RSSM, the
 representation loss is further selected by ``config.rep_loss``:
 
-- ``"r2dreamer"`` (default): decoder-free. A linear projector maps the RSSM
+- ``"r2dreamer"``: decoder-free. A linear projector maps the RSSM
   latent feature to the encoder embedding space and the two are pushed
   together via :func:`dreamer_arm.core.losses.barlow_twins_loss` (eq. 5 of
   the R2-Dreamer paper).
@@ -175,6 +175,16 @@ class Dreamer(nn.Module):
         feat = self.frozen_wm.get_feat(next_state)
         action = self.ac.act(feat, eval_mode)
         return action, TensorDict({**next_state, "prev_action": action}, batch_size=state.batch_size)
+
+    @torch.no_grad()
+    def policy_diagnostics(self, state: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Inspect the actor on an already-observed rollout state.
+
+        Evaluation calls this immediately after :meth:`act`, so it measures
+        the same frozen world-model feature and actor parameters without a
+        second image-encoder pass.
+        """
+        return self.ac.policy_diagnostics(self.frozen_wm.get_feat(dict(state)))
 
     def update(self, replay_buffer: Any) -> dict[str, torch.Tensor]:
         data, index, initial = replay_buffer.sample(self.replay_cache_keys)

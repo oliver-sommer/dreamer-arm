@@ -3,7 +3,7 @@
 #
 #   pixi run inference checkpoint=logs/<date>/<time>/best.pt envs.sim.task=MT10
 #   pixi run inference checkpoint=<path> envs/sim=metaworld envs.sim.task=door-open
-#   pixi run inference checkpoint=<path> core/model=dinowm envs.sim.task=door-open  # DINO-WM checkpoint
+#   pixi run inference checkpoint=<path> core/model=r2dreamer envs.sim.task=door-open  # RSSM checkpoint
 #
 # Model and env groups must match those the checkpoint was trained with,
 # otherwise the weights will not load into the constructed agent.
@@ -11,7 +11,7 @@
 defaults:
   - /envs/sim: metaworld-mt
   # Listed after /envs/sim -- see the matching comment in training/dreamer.yaml.
-  - /core/model: r2dreamer
+  - /core/model: dinowm
   - /utils/logging: default
   - _self_
 

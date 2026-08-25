@@ -225,11 +225,65 @@ class Bound:
         return self._dist.log_prob(x)
 
 
+class TanhNormal:
+    """Independent Normal followed by a differentiable tanh transform.
+
+    The previous ``bounded_normal`` only bounded the Normal's *location* and
+    relied on a later hard clamp for samples.  That made the distribution the
+    actor scored differ from the distribution the world model and environment
+    executed: all Normal tail mass collapsed onto atoms at -1/+1, while
+    ``log_prob`` still evaluated the ordinary Normal density at those points.
+
+    This wrapper keeps samples strictly inside the action bounds and applies
+    the tanh change-of-variables correction in ``log_prob``.  ``pre_mean`` and
+    ``pre_std`` intentionally expose the unsquashed parameters for policy-path
+    diagnostics.
+    """
+
+    def __init__(self, mean: torch.Tensor, std: torch.Tensor, eps: float = 1e-6) -> None:
+        self.pre_mean = to_f32(mean)
+        self.pre_std = to_f32(std)
+        self._base = torchd.Normal(self.pre_mean, self.pre_std)
+        self._eps = eps
+
+    @property
+    def mode(self) -> torch.Tensor:
+        return torch.tanh(self.pre_mean)
+
+    @property
+    def mean(self) -> torch.Tensor:
+        # The exact transformed mean has no simple closed form.  The
+        # deterministic action is the transformed base mode, which is also the
+        # intended evaluation action.
+        return self.mode
+
+    def rsample(self, sample_shape: tuple[int, ...] = ()) -> torch.Tensor:
+        return torch.tanh(self._base.rsample(sample_shape))
+
+    def sample(self, sample_shape: tuple[int, ...] = ()) -> torch.Tensor:
+        return torch.tanh(self._base.sample(sample_shape))
+
+    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
+        # atanh is undefined at the closed interval endpoints.  Samples from
+        # this distribution never reach them, but clamping makes scoring old
+        # replay/checkpoint actions and defensive env-clamped values finite.
+        bounded = value.clamp(-1.0 + self._eps, 1.0 - self._eps)
+        pre = torch.atanh(bounded)
+        log_det = torch.log1p(-(bounded * bounded) + self._eps)
+        return (self._base.log_prob(pre) - log_det).sum(dim=-1)
+
+    def entropy(self) -> torch.Tensor:
+        # A tanh-Normal has no analytic entropy.  A reparameterised one-sample
+        # estimate preserves the required entropy gradient without pretending
+        # that the unsquashed Normal is the executed action distribution.
+        sample = self.rsample()
+        return -self.log_prob(sample)
+
+
 def bounded_normal(x: torch.Tensor, min_std: float, max_std: float, **_: Any) -> DistLike:
     mean, std = torch.chunk(x, 2, dim=-1)
     std = (max_std - min_std) * torch.sigmoid(std + 2.0) + min_std
-    base = torchd.Normal(torch.tanh(to_f32(mean)), to_f32(std))
-    return torchd.Independent(base, 1)
+    return TanhNormal(to_f32(mean), to_f32(std))
 
 
 def normal_std_fixed(mean: torch.Tensor, std: float, **_: Any) -> DistLike:

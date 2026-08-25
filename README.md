@@ -1,18 +1,22 @@
 # dreamer-arm
 
-A Dreamer (**R2-Dreamer** / **DreamerV3**) implementation for the
+A Dreamer (**DINO-WM** / **R2-Dreamer** / **DreamerV3**) implementation for the
 [**i2rt YAM**][i2rt_yam] bimanual robotic arm, trained in MuJoCo via the
 [DeepMind Control Suite][dmc] stack.
 
 The world model is configurable behind a single config switch:
 
-- `core/model=r2dreamer` *(default)* — decoder-free, augmentation-free. Trains
+- `core/model=dinowm` *(default)* — frozen DINOv3 patch tokens plus a learned
+  causal token predictor. Dynamic proprioception (joint pose, gripper state,
+  TCP position) is embedded into the predicted state; immutable task identity
+  is also carried exactly through imagined rollouts.
+- `core/model=r2dreamer` — decoder-free, augmentation-free. Trains
   the RSSM with a Barlow-Twins redundancy-reduction loss between the image encoder
   embedding and a projector over the latent state (per [Morihira et al., 2026][r2dreamer_paper]).
 - `core/model=dreamerv3` — classic decoder-based reconstruction baseline.
 
-Everything else (RSSM with categorical stochastic state, KL balancing,
-actor–critic with λ-returns, LaProp + adaptive gradient clipping) is shared.
+The actor–critic with λ-returns, LaProp, and adaptive gradient clipping is
+shared across world models.
 
 ## Quick start
 
@@ -21,7 +25,7 @@ actor–critic with λ-returns, LaProp + adaptive gradient clipping) is shared.
 git submodule update --init --recursive
 pixi install
 
-# train R2-Dreamer on multi-task Meta-World MT10 (default)
+# train DINO-WM on multi-task Meta-World MT10 (default)
 pixi run training
 
 # larger multi-task benchmark, one env per task
@@ -33,6 +37,9 @@ pixi run training envs/sim=metaworld envs.sim.task=door-open envs/sim/arms=sawye
 
 # DreamerV3 baseline
 pixi run training core/model=dreamerv3
+
+# decoder-free RSSM baseline
+pixi run training core/model=r2dreamer
 
 # evaluate a saved checkpoint
 pixi run inference checkpoint=logs/<date>/<time>/best.pt envs.sim.task=MT10

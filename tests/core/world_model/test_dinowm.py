@@ -114,3 +114,30 @@ def test_dinowm_loss_is_chunk_invariant(tiny_dinowm_cfg) -> None:  # type: ignor
     assert torch.equal(tok_a, tok_b)
     assert torch.equal(act_a, act_b)
     assert torch.allclose(grad_a, grad_b, atol=1e-5)
+
+
+def test_task_id_is_exact_and_persistent_through_imagination(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]
+    """Task context must not be reconstructed by the learned dynamics."""
+    tiny_dinowm_cfg.mlp_keys = "proprio|task_id"
+    shapes = {"scene": (32, 32, 3), "proprio": (5,), "task_id": (3,)}
+    dinowm = DinoWM(tiny_dinowm_cfg, shapes, act_dim=4, num_patches=4, embed_dim=384)
+    b, t = 2, 6
+    task_id = torch.zeros(b, t, 3)
+    task_id[0, :, 0] = 1.0
+    task_id[1, :, 2] = 1.0
+    tokens = torch.randn(b, t, 4, dinowm.tok_dim)
+
+    state, _ = dinowm.loss(tokens, torch.randn(b, t, 4), task_id)
+    expected = task_id[:, dinowm.context :]
+    assert torch.equal(state["task_id"], expected)
+
+    start = {key: value[:, 0] for key, value in state.items()}
+    next_state = dinowm.img_step(start, torch.randn(b, 4))
+    assert torch.equal(next_state["task_id"], start["task_id"])
+    # Even with identical predicted tokens, exact task context reaches every
+    # actor/reward/value feature unchanged.
+    same_tokens = next_state["tokens"][:1].expand(b, *next_state["tokens"].shape[1:])
+    conditioned = {**next_state, "tokens": same_tokens}
+    feat = dinowm.get_feat(conditioned)
+    assert torch.equal(feat[:, -3:], start["task_id"])
+    assert not torch.equal(feat[0], feat[1])

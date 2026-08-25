@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pytest
 
 _SIGMA_MIN_HOME_FLOOR = 0.12
 
@@ -138,5 +139,25 @@ def test_yam_exposes_servo_state_after_attach() -> None:
         assert state.qpos_indices.shape == (6,)
         assert state.actuator_ids.shape == (6,)
         assert state.home_qpos.shape == (6,)
+    finally:
+        inner.close()
+
+
+def test_yam_action_dimension_signs_units_and_gripper_mapping() -> None:
+    """XYZ is ordered velocity in m/s; positive gripper closes."""
+    inner, arm, _ = _make_yam_inner()
+    try:
+        inner.reset()
+        action = np.array([0.25, -0.5, 0.75, 1.0], dtype=np.float32)
+        control_dt = float(inner.model.opt.timestep) * int(inner.frame_skip)
+        inner.step(action)
+        diagnostics = arm.last_diagnostics or {}
+
+        expected_delta = action[:3] * arm._cfg.max_ee_speed_m_s * control_dt
+        assert diagnostics["cmd_x"] == pytest.approx(expected_delta[0])
+        assert diagnostics["cmd_y"] == pytest.approx(expected_delta[1])
+        assert diagnostics["cmd_z"] == pytest.approx(expected_delta[2])
+        assert diagnostics["cmd_speed_m_s"] == pytest.approx(np.linalg.norm(action[:3] * arm._cfg.max_ee_speed_m_s))
+        assert inner.data.ctrl[arm._grip_act_id] == pytest.approx(0.0)
     finally:
         inner.close()

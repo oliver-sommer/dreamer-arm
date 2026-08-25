@@ -15,7 +15,7 @@ Each implementation documents its own keys (RSSM: ``stoch``/``deter``).
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch
 
@@ -42,14 +42,14 @@ class WorldModel(Protocol):
         """Flatten ``state`` into the feature vector the heads consume."""
         ...
 
-    def encode_for_act(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+    def encode_for_act(self, obs: dict[str, torch.Tensor]) -> Any:
         """Embed one step of raw observation ``(B, ...)`` for rollout inference."""
         ...
 
     def observe_step(
         self,
         prev_state: dict[str, torch.Tensor],
-        encoded: torch.Tensor,
+        encoded: Any,
         prev_action: torch.Tensor,
         is_first: torch.Tensor,
     ) -> dict[str, torch.Tensor]:

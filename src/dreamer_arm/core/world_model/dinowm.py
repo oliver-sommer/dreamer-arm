@@ -174,7 +174,9 @@ class DinoWM(nn.Module):
     tokens; ``actions_out (B, [T,] context-1, action_dim_embed)`` -- the
     *embedded* actions that led out of the first ``context-1`` frames of that
     window (the action leading out of the last frame is supplied fresh to
-    :meth:`img_step`, since it is what is being decided).
+    :meth:`img_step`, since it is what is being decided); and, for multi-task
+    runs, ``task_id (B, [T,] task_dim)`` -- the exact one-hot conditioning
+    carried unchanged through imagination rather than predicted as dynamics.
     """
 
     def __init__(
@@ -197,6 +199,14 @@ class DinoWM(nn.Module):
         if self.mlp_shapes:
             proprio_dim = sum(sum(v) for v in self.mlp_shapes.values())
             self.proprio_embed = Embedder(proprio_dim, self.extra_dim)
+        # Task identity is context, not a dynamical quantity.  It is still
+        # included in the per-frame extra embedding above (so the predictor
+        # can model task-specific dynamics), but the actor/reward/value heads
+        # also receive the exact one-hot separately.  Otherwise imagination
+        # asks the predictor to reconstruct a 10-d proprio+task embedding and
+        # task conditioning can drift after the first imagined step.
+        self.task_key = "task_id" if "task_id" in self.mlp_shapes else None
+        self.task_dim = int(sum(self.mlp_shapes[self.task_key])) if self.task_key is not None else 0
 
         self.action_dim_embed = int(config.action_dim_embed)
         self.action_embed = Embedder(act_dim, self.action_dim_embed)
@@ -213,7 +223,8 @@ class DinoWM(nn.Module):
             raise ValueError(f"Unsupported feat_pool: {feat_pool!r}")
         self.feat_pool = feat_pool
         self.num_patches = num_patches
-        self.feat_size = self.tok_dim if feat_pool == "mean" else self.tok_dim * num_patches
+        pooled_size = self.tok_dim if feat_pool == "mean" else self.tok_dim * num_patches
+        self.feat_size = pooled_size + self.task_dim
 
         for module in (self.proprio_embed, self.action_embed, self.predictor):
             if module is not None:
@@ -236,7 +247,10 @@ class DinoWM(nn.Module):
     def initial(self, batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
         tokens = torch.zeros(batch_size, self.context, self.num_patches, self.tok_dim, device=device)
         actions_out = torch.zeros(batch_size, self.context - 1, self.action_dim_embed, device=device)
-        return {"tokens": tokens, "actions_out": actions_out}
+        state = {"tokens": tokens, "actions_out": actions_out}
+        if self.task_key is not None:
+            state[self.task_key] = torch.zeros(batch_size, self.task_dim, device=device)
+        return state
 
     def img_step(self, state: dict[str, torch.Tensor], action: torch.Tensor) -> dict[str, torch.Tensor]:
         tokens = state["tokens"]  # (N, context, P, tok)
@@ -247,15 +261,24 @@ class DinoWM(nn.Module):
         pred_out = self.predictor(pred_in)[:, -1, :, : self.tok_dim]
         new_tokens = torch.cat([tokens[:, 1:], pred_out.unsqueeze(1)], dim=1)
         new_actions_out = ctx_actions[:, 1:]
-        return {"tokens": new_tokens, "actions_out": new_actions_out}
+        next_state = {"tokens": new_tokens, "actions_out": new_actions_out}
+        if self.task_key is not None:
+            next_state[self.task_key] = state[self.task_key]
+        return next_state
 
     def get_feat(self, state: dict[str, torch.Tensor]) -> torch.Tensor:
         last_frame = state["tokens"][..., -1, :, :]  # (..., P, tok)
-        if self.feat_pool == "mean":
-            return last_frame.mean(dim=-2)
-        return last_frame.reshape(*last_frame.shape[:-2], -1)
+        pooled = last_frame.mean(dim=-2) if self.feat_pool == "mean" else last_frame.reshape(*last_frame.shape[:-2], -1)
+        if self.task_key is not None:
+            return torch.cat([pooled, state[self.task_key]], dim=-1)
+        return pooled
 
-    def loss(self, tokens: torch.Tensor, action: torch.Tensor) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    def loss(
+        self,
+        tokens: torch.Tensor,
+        action: torch.Tensor,
+        task_id: torch.Tensor | None = None,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Teacher-forced next-frame-token prediction.
 
         ``tokens (B, T, P, tok)`` (already frozen-encoder + extra-modality
@@ -309,6 +332,13 @@ class DinoWM(nn.Module):
             "tokens": tokens[:, 1:].unfold(1, h, 1).permute(0, 1, 4, 2, 3).detach(),
             "actions_out": action_embed[:, 2:].unfold(1, h - 1, 1).permute(0, 1, 3, 2).detach(),
         }
+        if self.task_key is not None:
+            if task_id is None:
+                raise ValueError("DINO-WM configured with task_id but the training batch omitted it")
+            # Each observed imagination state ends at tokens[h:], so its exact
+            # task id is aligned to the same current state.  It remains raw and
+            # detached: conditioning is not something the dynamics predicts.
+            state[self.task_key] = task_id[:, h:].reshape(b, num_windows, -1).detach()
         return state, pred_loss
 
 
@@ -322,7 +352,8 @@ class DinoWorldModel:
     ``dinowm``, whose *trainable* parameters do need one for imagination).
 
     State keys: ``tokens (B, [T,] context, P, tok)``, ``actions_out (B, [T,]
-    context - 1, action_dim_embed)`` -- see :class:`DinoWM`.
+    context - 1, action_dim_embed)``, and optional exact ``task_id`` -- see
+    :class:`DinoWM`.
     """
 
     replay_cache_keys: tuple[str, ...] = ()
@@ -356,15 +387,18 @@ class DinoWorldModel:
             tokens = self.dinowm.tile_and_cat(tokens, extra)
         return tokens
 
-    def encode_for_act(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+    def encode_for_act(self, obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """``encode`` needs a ``(B, T, ...)`` sequence; rollout sees one frame ``(B, ...)``."""
         obs_seq = {k: (v.unsqueeze(1) if isinstance(v, torch.Tensor) else v) for k, v in obs.items()}
-        return self.encode(obs_seq).squeeze(1)
+        encoded = {"tokens": self.encode(obs_seq).squeeze(1)}
+        if self.dinowm.task_key is not None:
+            encoded[self.dinowm.task_key] = obs[self.dinowm.task_key].reshape(obs[self.dinowm.task_key].shape[0], -1)
+        return encoded
 
     def observe_step(
         self,
         prev_state: dict[str, torch.Tensor],
-        encoded: torch.Tensor,
+        encoded: dict[str, torch.Tensor],
         prev_action: torch.Tensor,
         is_first: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
@@ -383,12 +417,16 @@ class DinoWorldModel:
         prev_action_e = dinowm.action_embed(prev_action)
         prev_action_e = torch.where(rpad(is_first, prev_action_e.dim() - is_first.dim()), 0.0, prev_action_e)
         new_actions_out = torch.cat([actions_out[:, 1:], prev_action_e.unsqueeze(1)], dim=1)
-        new_window = torch.cat([tokens[:, 1:], encoded.unsqueeze(1)], dim=1)
-        return {"tokens": new_window, "actions_out": new_actions_out}
+        new_window = torch.cat([tokens[:, 1:], encoded["tokens"].unsqueeze(1)], dim=1)
+        next_state = {"tokens": new_window, "actions_out": new_actions_out}
+        if dinowm.task_key is not None:
+            next_state[dinowm.task_key] = encoded[dinowm.task_key]
+        return next_state
 
     def loss(
         self, data: dict[str, torch.Tensor], initial: dict[str, torch.Tensor]
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         tokens = self.encode(data)
-        state, pred_loss = self.dinowm.loss(tokens, data["action"])
+        task_id = data.get(self.dinowm.task_key) if self.dinowm.task_key is not None else None
+        state, pred_loss = self.dinowm.loss(tokens, data["action"], task_id)
         return state, {"pred": pred_loss.mean()}, {}

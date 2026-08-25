@@ -694,8 +694,8 @@ def test_eval_at_start_false_waits_for_normal_cadence(monkeypatch: Any) -> None:
     assert eval_calls == 0
 
 
-def test_eval_warmup_steps_fire_once_at_safe_boundaries(monkeypatch: Any) -> None:
-    """Milestones crossed mid-episode wait for the next boundary."""
+def test_eval_warmup_steps_do_not_wait_for_episode_boundaries(monkeypatch: Any) -> None:
+    """Long synchronized episodes must not delay or coalesce milestones."""
     N = 2
     envs = _MockVectorEnv(num_envs=N, done_every=2)
     agent = _MockAgent(num_envs=N)
@@ -712,9 +712,9 @@ def test_eval_warmup_steps_fire_once_at_safe_boundaries(monkeypatch: Any) -> Non
 
     trainer.begin(agent)
 
-    # 4 is an episode boundary.  10 is crossed halfway through the next
-    # episode, so the shared-env evaluation safely runs at step 12.
-    assert eval_steps == [4, 12]
+    # 4 is an episode boundary while 10 is mid-episode. Both run at their
+    # requested step rather than coalescing at the boundary at step 12.
+    assert eval_steps == [4, 10]
 
 
 def test_eval_warmup_steps_before_resume_are_not_replayed(monkeypatch: Any) -> None:

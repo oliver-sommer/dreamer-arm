@@ -8,8 +8,8 @@
 #   pixi run training envs/sim=metaworld-mt envs.sim.task=MT50 envs.sim.env_num=50
 #   pixi run training envs/sim=metaworld    envs.sim.task=door-open              # single task
 #   pixi run training envs/sim=metaworld    envs.sim.task=door-open envs/sim/arms=sawyer
-#   pixi run training core/model=dreamerv3                               # swap world model (RSSM variant)
-#   pixi run training core/model=dinowm envs.sim.task=door-open              # swap world model (DINO-WM)
+#   pixi run training core/model=r2dreamer                              # swap to decoder-free RSSM
+#   pixi run training core/model=dreamerv3                              # swap to reconstruction RSSM
 
 defaults:
   - /core/buffer
@@ -18,7 +18,7 @@ defaults:
   # `envs.sim.size` (needed so the ViT backbone's patch grid matches the
   # rendered resolution) must be applied after /envs's own default, or the
   # later group would clobber it back to 64x64.
-  - /core/model: r2dreamer
+  - /core/model: dinowm
   - /utils/logging: default
   - _self_
 
@@ -48,8 +48,8 @@ trainer:
   # Eval is expensive with shared train/eval envs: each eval steps the envs
   # for a full episode (time_limit × env_num global policy steps — 12500 for
   # MT50), so eval_every must be several times that or most env
-  # compute goes to eval.  The trainer additionally defers shared-env eval to
-  # episode boundaries so training episodes are never truncated.
+  # compute goes to eval. Shared-env eval interrupts the current collection
+  # episode, then resumes with fresh episode ids so milestones are not delayed.
   eval_every: 25000
   eval_episode_num: ${envs.sim.eval_episode_num}
   # Run one eval pass before the first training step, so W&B gets a baseline
@@ -58,9 +58,8 @@ trainer:
   # when eval is disabled (eval_episode_num: 0).
   eval_at_start: true
   # Additional one-shot evaluations during the early learning transient.
-  # Like periodic eval, each milestone is deferred to the first episode
-  # boundary after the step is crossed because eval shares the train envs.
-  # Milestones at or below a resumed checkpoint's step are not replayed.
+  # Each runs before the first collection step after its milestone; milestones
+  # at or below a resumed checkpoint's step are not replayed.
   eval_warmup_steps: [1000, 2500, 5000, 10000, 15000]
   # Agent checkpoint cadence (env steps).  Refreshes <logdir>/latest.pt
   # (~a few hundred MB: weights+optimiser), atomically replaced each time.

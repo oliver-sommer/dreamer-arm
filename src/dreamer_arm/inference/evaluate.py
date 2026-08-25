@@ -26,6 +26,8 @@ log = logging.getLogger(__name__)
 
 #: Fixed seed for evaluation resets, so eval is deterministic across checkpoints.
 EVAL_SEED = 12345
+ACTION_TRACE_STEPS = 20
+_ACTION_LABELS = ("x", "y", "z", "gripper")
 
 
 @dataclass
@@ -57,6 +59,7 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     num_rounds = max(1, math.ceil(episodes / n))
 
     task_success: dict[str, list[float]] = {}
+    task_returns: dict[str, list[float]] = {}
     # YamArm controller diagnostics, averaged across eval episodes (YAM only).
     ctrl_diags: dict[str, list[float]] = {}
 
@@ -64,6 +67,22 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     state = agent.get_initial_state(n)
     is_first = np.ones(n, dtype=bool)
     completed = np.zeros(n, dtype=np.int32)  # episodes done per env slot
+    episode_steps = np.zeros(n, dtype=np.int32)
+    episode_returns = np.zeros(n, dtype=np.float64)
+
+    # The first episode in every pinned env slot supplies the requested
+    # task-by-task deterministic action trace.  Slot names become available in
+    # final_info at episode end, so retain by slot until then.
+    slot_actions: list[list[np.ndarray]] = [[] for _ in range(n)]
+    slot_pre_means: list[list[np.ndarray]] = [[] for _ in range(n)]
+    slot_pre_stds: list[list[np.ndarray]] = [[] for _ in range(n)]
+    slot_task_names: list[str | None] = [None] * n
+    all_actions: list[np.ndarray] = []
+    all_pre_means: list[np.ndarray] = []
+    all_pre_stds: list[np.ndarray] = []
+    task_ids_seen: set[int] = set()
+    task_id_rows = 0
+    task_id_valid_rows = 0
 
     video_frames: list[np.ndarray] = []
     video_done = False
@@ -77,11 +96,42 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
         }
         obs_torch["is_first"] = torch.from_numpy(is_first).to(device, non_blocking=True)
 
+        if "task_id" in obs_np:
+            task_id = np.asarray(obs_np["task_id"])
+            row_sums = task_id.sum(axis=-1)
+            valid = np.isfinite(task_id).all(axis=-1) & np.isclose(row_sums, 1.0) & (task_id >= 0.0).all(axis=-1)
+            task_id_rows += int(task_id.shape[0])
+            task_id_valid_rows += int(valid.sum())
+            task_ids_seen.update(int(index) for index in task_id[valid].argmax(axis=-1))
+
         with torch.no_grad():
             action_t, next_state = agent.act(obs_torch, state, eval_mode=True)
         action_np = action_t.detach().cpu().numpy()
+        all_actions.append(action_np.copy())
 
-        obs_next_np, _rewards, terms, truncs, info = envs.step(action_np)
+        policy_diag: dict[str, torch.Tensor] = {}
+        if hasattr(agent, "policy_diagnostics"):
+            policy_diag = agent.policy_diagnostics(next_state)
+        pre_mean_np = policy_diag.get("pre_mean")
+        pre_std_np = policy_diag.get("pre_std")
+        pre_mean_arr = pre_mean_np.detach().cpu().numpy() if pre_mean_np is not None else None
+        pre_std_arr = pre_std_np.detach().cpu().numpy() if pre_std_np is not None else None
+        if pre_mean_arr is not None:
+            all_pre_means.append(pre_mean_arr.copy())
+        if pre_std_arr is not None:
+            all_pre_stds.append(pre_std_arr.copy())
+
+        for i in range(n):
+            if completed[i] == 0 and episode_steps[i] < ACTION_TRACE_STEPS:
+                slot_actions[i].append(action_np[i].copy())
+                if pre_mean_arr is not None:
+                    slot_pre_means[i].append(pre_mean_arr[i].copy())
+                if pre_std_arr is not None:
+                    slot_pre_stds[i].append(pre_std_arr[i].copy())
+
+        obs_next_np, rewards, terms, truncs, info = envs.step(action_np)
+        episode_returns += rewards
+        episode_steps += 1
         done = terms | truncs
 
         for i in range(n):
@@ -90,10 +140,14 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
                 task_name = fin.get("task_name", f"env_{i}") if fin is not None else f"env_{i}"
                 success = float(fin.get("success", 0.0)) if fin is not None else 0.0
                 task_success.setdefault(task_name, []).append(success)
+                task_returns.setdefault(task_name, []).append(float(episode_returns[i]))
+                slot_task_names[i] = task_name
                 if fin is not None:
                     for k, v in fin.get("ctrl_diag", {}).items():
                         ctrl_diags.setdefault(k, []).append(float(v))
                 completed[i] += 1
+                episode_returns[i] = 0.0
+                episode_steps[i] = 0
 
         if not video_done and done[0]:
             video_done = True
@@ -116,10 +170,107 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     if all_successes:
         metrics["eval/success_mean"] = float(np.mean(all_successes))
 
+    all_returns: list[float] = []
+    for task_name, returns in task_returns.items():
+        safe_name = task_name.replace("-", "_").replace(" ", "_")
+        metrics[f"eval/return/{safe_name}"] = float(np.mean(returns))
+        all_returns.extend(returns)
+    if all_returns:
+        metrics["eval/return_mean"] = float(np.mean(all_returns))
+
+    metrics["eval/episodes_completed"] = float(completed.sum())
+    metrics["eval/task_count"] = float(len(task_success))
+    if task_id_rows:
+        metrics["eval/task_id_valid_fraction"] = task_id_valid_rows / task_id_rows
+        metrics["eval/task_id_unique_count"] = float(len(task_ids_seen))
+
+    if all_actions:
+        actions = np.concatenate(all_actions, axis=0)
+        for index in range(actions.shape[-1]):
+            label = _ACTION_LABELS[index] if index < len(_ACTION_LABELS) else str(index)
+            component = actions[:, index]
+            metrics[f"eval/action_{label}_mean"] = float(component.mean())
+            metrics[f"eval/action_{label}_std"] = float(component.std())
+            metrics[f"eval/action_{label}_frac_saturated"] = float(np.mean(np.abs(component) >= 1.0 - 1e-6))
+
+    if all_pre_means and all_pre_stds:
+        pre_means = np.concatenate(all_pre_means, axis=0)
+        pre_stds = np.concatenate(all_pre_stds, axis=0)
+        for index in range(pre_means.shape[-1]):
+            label = _ACTION_LABELS[index] if index < len(_ACTION_LABELS) else str(index)
+            metrics[f"eval/action_{label}_pre_mean"] = float(pre_means[:, index].mean())
+            metrics[f"eval/action_{label}_pre_std"] = float(pre_stds[:, index].mean())
+
+    traced_tasks: set[str] = set()
+    for slot, task_name in enumerate(slot_task_names):
+        if task_name is None:
+            task_name = f"env_{slot}"
+        safe_name = task_name.replace("-", "_").replace(" ", "_")
+        if safe_name in traced_tasks:
+            continue
+        traced_tasks.add(safe_name)
+        trace = np.asarray(slot_actions[slot])
+        for step, action in enumerate(trace):
+            for index, value in enumerate(action):
+                label = _ACTION_LABELS[index] if index < len(_ACTION_LABELS) else str(index)
+                metrics[f"eval/action_trace/{safe_name}/t{step:02d}_{label}"] = float(value)
+        if slot_pre_means[slot] and slot_pre_stds[slot]:
+            task_pre_mean = np.asarray(slot_pre_means[slot]).mean(axis=0)
+            task_pre_std = np.asarray(slot_pre_stds[slot]).mean(axis=0)
+            for index in range(task_pre_mean.shape[-1]):
+                label = _ACTION_LABELS[index] if index < len(_ACTION_LABELS) else str(index)
+                metrics[f"eval/action_trace/{safe_name}/pre_mean_{label}"] = float(task_pre_mean[index])
+                metrics[f"eval/action_trace/{safe_name}/pre_std_{label}"] = float(task_pre_std[index])
+
+    metrics.update(_actor_parameter_metrics(agent))
+
     for diag_name, diag_vals in ctrl_diags.items():
         metrics[f"eval/ctrl_{diag_name}"] = float(np.mean(diag_vals))
 
     return EvalResult(metrics=metrics, video=np.stack(video_frames) if video_frames else None)
+
+
+def _actor_parameter_metrics(agent: Any) -> dict[str, float]:
+    """Prove which actor evaluation used and whether its parameters changed."""
+    ac = getattr(agent, "ac", None)
+    actor = getattr(ac, "actor", None)
+    if actor is None:
+        return {}
+
+    with torch.no_grad():
+        params = list(actor.parameters())
+        square_sum = sum(
+            (p.detach().double().square().sum() for p in params),
+            start=torch.zeros((), device=params[0].device, dtype=torch.float64),
+        )
+        # A deterministic, order-sensitive-enough scalar checksum for charts.
+        # It is not a cryptographic integrity check; paired with the norm it
+        # makes a stale actor immediately visible between eval milestones.
+        checksum = sum(
+            (
+                (index + 1) * (p.detach().double().sum() + 0.5 * p.detach().double().abs().sum())
+                for index, p in enumerate(params)
+            ),
+            start=torch.zeros((), device=params[0].device, dtype=torch.float64),
+        )
+        metrics = {
+            "eval/actor_param_norm": float(torch.sqrt(square_sum).cpu()),
+            "eval/actor_param_checksum": float(checksum.cpu()),
+            "eval/actor_param_count": float(sum(p.numel() for p in params)),
+            "eval/agent_training_mode": float(bool(getattr(agent, "training", False))),
+        }
+
+        frozen = getattr(ac, "_frozen_actor", None)
+        if frozen is not None:
+            frozen_params = list(frozen.parameters())
+            if len(frozen_params) == len(params):
+                max_diff = max(
+                    (p.detach() - fp.detach()).abs().max() for p, fp in zip(params, frozen_params, strict=True)
+                )
+                shared = sum(p.data_ptr() == fp.data_ptr() for p, fp in zip(params, frozen_params, strict=True))
+                metrics["eval/actor_live_frozen_max_diff"] = float(max_diff.cpu())
+                metrics["eval/actor_live_frozen_shared_fraction"] = shared / len(params)
+        return metrics
 
 
 def _run(cfg: DictConfig) -> EvalResult:

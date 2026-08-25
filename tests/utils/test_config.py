@@ -185,9 +185,11 @@ def test_dinowm_rejects_size_not_divisible_by_patch_size() -> None:
 
 
 def test_bare_train_defaults_to_mt10() -> None:
-    """No overrides = the multi-task default; nothing is left unset."""
+    """No overrides = DINO-WM on MT10; nothing is left unset."""
     cfg = _compose("training/dreamer", [])
     assert cfg.envs.sim.task == "MT10"
+    assert cfg.core.model.wm == "dinowm"
+    assert list(cfg.envs.sim.size) == [128, 128]
     validate_config(cfg)
 
 

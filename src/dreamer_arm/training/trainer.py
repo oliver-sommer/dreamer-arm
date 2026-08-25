@@ -13,7 +13,9 @@ Design notes
 * Eval reuses the train envs (``eval_envs is train_envs``), so no extra EGL
   contexts are created.  Eval is triggered when the step counter crosses a
   multiple of ``eval_every`` or a one-shot ``eval_warmup_steps`` milestone,
-  then deferred until an env is at an episode boundary (``is_first.any()``).
+  then runs before the next collection step.  A shared-env evaluation resets
+  the interrupted training rollout and allocates fresh episode ids, preventing
+  long synchronized MT episodes from delaying and coalescing early evals.
   ``eval_at_start`` additionally seeds this trigger before the loop's first
   iteration, so a run's first eval reads the policy exactly as ``begin``
   received it -- untrained on a fresh run, whatever ``resume`` restored on a
@@ -177,24 +179,27 @@ class OnlineTrainer:
         self._hb_time = time.time()
 
         while env_step < cfg.steps:
-            # When all envs are in phase (the common case) they reset together,
-            # so .any() == .all() here. But if an env ends out of phase (e.g. an
-            # early termination), requiring .all() could stall forever and eval
-            # would silently never run again; .any() stays robust to desync.
-            if eval_pending and is_first.any():
+            # Run at the first loop boundary after the requested step. Waiting
+            # for an episode boundary makes synchronized MT runs coalesce early
+            # milestones: with MT50, a 250-policy-step episode spans 12,500
+            # global steps. The episode-id seam and is_first below make the
+            # interrupted fragment safe for trajectory sampling.
+            if eval_pending:
                 self._run_eval(agent, env_step)
                 eval_pending = False
-                # Resync: train_envs was used for eval; reset it so collection
-                # resumes from clean episode starts.
-                obs_np = self._train_envs.reset(seed=None)
-                state = agent.get_initial_state(N)
-                is_first = np.ones(N, dtype=bool)
-                episode_ids = np.arange(self._next_ep_id, self._next_ep_id + N, dtype=np.int32)
-                self._next_ep_id += N
-                # The in-flight episodes were abandoned mid-way; carrying their
-                # partial totals over would inflate the next episode's score.
-                ep_return[:] = 0.0
-                ep_len[:] = 0
+                if self._eval_envs is self._train_envs:
+                    # Evaluation reset the shared envs. Start new training
+                    # trajectories rather than splicing them onto the fragments
+                    # collected before the evaluation.
+                    obs_np = self._train_envs.reset(seed=None)
+                    state = agent.get_initial_state(N)
+                    is_first = np.ones(N, dtype=bool)
+                    episode_ids = np.arange(self._next_ep_id, self._next_ep_id + N, dtype=np.int32)
+                    self._next_ep_id += N
+                    # The in-flight episodes were abandoned; carrying partial
+                    # totals over would inflate the next completed episode.
+                    ep_return[:] = 0.0
+                    ep_len[:] = 0
 
             # Build the CPU-side obs tensors once and reuse them for the buffer
             # write below, instead of wrapping the same numpy arrays a second
