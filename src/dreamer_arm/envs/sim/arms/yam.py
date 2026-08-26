@@ -62,6 +62,7 @@ class YamArm:
         self._velocity = np.zeros(3)  # Cartesian velocity scratch
         self._p_cmd = np.zeros(3)  # unclamped/projected target scratch
         self._target_lag = np.zeros(3)  # target-minus-measurement scratch
+        self._target_step = np.zeros(3)  # feasible retained-target change this step
         self._last_diagnostics: dict[str, float] | None = None
 
     @property
@@ -180,6 +181,7 @@ class YamArm:
         # matches Meta-World's Sawyer mocap bounds; the following-error leash is
         # tracking anti-windup, bounding any transient that contact can store.
         control_dt = float(m.opt.timestep) * int(env.frame_skip)
+        previous_target = self._p_target.copy()
         np.multiply(a[ActionSpec.CARTESIAN], cfg.max_ee_speed_m_s, out=self._velocity)
         np.multiply(self._velocity, control_dt, out=self._p_cmd)
         self._p_cmd += self._p_target
@@ -191,6 +193,8 @@ class YamArm:
         np.clip(self._target_lag, -cfg.max_lag_m, cfg.max_lag_m, out=self._target_lag)
         self._p_target[:] = tcp
         self._p_target += self._target_lag
+        self._target_step[:] = self._p_target
+        self._target_step -= previous_target
         e_pos = self._target_lag
 
         ik_cfg = self._ik_cfg
@@ -230,6 +234,14 @@ class YamArm:
             "cmd_x": float(self._velocity[0] * control_dt),
             "cmd_y": float(self._velocity[1] * control_dt),
             "cmd_z": float(self._velocity[2] * control_dt),
+            # Tracking uses the reference displacement the controller could
+            # actually retain after workspace and following-error projection.
+            # Keep cmd_* as the raw policy request so clamp-heavy policies are
+            # still diagnosable independently of servo tracking.
+            "track_cmd_norm": float(np.linalg.norm(self._target_step)),
+            "track_cmd_x": float(self._target_step[0]),
+            "track_cmd_y": float(self._target_step[1]),
+            "track_cmd_z": float(self._target_step[2]),
             "cmd_speed_m_s": float(np.linalg.norm(self._velocity)),
             "ik_step_norm": float(np.linalg.norm(e_pos)),
             "target_lag_norm": float(np.linalg.norm(e_pos)),

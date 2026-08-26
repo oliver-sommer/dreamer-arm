@@ -10,7 +10,7 @@ from dreamer_arm.envs.control.metrics import ControllerMetrics
 
 def test_controller_metrics_tracks_motion_from_reset_pose() -> None:
     data = SimpleNamespace(site_xpos=np.array([[0.0, 0.0, 0.0]]))
-    metrics = ControllerMetrics(enabled=True, site_id=0)
+    metrics = ControllerMetrics(enabled=True, site_id=0, tracking_window_steps=1)
     metrics.reset(data)
     data.site_xpos[0] = [0.01, 0.0, 0.0]
     metrics.accumulate(
@@ -37,7 +37,9 @@ def test_controller_metrics_tracks_motion_from_reset_pose() -> None:
     summary = metrics.summary()
     assert summary is not None
     assert summary["track_ratio_mean"] == pytest.approx(0.5)
+    assert summary["path_ratio_mean"] == pytest.approx(0.5)
     assert summary["frac_stuck"] == 0.0
+    assert summary["frac_undertracking"] == 0.0
     assert summary["ori_error_norm_mean"] == pytest.approx(0.4)
     assert summary["ori_task_norm_mean"] == pytest.approx(0.1)
     assert summary["cmd_x_mean"] == pytest.approx(0.02)
@@ -51,7 +53,7 @@ def test_controller_metrics_tracks_motion_from_reset_pose() -> None:
 
 def test_controller_metrics_does_not_count_orthogonal_drift_as_tracking() -> None:
     data = SimpleNamespace(site_xpos=np.array([[0.0, 0.0, 0.0]]))
-    metrics = ControllerMetrics(enabled=True, site_id=0)
+    metrics = ControllerMetrics(enabled=True, site_id=0, tracking_window_steps=1)
     metrics.reset(data)
     data.site_xpos[0] = [0.0, 0.02, 0.0]
     metrics.accumulate(
@@ -71,12 +73,27 @@ def test_controller_metrics_does_not_count_orthogonal_drift_as_tracking() -> Non
     assert summary is not None
     assert summary["track_ratio_mean"] == pytest.approx(0.0)
     assert summary["motion_ratio_mean"] == pytest.approx(1.0)
+    assert summary["frac_undertracking"] == 1.0
+    assert summary["frac_stuck"] == 0.0
+
+
+def test_controller_metrics_only_calls_a_true_lack_of_motion_stuck() -> None:
+    data = SimpleNamespace(site_xpos=np.array([[0.0, 0.0, 0.0]]))
+    metrics = ControllerMetrics(enabled=True, site_id=0, tracking_window_steps=1)
+    metrics.reset(data)
+    metrics.accumulate({"cmd_x": 0.01, "cmd_y": 0.0, "cmd_z": 0.0}, data)
+
+    summary = metrics.summary()
+    assert summary is not None
+    assert summary["frac_undertracking"] == 1.0
     assert summary["frac_stuck"] == 1.0
+    assert summary["path_ratio_mean"] == 0.0
+    assert metrics.stall_samples == 1
 
 
 def test_controller_metrics_copies_mujoco_position_buffer() -> None:
     data = SimpleNamespace(site_xpos=np.array([[0.0, 0.0, 0.0]]))
-    metrics = ControllerMetrics(enabled=True, site_id=0)
+    metrics = ControllerMetrics(enabled=True, site_id=0, tracking_window_steps=1)
     metrics.reset(data)
     data.site_xpos[0] = [0.01, 0.0, 0.0]
     metrics.accumulate({"cmd_norm": 0.01}, data)
@@ -94,3 +111,46 @@ def test_controller_metrics_disabled() -> None:
     metrics.reset(data)
     metrics.accumulate({"sigma_min": 0.2}, data)
     assert metrics.summary() is None
+
+
+def test_controller_metrics_tracks_over_servo_response_window() -> None:
+    data = SimpleNamespace(site_xpos=np.array([[0.0, 0.0, 0.0]]))
+    metrics = ControllerMetrics(enabled=True, site_id=0, tracking_window_steps=3)
+    metrics.reset(data)
+    for position in (0.0, 0.0, 0.015):
+        data.site_xpos[0, 0] = position
+        metrics.accumulate({"cmd_x": 0.01, "cmd_y": 0.0, "cmd_z": 0.0}, data)
+
+    summary = metrics.summary()
+    assert summary is not None
+    assert metrics.tracking_samples == 1
+    assert summary["track_ratio_mean"] == pytest.approx(0.5)
+    assert summary["frac_stuck"] == 0.0
+    assert summary["track_sample_fraction"] == 1.0
+
+
+def test_controller_metrics_uses_feasible_tracking_command() -> None:
+    data = SimpleNamespace(site_xpos=np.array([[0.0, 0.0, 0.0]]))
+    metrics = ControllerMetrics(enabled=True, site_id=0, tracking_window_steps=1)
+    metrics.reset(data)
+    metrics.accumulate(
+        {
+            "cmd_norm": 0.01,
+            "cmd_x": -0.01,
+            "cmd_y": 0.0,
+            "cmd_z": 0.0,
+            "track_cmd_norm": 0.0,
+            "track_cmd_x": 0.0,
+            "track_cmd_y": 0.0,
+            "track_cmd_z": 0.0,
+            "ws_clamped": 1.0,
+        },
+        data,
+    )
+
+    summary = metrics.summary()
+    assert summary is not None
+    assert metrics.tracking_samples == 0
+    assert summary["frac_stuck"] == 0.0
+    assert summary["track_sample_fraction"] == 0.0
+    assert summary["frac_ws_clamped"] == 1.0

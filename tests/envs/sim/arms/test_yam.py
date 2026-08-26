@@ -158,6 +158,11 @@ def test_yam_action_dimension_signs_units_and_gripper_mapping() -> None:
         assert diagnostics["cmd_x"] == pytest.approx(expected_delta[0])
         assert diagnostics["cmd_y"] == pytest.approx(expected_delta[1])
         assert diagnostics["cmd_z"] == pytest.approx(expected_delta[2])
+        np.testing.assert_allclose(
+            [diagnostics[f"track_cmd_{axis}"] for axis in "xyz"],
+            expected_delta,
+            atol=1e-12,
+        )
         assert diagnostics["cmd_speed_m_s"] == pytest.approx(np.linalg.norm(action[:3] * arm._cfg.max_ee_speed_m_s))
         assert inner.data.ctrl[arm._grip_act_id] == pytest.approx(0.0)
     finally:
@@ -175,6 +180,8 @@ def test_yam_zero_action_holds_commanded_pose_while_loaded_on_table() -> None:
 
         diagnostics = arm.last_diagnostics or {}
         assert diagnostics["ws_clamped"] == 1.0
+        assert diagnostics["cmd_z"] < 0.0
+        assert diagnostics["track_cmd_z"] == pytest.approx(0.0, abs=1e-12)
         target_at_contact = arm._p_target.copy()
 
         positions = []

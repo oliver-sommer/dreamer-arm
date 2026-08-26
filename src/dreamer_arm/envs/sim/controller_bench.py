@@ -160,6 +160,8 @@ def _blocked_reversal_steps(inner: Any, arm: Any, gid: int, max_steps: int = 40)
 
 def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int, n_dirs: int) -> dict[str, Any]:
     """Hold each axis + ``n_dirs`` random unit directions for ``horizon`` steps."""
+    from dreamer_arm.envs.control.metrics import ControllerMetrics
+
     inner, arm, gid = _build_env(arm_cfg, arm_name, task, seed)
     rng = np.random.default_rng(seed)
     directions = list(_AXIS_DIRS)
@@ -170,6 +172,8 @@ def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int,
     rows: list[dict[str, Any]] = []
     for direction in directions:
         inner.reset()
+        metrics = ControllerMetrics(enabled=True, site_id=gid)
+        metrics.reset(inner.data)
         prev_tcp = _tcp(inner, gid)
         action = np.array([*(0.7 * direction), -1.0], dtype=np.float32)
         ratios: list[float] = []
@@ -180,6 +184,7 @@ def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int,
             diag = arm.last_diagnostics
             tcp = _tcp(inner, gid)
             if diag:
+                metrics.accumulate(diag, inner.data)
                 cmd = float(diag.get("cmd_norm", 0.0))
                 if cmd > 1e-4:
                     achieved = tcp - prev_tcp
@@ -197,13 +202,16 @@ def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int,
         # "Steady state" = the last quarter of the horizon, once the servo
         # has had time to catch up to the leashed setpoint.
         tail = max(1, len(ratios) // 4)
+        metric_summary = metrics.summary() or {}
         rows.append(
             {
                 "direction": direction,
                 "track_mean": float(np.mean(ratios)) if ratios else 0.0,
                 "track_tail_mean": float(np.mean(ratios[-tail:])) if ratios else 0.0,
                 "cos_mean": float(np.mean(cosines)) if cosines else 0.0,
-                "frac_stuck": float(np.mean([r < 0.25 for r in ratios])) if ratios else 1.0,
+                "frac_stuck": float(metric_summary.get("frac_stuck", 0.0)),
+                "frac_undertracking": float(metric_summary.get("frac_undertracking", 0.0)),
+                "path_ratio_mean": float(metric_summary.get("path_ratio_mean", 1.0)),
                 "frac_dq_clamped": dq_clamped / n if n else 0.0,
                 "frac_joint_limit_clamped": joint_limit_clamped / n if n else 0.0,
                 "frac_ori_capped": ori_capped / n if n else 0.0,
@@ -232,6 +240,8 @@ def _roll_probe(arm_cfg: Any, arm_name: str, task: str, seed: int, horizon: int,
         "track_tail_mean",
         "cos_mean",
         "frac_stuck",
+        "frac_undertracking",
+        "path_ratio_mean",
         "frac_dq_clamped",
         "frac_joint_limit_clamped",
         "frac_ori_capped",
@@ -256,12 +266,14 @@ def run_probe(cfg: DictConfig) -> dict[str, float]:
     )
     log.info("probe: task=%s horizon=%d arm_cfg=%s", cfg.envs.sim.task, cfg.horizon, arm_cfg)
     log.info(
-        "  %-19s %10s %10s %8s %8s %8s %8s %8s %8s",
+        "  %-19s %10s %10s %8s %8s %8s %8s %8s %8s %8s %8s",
         "direction",
         "track",
         "track_tl",
         "cos",
         "stuck",
+        "undertrk",
+        "path",
         "dq_clmp",
         "jnt_clmp",
         "ori_cap",
@@ -270,7 +282,7 @@ def run_probe(cfg: DictConfig) -> dict[str, float]:
     for row in result["rows"]:
         d = row["direction"]
         log.info(
-            "  [%+.2f %+.2f %+.2f]  %10.4f %10.4f %8.4f %8.2f %8.2f %8.2f %8.2f %8.0f",
+            "  [%+.2f %+.2f %+.2f]  %10.4f %10.4f %8.4f %8.2f %8.2f %8.2f %8.2f %8.2f %8.2f %8.0f",
             d[0],
             d[1],
             d[2],
@@ -278,6 +290,8 @@ def run_probe(cfg: DictConfig) -> dict[str, float]:
             row["track_tail_mean"],
             row["cos_mean"],
             row["frac_stuck"],
+            row["frac_undertracking"],
+            row["path_ratio_mean"],
             row["frac_dq_clamped"],
             row["frac_joint_limit_clamped"],
             row["frac_ori_capped"],
@@ -285,12 +299,14 @@ def run_probe(cfg: DictConfig) -> dict[str, float]:
         )
     agg = result["agg"]
     log.info(
-        "  %-19s %10.4f %10.4f %8.4f %8.2f %8.2f %8.2f %8.2f %8.2f",
+        "  %-19s %10.4f %10.4f %8.4f %8.2f %8.2f %8.2f %8.2f %8.2f %8.2f %8.2f",
         "MEAN",
         agg["track_mean"],
         agg["track_tail_mean"],
         agg["cos_mean"],
         agg["frac_stuck"],
+        agg["frac_undertracking"],
+        agg["path_ratio_mean"],
         agg["frac_dq_clamped"],
         agg["frac_joint_limit_clamped"],
         agg["frac_ori_capped"],
@@ -321,41 +337,43 @@ def _roll_iid(
     """
     inner, arm, gid = _build_env(arm_cfg, arm_name, task, seed)
     rng = np.random.default_rng(seed)
-    ratios: list[float] = []
-    diag_counts = {
-        "dq_clamped": 0,
-        "joint_limit_clamped": 0,
-        "ori_capped": 0,
-    }
-    diag_n = 0
+    from dreamer_arm.envs.control.metrics import ControllerMetrics
+
+    episode_summaries: list[dict[str, float]] = []
+    tracking_samples = 0
     for _ep in range(n_episodes):
         inner.reset()
-        prev_tcp = _tcp(inner, gid)
+        metrics = ControllerMetrics(enabled=True, site_id=gid)
+        metrics.reset(inner.data)
         for _t in range(horizon):
             a = np.clip(rng.normal(0.0, action_std, 4), -1.0, 1.0).astype(np.float32)
             for _r in range(action_repeat):
                 inner.step(a)
                 diag = arm.last_diagnostics
-                tcp = _tcp(inner, gid)
                 if diag:
-                    diag_n += 1
-                    for key in diag_counts:
-                        diag_counts[key] += int(diag.get(key, 0.0) > 0.0)
-                cmd = float(diag.get("cmd_norm", 0.0)) if diag else 0.0
-                if cmd > 1e-4:
-                    achieved = tcp - prev_tcp
-                    desired = np.array([diag.get(f"cmd_{axis}", 0.0) for axis in "xyz"], dtype=np.float64)
-                    desired_norm = float(np.linalg.norm(desired))
-                    ratios.append(float(achieved @ desired) / (desired_norm * cmd) if desired_norm > 1e-12 else 0.0)
-                prev_tcp = tcp
+                    metrics.accumulate(diag, inner.data)
+        summary = metrics.summary()
+        if summary is not None:
+            episode_summaries.append(summary)
+            tracking_samples += metrics.tracking_samples
     inner.close()
-    arr = np.array(ratios) if ratios else np.zeros(1)
-    result = {
-        "track_ratio_mean": float(arr.mean()),
-        "frac_stuck": float((arr < 0.25).mean()),
-        "n_samples": float(len(ratios)),
-    }
-    result.update({f"frac_{key}": count / diag_n if diag_n else 0.0 for key, count in diag_counts.items()})
+    if not episode_summaries:
+        return {"track_ratio_mean": 1.0, "frac_stuck": 0.0, "n_samples": 0.0}
+    keys = (
+        "track_ratio_mean",
+        "frac_undertracking",
+        "path_ratio_mean",
+        "frac_stuck",
+        "track_sample_fraction",
+        "stall_sample_fraction",
+        "frac_dq_clamped",
+        "frac_joint_limit_clamped",
+        "frac_lag_clamped",
+        "frac_ws_clamped",
+        "frac_ori_capped",
+    )
+    result = {key: float(np.mean([summary[key] for summary in episode_summaries])) for key in keys}
+    result["n_samples"] = float(tracking_samples)
     return result
 
 
