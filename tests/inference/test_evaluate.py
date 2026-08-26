@@ -126,12 +126,20 @@ def test_evaluate_aggregates_conditioning_and_reward_diagnostics() -> None:
             for fin in info["final_info"]:
                 if fin is not None:
                     fin["reward_diag"] = {"in_place_reward": 0.75}
+                    fin["ctrl_diag"] = {"frac_stuck": 0.125, "path_ratio_mean": 0.875}
             return obs, rew, terms, truncs, info
 
     result = evaluate(_DiagnosticAgent(), _DiagnosticEnv(done_every=2), episodes=2)
     assert result.metrics["eval/action_task_id_sensitivity"] == pytest.approx(0.25)
     assert result.metrics["eval/action_proprio_sensitivity"] == pytest.approx(0.5)
     assert result.metrics["eval/action_visual_sensitivity"] == pytest.approx(0.75)
+    assert result.metrics["eval/action_task_id_sensitivity/mock"] == pytest.approx(0.25)
+    assert result.metrics["eval/action_proprio_sensitivity/mock"] == pytest.approx(0.5)
+    assert result.metrics["eval/action_visual_sensitivity/mock"] == pytest.approx(0.75)
+    assert result.metrics["eval/action_x_mean/mock"] == 0.0
+    assert result.metrics["eval/action_x_std/mock"] == 0.0
+    assert result.metrics["eval/ctrl_frac_stuck/mock"] == pytest.approx(0.125)
+    assert result.metrics["eval/ctrl_path_ratio_mean/mock"] == pytest.approx(0.875)
     assert result.metrics["eval/reward_in_place_reward"] == pytest.approx(0.75)
 
 

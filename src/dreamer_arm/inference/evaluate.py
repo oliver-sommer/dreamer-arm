@@ -74,6 +74,7 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     task_returns: dict[str, list[float]] = {}
     # YamArm controller diagnostics, averaged across eval episodes (YAM only).
     ctrl_diags: dict[str, list[float]] = {}
+    ctrl_diags_by_task: dict[str, dict[str, list[float]]] = {}
     reward_diags: dict[str, list[float]] = {}
 
     obs_np = envs.reset(seed=EVAL_SEED)
@@ -96,6 +97,10 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     all_task_sensitivity: list[np.ndarray] = []
     all_proprio_sensitivity: list[np.ndarray] = []
     all_visual_sensitivity: list[np.ndarray] = []
+    slot_all_actions: list[list[np.ndarray]] = [[] for _ in range(n)]
+    slot_task_sensitivity: list[list[float]] = [[] for _ in range(n)]
+    slot_proprio_sensitivity: list[list[float]] = [[] for _ in range(n)]
+    slot_visual_sensitivity: list[list[float]] = [[] for _ in range(n)]
     task_ids_seen: set[int] = set()
     task_id_rows = 0
     task_id_valid_rows = 0
@@ -135,18 +140,31 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
         visual_sensitivity = policy_diag.get("visual_action_sensitivity")
         pre_mean_arr = pre_mean_np.detach().cpu().numpy() if pre_mean_np is not None else None
         pre_std_arr = pre_std_np.detach().cpu().numpy() if pre_std_np is not None else None
+        task_sensitivity_arr = task_sensitivity.detach().cpu().numpy() if task_sensitivity is not None else None
+        proprio_sensitivity_arr = (
+            proprio_sensitivity.detach().cpu().numpy() if proprio_sensitivity is not None else None
+        )
+        visual_sensitivity_arr = visual_sensitivity.detach().cpu().numpy() if visual_sensitivity is not None else None
         if pre_mean_arr is not None:
             all_pre_means.append(pre_mean_arr.copy())
         if pre_std_arr is not None:
             all_pre_stds.append(pre_std_arr.copy())
-        if task_sensitivity is not None:
-            all_task_sensitivity.append(task_sensitivity.detach().cpu().numpy().copy())
-        if proprio_sensitivity is not None:
-            all_proprio_sensitivity.append(proprio_sensitivity.detach().cpu().numpy().copy())
-        if visual_sensitivity is not None:
-            all_visual_sensitivity.append(visual_sensitivity.detach().cpu().numpy().copy())
+        if task_sensitivity_arr is not None:
+            all_task_sensitivity.append(task_sensitivity_arr.copy())
+        if proprio_sensitivity_arr is not None:
+            all_proprio_sensitivity.append(proprio_sensitivity_arr.copy())
+        if visual_sensitivity_arr is not None:
+            all_visual_sensitivity.append(visual_sensitivity_arr.copy())
 
         for i in range(n):
+            if completed[i] < num_rounds:
+                slot_all_actions[i].append(action_np[i].copy())
+                if task_sensitivity_arr is not None:
+                    slot_task_sensitivity[i].append(float(task_sensitivity_arr[i]))
+                if proprio_sensitivity_arr is not None:
+                    slot_proprio_sensitivity[i].append(float(proprio_sensitivity_arr[i]))
+                if visual_sensitivity_arr is not None:
+                    slot_visual_sensitivity[i].append(float(visual_sensitivity_arr[i]))
             if completed[i] == 0 and episode_steps[i] < ACTION_TRACE_STEPS:
                 slot_actions[i].append(action_np[i].copy())
                 if pre_mean_arr is not None:
@@ -170,6 +188,7 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
                 if fin is not None:
                     for k, v in fin.get("ctrl_diag", {}).items():
                         ctrl_diags.setdefault(k, []).append(float(v))
+                        ctrl_diags_by_task.setdefault(task_name, {}).setdefault(k, []).append(float(v))
                     for k, v in fin.get("reward_diag", {}).items():
                         reward_diags.setdefault(k, []).append(float(v))
                 completed[i] += 1
@@ -235,6 +254,33 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     if all_visual_sensitivity:
         metrics["eval/action_visual_sensitivity"] = float(np.concatenate(all_visual_sensitivity).mean())
 
+    # Aggregate policy conditioning by pinned task slot. A healthy MT actor may
+    # legitimately share coarse reaching motion, but these series reveal when
+    # one task (or every task) collapses to the same state-independent command.
+    per_task_actions: dict[str, list[np.ndarray]] = {}
+    per_task_conditioning: dict[str, dict[str, list[float]]] = {}
+    for slot, task_name in enumerate(slot_task_names):
+        safe_name = (task_name or f"env_{slot}").replace("-", "_").replace(" ", "_")
+        per_task_actions.setdefault(safe_name, []).extend(slot_all_actions[slot])
+        conditioning = per_task_conditioning.setdefault(
+            safe_name,
+            {"task_id": [], "proprio": [], "visual": []},
+        )
+        conditioning["task_id"].extend(slot_task_sensitivity[slot])
+        conditioning["proprio"].extend(slot_proprio_sensitivity[slot])
+        conditioning["visual"].extend(slot_visual_sensitivity[slot])
+
+    for safe_name, task_actions in per_task_actions.items():
+        if task_actions:
+            actions = np.asarray(task_actions)
+            for index in range(actions.shape[-1]):
+                label = _ACTION_LABELS[index] if index < len(_ACTION_LABELS) else str(index)
+                metrics[f"eval/action_{label}_mean/{safe_name}"] = float(actions[:, index].mean())
+                metrics[f"eval/action_{label}_std/{safe_name}"] = float(actions[:, index].std())
+        for source, values in per_task_conditioning[safe_name].items():
+            if values:
+                metrics[f"eval/action_{source}_sensitivity/{safe_name}"] = float(np.mean(values))
+
     trace_columns = ["task", "timestep"]
     trace_columns += [f"action_{label}" for label in _ACTION_LABELS]
     trace_columns += [f"pre_mean_{label}" for label in _ACTION_LABELS]
@@ -262,6 +308,19 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
 
     for diag_name, diag_vals in ctrl_diags.items():
         metrics[f"eval/ctrl_{diag_name}"] = float(np.mean(diag_vals))
+    per_task_ctrl_metrics = {
+        "frac_stuck",
+        "frac_undertracking",
+        "path_ratio_mean",
+        "frac_ws_clamped",
+        "frac_lag_clamped",
+        "frac_joint_limit_clamped",
+    }
+    for task_name, task_diags in ctrl_diags_by_task.items():
+        safe_name = task_name.replace("-", "_").replace(" ", "_")
+        for diag_name, diag_vals in task_diags.items():
+            if diag_name in per_task_ctrl_metrics:
+                metrics[f"eval/ctrl_{diag_name}/{safe_name}"] = float(np.mean(diag_vals))
     for diag_name, diag_vals in reward_diags.items():
         metrics[f"eval/reward_{diag_name}"] = float(np.mean(diag_vals))
 

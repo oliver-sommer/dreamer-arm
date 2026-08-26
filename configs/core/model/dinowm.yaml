@@ -53,6 +53,19 @@ core:
       # slope: once the backward's recompute stops fitting, the device pages
       # and lands >20x worse than the loop.  Sweep it, don't assume.
       window_chunk: 1
+      # Close the teacher-forcing gap on the autoregressive path used by
+      # Dreamer imagination. Eight sampled replay contexts bound the added
+      # compute. Gradients reach horizons 3/5/10; horizon 15 is diagnostic-only
+      # after detaching the horizon-10 state. Every listed horizon logs both a
+      # persistence baseline and model skill relative to that baseline.
+      rollout:
+        starts: 8
+        horizons: [1, 3, 5, 10, 15]
+        train_horizons: [3, 5, 10]
+        # Relative weight for patches that changed from the rollout's starting
+        # frame. 1.0 gives changed regions one additional normalized share;
+        # raw unweighted MSE remains the reported rollout accuracy metric.
+        motion_weight: 1.0
       # How reward/value/policy heads pool the last frame's spatial DINO
       # tokens. task_attention uses current proprio + exact task identity as a
       # cross-attention query, retaining task-relevant spatial information at
@@ -78,6 +91,9 @@ core:
       rew: 1.0
       con: 1.0
       pred: 1.0
+      # Same modality-balanced units as pred. Half weight improves open-loop
+      # stability without displacing dense one-step supervision.
+      overshoot: 0.5
       policy: 1.0
       value: 1.0
       repval: 0.3

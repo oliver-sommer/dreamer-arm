@@ -7,6 +7,9 @@ one timm registers locally, just with random weights.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from dreamer_arm.core.world_model.dinowm import DinoEncoder, DinoWM, generate_mask_matrix
@@ -193,3 +196,56 @@ def test_proprio_is_explicit_in_actor_feature(tiny_dinowm_cfg) -> None:  # type:
     assert torch.equal(feat[0, : dinowm.tok_dim], feat[1, : dinowm.tok_dim])
     assert torch.equal(feat[:, -dinowm.proprio_dim :], state["proprio"][:, -1])
     assert not torch.equal(feat[0], feat[1])
+
+
+def test_rollout_loss_trains_autoregressive_horizons_and_logs_baselines(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]
+    tiny_dinowm_cfg.rollout = SimpleNamespace(
+        starts=2,
+        horizons=[1, 3, 5, 10, 15],
+        train_horizons=[3, 5, 10],
+        motion_weight=1.0,
+    )
+    dinowm = DinoWM(tiny_dinowm_cfg, _shapes(), act_dim=4, num_patches=4, embed_dim=384)
+    b, t = 3, 20
+    tokens = torch.randn(b, t, 4, dinowm.tok_dim)
+    proprio = torch.randn(b, t, dinowm.proprio_dim)
+    action = torch.randn(b, t, 4)
+    state, _, _ = dinowm.loss(tokens, proprio, action)
+
+    overshoot, metrics = dinowm.rollout_loss(state, tokens, proprio, action)
+
+    assert overshoot is not None
+    assert overshoot.ndim == 0
+    assert metrics["rollout/start_count"] == 2
+    assert metrics["rollout/max_horizon"] == 15
+    for horizon in (1, 3, 5, 10, 15):
+        for modality in ("visual", "proprio"):
+            assert torch.isfinite(metrics[f"rollout/{modality}_mse_h{horizon}"])
+            assert torch.isfinite(metrics[f"rollout/{modality}_persistence_mse_h{horizon}"])
+            assert torch.isfinite(metrics[f"rollout/{modality}_skill_h{horizon}"])
+        assert torch.isfinite(metrics[f"rollout/visual_motion_weighted_mse_h{horizon}"])
+    for name in (
+        "rollout/action_zero_excess_mse",
+        "rollout/action_shuffled_excess_mse",
+        "rollout/action_zero_effect_mse",
+    ):
+        assert torch.isfinite(metrics[name])
+
+    overshoot.backward()
+    predictor_grads = [p.grad for p in dinowm.predictor.parameters()]
+    assert any(grad is not None for grad in predictor_grads)
+    assert all(grad is None or torch.isfinite(grad).all() for grad in predictor_grads)
+    assert dinowm.action_embed.net.weight.grad is not None
+    assert torch.isfinite(dinowm.action_embed.net.weight.grad).all()
+
+
+def test_rollout_config_rejects_training_horizon_without_diagnostic(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]
+    tiny_dinowm_cfg.rollout = SimpleNamespace(
+        starts=2,
+        horizons=[1, 3],
+        train_horizons=[5],
+        motion_weight=1.0,
+    )
+
+    with pytest.raises(ValueError, match="subset"):
+        DinoWM(tiny_dinowm_cfg, _shapes(), act_dim=4, num_patches=4, embed_dim=384)

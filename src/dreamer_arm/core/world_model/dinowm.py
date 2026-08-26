@@ -11,8 +11,10 @@ pieces:
 - :class:`DinoWM` — the trainable part: a small action embedder and
   :class:`CausalPredictor`, a frame-causal transformer that predicts both the
   next frame's patch tokens and explicit normalized proprioception from a
-  fixed ``context``-frame window (teacher-forced during training). Exact task
-  identity conditions the transition without becoming a prediction target.
+  fixed ``context``-frame window. Dense one-step teacher forcing is augmented
+  with bounded open-loop overshooting on sampled replay contexts so training
+  covers the autoregressive path used by imagination. Exact task identity
+  conditions the transition without becoming a prediction target.
 - :class:`DinoWorldModel` — adapts ``DinoWM`` + ``DinoEncoder`` to the
   :class:`~dreamer_arm.core.world_model.protocol.WorldModel` protocol.
 
@@ -39,6 +41,11 @@ from dreamer_arm.utils.tensor import rpad, symlog
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 _EXCLUDED_OBS_KEYS = ("is_first", "is_last", "is_terminal", "reward")
+
+
+def _skill_vs_baseline(error: torch.Tensor, baseline: torch.Tensor) -> torch.Tensor:
+    """Bounded relative skill: -1 worse, 0 tied, +1 better than baseline."""
+    return (baseline - error) / (baseline + error).clamp_min(1e-8)
 
 
 class DinoEncoder(nn.Module):
@@ -251,6 +258,31 @@ class DinoWM(nn.Module):
         # for GPU occupancy.  1 measured fastest on MPS -- see the config.
         self.window_chunk = int(getattr(config, "window_chunk", 1))
 
+        # One-step teacher forcing alone does not constrain the distribution
+        # the actor actually sees: Dreamer recursively feeds this predictor's
+        # own outputs back for `imag_horizon` steps. A small replay-context
+        # subsample therefore receives an open-loop overshooting loss. Keep it
+        # configurable because its cost is proportional to starts * horizon.
+        rollout_cfg = getattr(config, "rollout", None)
+        self.rollout_starts = int(getattr(rollout_cfg, "starts", 0)) if rollout_cfg is not None else 0
+        self.rollout_horizons = self._validate_horizons(
+            getattr(rollout_cfg, "horizons", (1, 3, 5, 10, 15)) if rollout_cfg is not None else ()
+        )
+        self.rollout_train_horizons = self._validate_horizons(
+            getattr(rollout_cfg, "train_horizons", (3, 5, 10)) if rollout_cfg is not None else ()
+        )
+        self.rollout_motion_weight = (
+            float(getattr(rollout_cfg, "motion_weight", 0.0)) if rollout_cfg is not None else 0.0
+        )
+        if self.rollout_starts < 0:
+            raise ValueError(f"rollout.starts must be non-negative, got {self.rollout_starts}")
+        if self.rollout_motion_weight < 0.0:
+            raise ValueError(f"rollout.motion_weight must be non-negative, got {self.rollout_motion_weight}")
+        if self.rollout_starts and not self.rollout_horizons:
+            raise ValueError("rollout.horizons must be non-empty when rollout.starts is positive")
+        if not set(self.rollout_train_horizons).issubset(self.rollout_horizons):
+            raise ValueError("rollout.train_horizons must be a subset of rollout.horizons")
+
         # Keep this public alias for callers/tests: tokens now contain visual
         # DINO dimensions only; state/task/action are explicit conditioning.
         self.tok_dim = embed_dim
@@ -275,6 +307,13 @@ class DinoWM(nn.Module):
         for module in (self.action_embed, self.predictor):
             module.apply(weight_init_)
 
+    @staticmethod
+    def _validate_horizons(values: Any) -> tuple[int, ...]:
+        horizons = tuple(sorted({int(value) for value in values}))
+        if any(value < 1 for value in horizons):
+            raise ValueError(f"rollout horizons must be positive, got {horizons}")
+        return horizons
+
     def encode_proprio(self, data: dict[str, torch.Tensor]) -> torch.Tensor:
         """Concatenate vector observations and apply fixed, invertible scaling."""
         first = next(iter(self.proprio_shapes))
@@ -297,6 +336,15 @@ class DinoWM(nn.Module):
         return state
 
     def img_step(self, state: dict[str, torch.Tensor], action: torch.Tensor) -> dict[str, torch.Tensor]:
+        return self._img_step(state, action, checkpoint_predictor=False)
+
+    def _img_step(
+        self,
+        state: dict[str, torch.Tensor],
+        action: torch.Tensor,
+        *,
+        checkpoint_predictor: bool,
+    ) -> dict[str, torch.Tensor]:
         tokens = state["tokens"]  # (N, context, P, visual_dim)
         proprio = state["proprio"]  # (N, context, proprio_dim)
         actions_out = state["actions_out"]  # (N, context - 1, AE)
@@ -307,7 +355,10 @@ class DinoWM(nn.Module):
             conditioning.append(state[self.task_key].unsqueeze(1).expand(-1, self.context, -1))
         conditioning.append(ctx_actions)
         pred_in = self.tile_and_cat(tokens, torch.cat(conditioning, dim=-1))
-        pred_out = self.predictor(pred_in)[:, -1]
+        if checkpoint_predictor and torch.is_grad_enabled():
+            pred_out = checkpoint(self.predictor, pred_in, use_reentrant=False)[:, -1]
+        else:
+            pred_out = self.predictor(pred_in)[:, -1]
         pred_tokens = pred_out[..., : self.tok_dim]
         proprio_start = self.tok_dim
         pred_proprio = pred_out[..., proprio_start : proprio_start + self.proprio_dim].mean(dim=-2)
@@ -318,6 +369,125 @@ class DinoWM(nn.Module):
         if self.task_key is not None:
             next_state[self.task_key] = state[self.task_key]
         return next_state
+
+    def rollout_loss(
+        self,
+        state: dict[str, torch.Tensor],
+        tokens: torch.Tensor,
+        proprio: torch.Tensor,
+        action: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+        """Train and diagnose the autoregressive path used by imagination.
+
+        Loss is applied only at ``rollout_train_horizons``. Diagnostics
+        continue through the largest requested horizon under ``no_grad`` after
+        the last trained horizon. Persistence baselines keep a low DINO-token
+        MSE honest on static scenes; action ablations expose ignored controls.
+        """
+        if self.rollout_starts == 0 or not self.rollout_horizons:
+            return None, {}
+
+        b, t = action.shape[:2]
+        num_windows = state["tokens"].shape[1]
+        active_horizons = tuple(horizon for horizon in self.rollout_horizons if horizon < num_windows)
+        if not active_horizons:
+            return None, {}
+        active_train_horizons = tuple(horizon for horizon in self.rollout_train_horizons if horizon in active_horizons)
+        max_horizon = active_horizons[-1]
+        starts_per_row = num_windows - max_horizon
+        assert starts_per_row > 0, (t, self.context, max_horizon)
+
+        count = min(self.rollout_starts, b * starts_per_row)
+        if count <= b:
+            # MT replay is balanced by env slot; distinct slices tend to cover
+            # more tasks than a flat sample that may repeat one slice.
+            rows = torch.randperm(b, device=action.device)[:count]
+            cols = torch.randint(starts_per_row, (count,), device=action.device)
+        else:
+            flat = torch.randperm(b * starts_per_row, device=action.device)[:count]
+            rows, cols = flat // starts_per_row, flat % starts_per_row
+
+        rollout_state = {key: value[rows, cols].detach() for key, value in state.items()}
+        end = self.context + cols
+        initial_tokens = rollout_state["tokens"][:, -1].detach()
+        initial_proprio = rollout_state["proprio"][:, -1].detach()
+
+        # Counterfactual controls are diagnostic only. Comparing their target
+        # error with the real-action error catches both ignored and wrongly
+        # signed action conditioning.
+        first_action = action[rows, end + 1]
+        with torch.no_grad():
+            zero_state = self.img_step(rollout_state, torch.zeros_like(first_action))
+            shuffled_state = self.img_step(rollout_state, first_action.roll(1, dims=0))
+
+        visual_train_losses: list[torch.Tensor] = []
+        proprio_train_losses: list[torch.Tensor] = []
+        metrics: dict[str, torch.Tensor] = {
+            "rollout/start_count": torch.as_tensor(float(count), device=action.device),
+            "rollout/max_horizon": torch.as_tensor(float(max_horizon), device=action.device),
+        }
+        max_train_horizon = max(active_train_horizons, default=0)
+        detached_rollout = False
+
+        for horizon in range(1, max_horizon + 1):
+            rollout_action = action[rows, end + horizon]
+            if horizon <= max_train_horizon:
+                rollout_state = self._img_step(rollout_state, rollout_action, checkpoint_predictor=True)
+            else:
+                if not detached_rollout:
+                    rollout_state = {key: value.detach() for key, value in rollout_state.items()}
+                    detached_rollout = True
+                with torch.no_grad():
+                    rollout_state = self.img_step(rollout_state, rollout_action)
+
+            target_tokens = tokens[rows, end + horizon].detach()
+            target_proprio = proprio[rows, end + horizon].detach()
+            visual_patch_mse = F.mse_loss(rollout_state["tokens"][:, -1], target_tokens, reduction="none").mean(dim=-1)
+            visual_mse = visual_patch_mse.mean()
+            proprio_mse = F.mse_loss(rollout_state["proprio"][:, -1], target_proprio)
+            visual_motion = F.mse_loss(initial_tokens, target_tokens, reduction="none").mean(dim=-1)
+            relative_motion = visual_motion / visual_motion.mean(dim=-1, keepdim=True).clamp_min(1e-8)
+            motion_weights = 1.0 + self.rollout_motion_weight * relative_motion
+            visual_motion_weighted_mse = (visual_patch_mse * motion_weights).sum() / motion_weights.sum()
+
+            if horizon in active_train_horizons:
+                visual_train_losses.append(visual_motion_weighted_mse)
+                proprio_train_losses.append(proprio_mse)
+
+            if horizon in active_horizons:
+                visual_persistence = F.mse_loss(initial_tokens, target_tokens)
+                proprio_persistence = F.mse_loss(initial_proprio, target_proprio)
+                metrics[f"rollout/visual_mse_h{horizon}"] = visual_mse.detach()
+                metrics[f"rollout/visual_motion_weighted_mse_h{horizon}"] = visual_motion_weighted_mse.detach()
+                metrics[f"rollout/proprio_mse_h{horizon}"] = proprio_mse.detach()
+                metrics[f"rollout/visual_persistence_mse_h{horizon}"] = visual_persistence.detach()
+                metrics[f"rollout/proprio_persistence_mse_h{horizon}"] = proprio_persistence.detach()
+                metrics[f"rollout/visual_skill_h{horizon}"] = _skill_vs_baseline(
+                    visual_mse.detach(), visual_persistence
+                )
+                metrics[f"rollout/proprio_skill_h{horizon}"] = _skill_vs_baseline(
+                    proprio_mse.detach(), proprio_persistence
+                )
+
+            if horizon == 1:
+                real_combined = visual_mse.detach() + proprio_mse.detach()
+                zero_combined = F.mse_loss(zero_state["tokens"][:, -1], target_tokens) + F.mse_loss(
+                    zero_state["proprio"][:, -1], target_proprio
+                )
+                shuffled_combined = F.mse_loss(shuffled_state["tokens"][:, -1], target_tokens) + F.mse_loss(
+                    shuffled_state["proprio"][:, -1], target_proprio
+                )
+                metrics["rollout/action_zero_excess_mse"] = (zero_combined - real_combined).detach()
+                metrics["rollout/action_shuffled_excess_mse"] = (shuffled_combined - real_combined).detach()
+                metrics["rollout/action_zero_effect_mse"] = (
+                    F.mse_loss(zero_state["tokens"][:, -1], rollout_state["tokens"][:, -1].detach())
+                    + F.mse_loss(zero_state["proprio"][:, -1], rollout_state["proprio"][:, -1].detach())
+                ).detach()
+
+        if not visual_train_losses:
+            return None, metrics
+        overshoot = torch.stack(visual_train_losses).mean() + torch.stack(proprio_train_losses).mean()
+        return overshoot, metrics
 
     def get_feat(self, state: dict[str, torch.Tensor]) -> torch.Tensor:
         last_frame = state["tokens"][..., -1, :, :]  # (..., P, tok)
@@ -519,8 +689,30 @@ class DinoWorldModel:
         # one tensor would make 64*384 visual values drown out 10 proprio
         # values and recreate the state-collapse bug this separation fixes.
         pred_loss = visual_loss.mean() + proprio_loss.mean()
+        visual_persistence = F.mse_loss(
+            encoded["tokens"][:, self.dinowm.context - 1 : -1],
+            encoded["tokens"][:, self.dinowm.context :],
+        )
+        proprio_persistence = F.mse_loss(
+            encoded["proprio"][:, self.dinowm.context - 1 : -1],
+            encoded["proprio"][:, self.dinowm.context :],
+        )
         metrics = {
             "pred/visual_mse": visual_loss.mean().detach(),
             "pred/proprio_mse": proprio_loss.mean().detach(),
+            "pred/visual_persistence_mse": visual_persistence.detach(),
+            "pred/proprio_persistence_mse": proprio_persistence.detach(),
+            "pred/visual_skill_vs_persistence": _skill_vs_baseline(visual_loss.mean().detach(), visual_persistence),
+            "pred/proprio_skill_vs_persistence": _skill_vs_baseline(proprio_loss.mean().detach(), proprio_persistence),
         }
-        return state, {"pred": pred_loss}, metrics
+        losses = {"pred": pred_loss}
+        overshoot, rollout_metrics = self.dinowm.rollout_loss(
+            state,
+            encoded["tokens"],
+            encoded["proprio"],
+            data["action"],
+        )
+        if overshoot is not None:
+            losses["overshoot"] = overshoot
+        metrics.update(rollout_metrics)
+        return state, losses, metrics
