@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -37,6 +38,37 @@ def test_build_from_config_forwards_arm_tuning(monkeypatch: pytest.MonkeyPatch) 
 def test_factory_env_num_guard() -> None:
     with pytest.raises(ValueError, match="divisible"):
         _resolve_task_assignments("MT10", num_envs=7, seed=0)
+
+
+def test_factory_logs_environment_construction_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    count = 3
+    assignments = [(MagicMock(), MagicMock(), None, None) for _ in range(count)]
+    monkeypatch.setattr(factory, "_resolve_task_assignments", lambda **_kwargs: assignments)
+    monkeypatch.setattr(factory.metaworld, "set_active_arm", lambda _arm: None)
+    monkeypatch.setattr(factory, "make_arm", lambda *_args, **_kwargs: MagicMock())
+    monkeypatch.setattr(factory, "make_env", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(
+        factory,
+        "SyncVectorEnv",
+        lambda env_fns, action_repeat: [make() for make in env_fns],
+    )
+
+    with caplog.at_level(logging.INFO, logger="dreamer_arm.envs.sim.factory"):
+        make_vector_env(
+            "metaworld:MT10",
+            num_envs=count,
+            seed=0,
+            size=(64, 64),
+            action_repeat=1,
+            time_limit=5,
+            arm="yam",
+        )
+
+    messages = [record.message for record in caplog.records if record.name == "dreamer_arm.envs.sim.factory"]
+    assert messages == [f"YAM environment {i}/{count}" for i in range(1, count + 1)]
 
 
 @pytest.mark.slow

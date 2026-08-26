@@ -23,6 +23,7 @@ is called **once per process** before constructing any Meta-World task env.
 from __future__ import annotations
 
 import collections
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -40,6 +41,8 @@ _BENCHMARK_CLS: dict[str, type] = {
     "MT25": metaworld.MT25,
     "MT50": metaworld.MT50,
 }
+
+log = logging.getLogger(__name__)
 
 
 def make_env(
@@ -161,7 +164,7 @@ def make_vector_env(
             # One shared arm object per env so hooks don't cross-contaminate.
             # Viewer is only attached to env 0 (one window regardless of num_envs).
             arm_obj = make_arm(arm_name, arm_cfg)
-            return make_env(
+            env = make_env(
                 env_name=env_name,
                 seed=_env_seed,
                 size=size,
@@ -176,6 +179,8 @@ def make_vector_env(
                 _arm_obj=arm_obj,
                 **kwargs,
             )
+            log.info("%s environment %d/%d", arm_name.upper(), _i + 1, num_envs)
+            return env
 
         env_fns.append(_make)
 

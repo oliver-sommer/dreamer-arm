@@ -16,7 +16,6 @@ Control contract:
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -35,8 +34,6 @@ _ARM_JOINT_NAMES = [f"joint{i}" for i in range(1, 7)]
 _GRASP_SITE_NAME = "grasp_site"
 _GRIPPER_ACT_NAME = "gripper"
 _GRIPPER_MAX_OPEN = 0.041  # ctrlrange hi = fully open
-
-log = logging.getLogger(__name__)
 
 
 class YamArm:
@@ -110,13 +107,7 @@ class YamArm:
         cfg = self._cfg
         if not np.isfinite(cfg.max_lag_m) or cfg.max_lag_m <= 0.0:
             raise ValueError(f"max_lag_m must be finite and positive, got {cfg.max_lag_m!r}")
-        self._ws_low, self._ws_high, bounds_source = self._resolve_workspace_bounds(env)
-        log.info(
-            "YAM Cartesian workspace source=%s low=%s high=%s",
-            bounds_source,
-            self._ws_low,
-            self._ws_high,
-        )
+        self._ws_low, self._ws_high, _bounds_source = self._resolve_workspace_bounds(env)
         self._ik_cfg = IKConfig(
             damping=cfg.damping,
             nullspace_gain=cfg.nullspace_gain * cfg.joint_target_horizon_s,
