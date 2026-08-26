@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from dreamer_arm.core.actor_critic import ActorCritic, sanitize_action
+from dreamer_arm.core.actor_critic import ActorCritic, ReturnEMA, sanitize_action
 
 
 class _TinyWorldModel:
@@ -102,13 +102,15 @@ def test_imag_starts_accepts_a_non_contiguous_view(tiny_actor_critic_cfg) -> Non
     assert ac._gather_imag_starts({"feat": windows})["feat"].shape == (3, 3, 4)
 
 
-def test_refresh_frozen_picks_up_new_weights(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]
+def test_refresh_frozen_picks_up_new_weights_without_persisting_views(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]
     ac = ActorCritic(tiny_actor_critic_cfg, 4, (2,), act_discrete=False, imag_starts=None, device=torch.device("cpu"))
     with torch.no_grad():
-        for p in ac.value.parameters():
+        for p in ac.actor.parameters():
             p.fill_(0.123)
     ac.refresh_frozen()
-    assert all(torch.equal(p, torch.full_like(p, 0.123)) for p in ac._frozen_value.parameters())
+    assert all(torch.equal(p, torch.full_like(p, 0.123)) for p in ac._frozen_actor.parameters())
+    assert ac._frozen_actor.training is False
+    assert not any("_frozen" in key for key in ac.state_dict())
 
 
 def test_sanitize_action_scrubs_nan_and_clamps_continuous() -> None:
@@ -122,3 +124,34 @@ def test_sanitize_action_scrubs_nan_and_clamps_continuous() -> None:
 def test_sanitize_action_passes_discrete_through_unchanged() -> None:
     d = torch.tensor([0.0, 1.0, 0.0])
     assert torch.equal(sanitize_action(d, discrete=True), d)
+
+
+def test_return_ema_normalises_each_task_independently() -> None:
+    """A large-return task must not set another task's actor scale."""
+    normaliser = ReturnEMA(torch.device("cpu"), num_tasks=2, alpha=1.0)
+    returns = torch.tensor(
+        [
+            [[0.0], [5.0], [10.0]],
+            [[1000.0], [1500.0], [2000.0]],
+        ]
+    )
+    task_id = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+    offset, scale = normaliser(returns, task_id)
+
+    assert offset.shape == (2, 1, 1)
+    assert scale.shape == (2, 1, 1)
+    assert scale[0].item() < 20.0
+    assert scale[1].item() > 500.0
+    assert torch.allclose(offset[:, 0, 0], normaliser.ema_vals[:, 0])
+
+
+def test_return_ema_leaves_absent_task_unchanged() -> None:
+    normaliser = ReturnEMA(torch.device("cpu"), num_tasks=3, alpha=1.0)
+    returns = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
+    task_id = torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+    normaliser(returns, task_id)
+
+    assert torch.count_nonzero(normaliser.ema_vals[0]) == 2
+    assert torch.equal(normaliser.ema_vals[1:], torch.zeros_like(normaliser.ema_vals[1:]))

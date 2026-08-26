@@ -92,6 +92,41 @@ class Embedder(nn.Module):
         return self.net(x)
 
 
+class TaskConditionedPool(nn.Module):
+    """Cross-attention pooling over spatial DINO tokens.
+
+    The query is built from the current robot state and exact task identity,
+    so different tasks may select different objects/regions while the output
+    width remains one DINO token.  A residual global mean gives the heads a
+    stable scene summary from the first update; cross-attention adds the
+    selective part instead of forcing every reward/value/policy head to infer
+    it from a spatially destructive mean.
+    """
+
+    def __init__(self, token_dim: int, condition_dim: int, heads: int) -> None:
+        super().__init__()
+        if token_dim % heads:
+            raise ValueError(f"pool token_dim={token_dim} must be divisible by heads={heads}")
+        self.query = nn.Linear(condition_dim, token_dim)
+        self.token_norm = nn.RMSNorm(token_dim, eps=1e-4, dtype=torch.float32)
+        self.query_norm = nn.RMSNorm(token_dim, eps=1e-4, dtype=torch.float32)
+        self.attention = nn.MultiheadAttention(token_dim, heads, batch_first=True)
+        self.output_norm = nn.RMSNorm(token_dim, eps=1e-4, dtype=torch.float32)
+        self.apply(weight_init_)
+
+    def forward(self, tokens: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        """Pool ``(..., patches, token_dim)`` using ``(..., condition_dim)``."""
+        lead = tokens.shape[:-2]
+        patches, token_dim = tokens.shape[-2:]
+        flat_tokens = tokens.reshape(-1, patches, token_dim)
+        flat_condition = condition.reshape(-1, condition.shape[-1])
+        query = self.query_norm(self.query(flat_condition)).unsqueeze(1)
+        values = self.token_norm(flat_tokens)
+        selected, _ = self.attention(query, values, values, need_weights=False)
+        pooled = flat_tokens.mean(dim=1) + selected.squeeze(1)
+        return self.output_norm(pooled).reshape(*lead, token_dim)
+
+
 def generate_mask_matrix(num_frames: int, tokens_per_frame: int) -> torch.Tensor:
     """Block-lower-triangular frame-causal mask: ``(F*P, F*P)`` bool, ``True`` = attend.
 
@@ -223,11 +258,18 @@ class DinoWM(nn.Module):
         self.predictor = CausalPredictor(config.predictor, predictor_dim, num_patches, self.context)
 
         feat_pool = str(config.feat_pool)
-        if feat_pool not in ("mean", "flatten"):
+        if feat_pool not in ("mean", "flatten", "task_attention"):
             raise ValueError(f"Unsupported feat_pool: {feat_pool!r}")
         self.feat_pool = feat_pool
         self.num_patches = num_patches
-        pooled_size = self.tok_dim if feat_pool == "mean" else self.tok_dim * num_patches
+        self.task_pool: TaskConditionedPool | None = None
+        if feat_pool == "task_attention":
+            self.task_pool = TaskConditionedPool(
+                self.tok_dim,
+                self.proprio_dim + self.task_dim,
+                int(getattr(config, "pool_heads", 8)),
+            )
+        pooled_size = self.tok_dim * num_patches if feat_pool == "flatten" else self.tok_dim
         self.feat_size = pooled_size + self.proprio_dim + self.task_dim
 
         for module in (self.action_embed, self.predictor):
@@ -279,10 +321,19 @@ class DinoWM(nn.Module):
 
     def get_feat(self, state: dict[str, torch.Tensor]) -> torch.Tensor:
         last_frame = state["tokens"][..., -1, :, :]  # (..., P, tok)
-        pooled = last_frame.mean(dim=-2) if self.feat_pool == "mean" else last_frame.reshape(*last_frame.shape[:-2], -1)
-        features = [pooled, state["proprio"][..., -1, :]]
-        if self.task_key is not None:
-            features.append(state[self.task_key])
+        current_proprio = state["proprio"][..., -1, :]
+        task_id = state.get(self.task_key) if self.task_key is not None else None
+        if self.feat_pool == "mean":
+            pooled = last_frame.mean(dim=-2)
+        elif self.feat_pool == "flatten":
+            pooled = last_frame.reshape(*last_frame.shape[:-2], -1)
+        else:
+            assert self.task_pool is not None
+            condition = current_proprio if task_id is None else torch.cat([current_proprio, task_id], dim=-1)
+            pooled = self.task_pool(last_frame, condition)
+        features = [pooled, current_proprio]
+        if task_id is not None:
+            features.append(task_id)
         return torch.cat(features, dim=-1)
 
     def loss(

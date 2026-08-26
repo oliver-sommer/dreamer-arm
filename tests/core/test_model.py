@@ -67,6 +67,9 @@ def _run_smoke(agent: Dreamer, batch_length: int, task_count: int = 0) -> None:
         if "proprio" in next_state:
             assert policy_diag["proprio_action_sensitivity"].shape == (_N,)
             assert torch.isfinite(policy_diag["proprio_action_sensitivity"]).all()
+        if "tokens" in next_state:
+            assert policy_diag["visual_action_sensitivity"].shape == (_N,)
+            assert torch.isfinite(policy_diag["visual_action_sensitivity"]).all()
         if task_count:
             assert policy_diag["task_id_action_sensitivity"].shape == (_N,)
             assert torch.isfinite(policy_diag["task_id_action_sensitivity"]).all()
@@ -184,12 +187,49 @@ def test_to_and_checkpoint_round_trip_preserve_frozen_views() -> None:
     with torch.no_grad():
         for p in agent.wm_modules["rssm"].parameters():
             p.fill_(0.05)
+        for p in agent.ac.actor.parameters():
+            p.fill_(0.07)
     ckpt = agent.checkpoint_state()
+    assert not any("ac._frozen_" in key for key in ckpt["model"])
+
+    # Simulate the redundant rollout-view keys written by older versions.
+    # They must not make an otherwise compatible checkpoint unloadable.
+    legacy_actor = {
+        key.replace("ac.actor.", "ac._frozen_actor."): value.clone()
+        for key, value in ckpt["model"].items()
+        if key.startswith("ac.actor.")
+    }
+    ckpt["model"].update(legacy_actor)
 
     agent2 = Dreamer(cfg.core.model, _obs_space(), _act_space())
     agent2.load_checkpoint_state(ckpt)
     for p in agent2.frozen_wm.rssm.parameters():  # type: ignore[attr-defined]
         assert torch.allclose(p, torch.full_like(p, 0.05))
+    for p in agent2.ac._frozen_actor.parameters():
+        assert torch.allclose(p, torch.full_like(p, 0.07))
+
+
+def test_checkpoint_migrates_global_return_ema_to_each_task() -> None:
+    cfg = _compose(
+        "training/dreamer",
+        [
+            "core/model=r2dreamer",
+            "envs/sim=metaworld",
+            "envs.sim.task=MT10",
+            "envs.sim.size=[32,32]",
+            "device=cpu",
+            "core.model.compile=false",
+        ],
+    )
+    agent = Dreamer(cfg.core.model, _obs_space(task_count=10), _act_space())
+    ckpt = agent.checkpoint_state()
+    ckpt["model"]["ac.return_ema.ema_vals"] = torch.tensor([1.5, 9.5])
+
+    restored = Dreamer(cfg.core.model, _obs_space(task_count=10), _act_space())
+    restored.load_checkpoint_state(ckpt)
+
+    expected = torch.tensor([[1.5, 9.5]]).repeat(10, 1)
+    assert torch.equal(restored.ac.return_ema.ema_vals, expected)
 
 
 def test_compile_raises_recursion_limit() -> None:

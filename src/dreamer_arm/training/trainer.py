@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -247,22 +248,10 @@ class OnlineTrainer:
             ep_return += rewards
             ep_len += 1
 
+            if done.any():
+                self._log_completed_episodes(done, info["final_info"], ep_return, ep_len)
             for i in range(N):
                 if done[i]:
-                    self._logger.scalar("episode/score", float(ep_return[i]))
-                    self._logger.scalar("episode/length", int(ep_len[i]))
-                    fin = info["final_info"][i]
-                    if fin is not None and "success" in fin:
-                        self._logger.scalar("episode/success", float(fin["success"]))
-                    # YamArm episode diagnostics (YAM only): singularity,
-                    # orientation fighting, joint-velocity saturation, and the
-                    # achieved-vs-commanded TCP ratio (the stuck signal).
-                    if fin is not None and "ctrl_diag" in fin:
-                        for k, v in fin["ctrl_diag"].items():
-                            self._logger.scalar(f"episode/ctrl_{k}", float(v))
-                    if fin is not None and "reward_diag" in fin:
-                        for k, v in fin["reward_diag"].items():
-                            self._logger.scalar(f"episode/reward_{k}", float(v))
                     ep_return[i] = 0.0
                     ep_len[i] = 0
 
@@ -347,6 +336,51 @@ class OnlineTrainer:
             self._logger.keepalive(env_step)
 
         self._logger.write(env_step, fps=True)
+
+    def _log_completed_episodes(
+        self,
+        done: np.ndarray,
+        final_info: list[dict[str, Any] | None],
+        episode_returns: np.ndarray,
+        episode_lengths: np.ndarray,
+    ) -> None:
+        """Log means plus per-task values for every episode ending together.
+
+        MT10 environments are synchronized, so ten episodes normally finish
+        on one vector step. Writing the same scalar name in a loop makes the
+        logger's dict retain only env 9, which previously made training score,
+        success, reward, and controller charts describe one arbitrary task.
+        """
+        values: dict[str, list[float]] = defaultdict(list)
+        task_values: dict[tuple[str, str], list[float]] = defaultdict(list)
+
+        def add(name: str, task: str, value: float) -> None:
+            values[name].append(value)
+            task_values[(name, task)].append(value)
+
+        for index in np.flatnonzero(done):
+            i = int(index)
+            fin = final_info[i]
+            task_name = str(fin.get("task_name", f"env_{i}")) if fin is not None else f"env_{i}"
+            safe_task = task_name.replace("-", "_").replace(" ", "_")
+            add("episode/score", safe_task, float(episode_returns[i]))
+            add("episode/length", safe_task, float(episode_lengths[i]))
+            if fin is None:
+                continue
+            if "success" in fin:
+                add("episode/success", safe_task, float(fin["success"]))
+            # YamArm episode diagnostics (YAM only): singularity,
+            # orientation fighting, joint-velocity saturation, and the
+            # achieved-vs-commanded TCP ratio (the stuck signal).
+            for key, value in fin.get("ctrl_diag", {}).items():
+                add(f"episode/ctrl_{key}", safe_task, float(value))
+            for key, value in fin.get("reward_diag", {}).items():
+                add(f"episode/reward_{key}", safe_task, float(value))
+
+        for name, samples in values.items():
+            self._logger.scalar(name, float(np.mean(samples)))
+        for (name, task), samples in task_values.items():
+            self._logger.scalar(f"{name}/{task}", float(np.mean(samples)))
 
     def _heartbeat(self, env_step: int, updates: int, prefill_min: int) -> None:
         """Print a console liveness line if ``heartbeat_secs`` has elapsed.

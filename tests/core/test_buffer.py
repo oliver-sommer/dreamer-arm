@@ -117,14 +117,15 @@ def test_buffer_empty_cache_keys_is_a_noop() -> None:
 
 
 def test_buffer_sample_alignment() -> None:
-    """obs/action/reward must line up on the *arrival* convention.
+    """Action/reward align to arrivals while boundary sentinels stay stored.
 
     A stored row is ``(obs_t, action_t, reward_t)`` where action/reward
     describe the transition leaving ``obs_t``.  The training window is indexed
     by the state a transition arrives at, so ``data[t]`` must pair
-    ``obs_{t+1}`` with ``action_t`` and ``reward_t`` -- the alignment
-    ``losses.lambda_return`` assumes.  Shifting only ``action`` (the old
-    behaviour) left every value target offset by one step.
+    ``obs_{t+1}`` with action/reward from transition ``t`` -- the alignment
+    ``losses.lambda_return`` assumes. The vector replay has no separate
+    terminal-arrival row, so last/terminal and observation-local ``is_first``
+    must not move.
     """
     n_envs = 2
     batch_length = 4
@@ -138,6 +139,9 @@ def test_buffer_sample_alignment() -> None:
                     "obs": torch.full((n_envs, 1), float(t)),
                     "action": torch.full((n_envs, 1), float(t)),
                     "reward": torch.full((n_envs, 1), float(t)),
+                    "is_first": torch.full((n_envs,), t == 7),
+                    "is_last": torch.full((n_envs,), t % 3 == 0),
+                    "is_terminal": torch.full((n_envs,), t % 4 == 0),
                     "stoch": torch.zeros(n_envs, 2, 2),
                     "deter": torch.zeros(n_envs, 4),
                     "episode": torch.zeros(n_envs, dtype=torch.int32),
@@ -151,6 +155,10 @@ def test_buffer_sample_alignment() -> None:
 
     assert torch.equal(action, obs - 1.0), f"action misaligned:\nobs={obs}\naction={action}"
     assert torch.equal(reward, obs - 1.0), f"reward misaligned:\nobs={obs}\nreward={reward}"
+    current = obs[..., 0].to(torch.int64)
+    assert torch.equal(data["is_last"], current % 3 == 0)
+    assert torch.equal(data["is_terminal"], current % 4 == 0)
+    assert torch.equal(data["is_first"], obs[..., 0] == 7.0)
 
 
 def test_buffer_sample_never_splices_across_episodes() -> None:

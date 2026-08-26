@@ -143,12 +143,17 @@ def test_write_flushes_pending_deferred_scalars(monkeypatch: Any) -> None:
 
 def test_table_is_buffered_as_one_wandb_payload_and_cleared(monkeypatch: Any) -> None:
     logger = _make_logger()
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr("dreamer_arm.utils.tracking.wandb.log", lambda payload: captured.update(payload))
+    calls: list[tuple[dict[str, Any], int]] = []
+    monkeypatch.setattr(
+        "dreamer_arm.utils.tracking.wandb.log", lambda payload, step: calls.append((dict(payload), step))
+    )
     logger.table("eval/action_trace", ["task", "timestep", "action_x"], [["reach", 0, 0.25]])
 
     logger.write(step=0)
 
+    assert len(calls) == 1
+    captured, step = calls[0]
+    assert step == 0
     assert list(captured) == ["env_step", "eval/action_trace"]
     assert captured["env_step"] == 0
     assert captured["eval/action_trace"].columns == ["task", "timestep", "action_x"]
@@ -156,19 +161,47 @@ def test_table_is_buffered_as_one_wandb_payload_and_cleared(monkeypatch: Any) ->
 
 
 def test_write_preserves_duplicate_environment_steps(monkeypatch: Any) -> None:
-    """Train and eval rows at one transition count must share the true x value."""
+    """Train and eval may both log immediately at one true environment step."""
     logger = _make_logger()
-    rows: list[dict[str, Any]] = []
-    monkeypatch.setattr("dreamer_arm.utils.tracking.wandb.log", lambda payload: rows.append(dict(payload)))
+    calls: list[tuple[dict[str, Any], int]] = []
+    monkeypatch.setattr(
+        "dreamer_arm.utils.tracking.wandb.log", lambda payload, step: calls.append((dict(payload), step))
+    )
 
     logger.scalar("train/loss", 1.0)
     logger.write(step=2500)
     logger.scalar("eval/success_mean", 0.0)
     logger.write(step=2500)
 
-    assert [row["env_step"] for row in rows] == [2500, 2500]
-    assert rows[0]["train/loss"] == 1.0
-    assert rows[1]["eval/success_mean"] == 0.0
+    assert calls == [
+        ({"env_step": 2500, "train/loss": 1.0}, 2500),
+        ({"env_step": 2500, "eval/success_mean": 0.0}, 2500),
+    ]
+
+
+def test_video_uses_true_environment_step(monkeypatch: Any) -> None:
+    """Media must use W&B's real step field, not its unrelated history-row index."""
+    logger = _make_logger()
+    calls: list[tuple[dict[str, Any], int]] = []
+    marker = object()
+    monkeypatch.setattr(logger, "_encode_video", lambda _arr: marker)
+    monkeypatch.setattr(
+        "dreamer_arm.utils.tracking.wandb.log", lambda payload, step: calls.append((dict(payload), step))
+    )
+
+    logger.video("eval/video", torch.zeros(2, 3, 4, 4, dtype=torch.uint8))
+    logger.write(step=75000)
+
+    assert calls == [({"env_step": 75000, "eval/video": marker}, 75000)]
+
+
+def test_write_rejects_backward_environment_step() -> None:
+    logger = _make_logger()
+    logger.scalar("train/loss", 1.0)
+    logger.write(step=100)
+    logger.scalar("eval/success_mean", 0.0)
+    with pytest.raises(ValueError, match="moved backwards"):
+        logger.write(step=99)
 
 
 def test_encode_video_returns_none_when_ffmpeg_missing(monkeypatch: Any) -> None:

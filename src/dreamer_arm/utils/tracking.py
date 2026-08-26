@@ -86,13 +86,6 @@ class WandbLogger:
             dir=str(logdir) if logdir is not None else None,
             reinit="finish_previous",
         )
-        # W&B's internal row counter must increase on every log call, but
-        # train and eval can legitimately emit separate rows for the same
-        # environment transition (for example, both at the 2.5k milestone).
-        # Use an explicit semantic axis instead of falsifying the environment
-        # step to dodge W&B's monotonically-increasing internal counter.
-        self._run.define_metric("env_step", hidden=True)
-        self._run.define_metric("*", step_metric="env_step")
         self._video_fps = video_fps
         self._warned_no_ffmpeg = False
         self._scalars: dict[str, _Scalar] = {}
@@ -105,6 +98,7 @@ class WandbLogger:
         self._last_time: float | None = None
         self._last_log_time: float = time.time()
         self._keepalive_secs: float = 60.0
+        self._last_wandb_step: int | None = None
 
         # Offline mode + periodic `wandb sync --append` is the robust setup for
         # hosts with unreliable egress (e.g. vast.ai, whose proxy intermittently
@@ -213,12 +207,8 @@ class WandbLogger:
         for name, (columns, rows) in self._tables.items():
             payload[name] = wandb.Table(columns=columns, data=rows)
         now = time.time()
-        # Do not pass W&B's reserved ``step=`` argument here. Its internal
-        # history row remains monotonic while ``env_step`` can correctly be
-        # equal across separate train/eval records.
         if len(payload) > 1 or now - self._last_log_time >= self._keepalive_secs:
-            wandb.log(payload)
-            self._last_log_time = now
+            self._log(payload, step)
         self._scalars.clear()
         self._videos.clear()
         self._images.clear()
@@ -229,8 +219,21 @@ class WandbLogger:
         """Send an empty wandb.log if no log has been sent recently."""
         now = time.time()
         if now - self._last_log_time >= self._keepalive_secs:
-            wandb.log({"env_step": step})
-            self._last_log_time = now
+            self._log({"env_step": step}, step)
+
+    def _log(self, payload: Mapping[str, Any], step: int) -> None:
+        """Log immediately on W&B's real, nondecreasing environment-step axis.
+
+        W&B explicitly supports multiple ``log`` calls with the same explicit
+        step, which is exactly the train-then-eval case. Using that documented
+        contract keeps media visible immediately and avoids the unrelated
+        per-call counter that previously labelled an 87k video as step 395.
+        """
+        if self._last_wandb_step is not None and step < self._last_wandb_step:
+            raise ValueError(f"W&B environment step moved backwards: {step} < {self._last_wandb_step}")
+        wandb.log(dict(payload), step=step)
+        self._last_wandb_step = step
+        self._last_log_time = time.time()
 
     def finish(self) -> None:
         if self._run is not None:

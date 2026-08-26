@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
 import torch
 from tensordict import TensorDict
 
@@ -294,6 +295,45 @@ def test_episode_reward_components_logged() -> None:
     trainer.begin(_MockAgent())
 
     assert ("episode/reward_grasp_reward", 0.25) in logger.recorded
+
+
+def test_synchronized_episode_logs_are_averaged_and_split_by_task() -> None:
+    """MT episode metrics must not silently retain only the final env slot."""
+
+    class _TwoTaskEnv(_MockVectorEnv):
+        def step(self, actions):
+            obs, rewards, terms, truncs, info = super().step(actions)
+            rewards[:] = [1.0, 3.0]
+            info["final_info"] = [
+                {
+                    "task_name": "task-a",
+                    "success": False,
+                    "ctrl_diag": {"frac_stuck": 0.2},
+                    "reward_diag": {"grasp_success": 0.0},
+                },
+                {
+                    "task_name": "task-b",
+                    "success": True,
+                    "ctrl_diag": {"frac_stuck": 0.8},
+                    "reward_diag": {"grasp_success": 1.0},
+                },
+            ]
+            return obs, rewards, terms, truncs, info
+
+    envs = _TwoTaskEnv(num_envs=2, done_every=1)
+    logger = _MockLogger()
+    trainer = OnlineTrainer(_make_trainer_cfg(steps=2), _MockBuffer(), logger, envs, eval_envs=None)
+    trainer.begin(_MockAgent())
+    logged = dict(logger.recorded)
+
+    assert logged["episode/score"] == pytest.approx(2.0)
+    assert logged["episode/score/task_a"] == pytest.approx(1.0)
+    assert logged["episode/score/task_b"] == pytest.approx(3.0)
+    assert logged["episode/success"] == pytest.approx(0.5)
+    assert logged["episode/success/task_a"] == pytest.approx(0.0)
+    assert logged["episode/success/task_b"] == pytest.approx(1.0)
+    assert logged["episode/ctrl_frac_stuck"] == pytest.approx(0.5)
+    assert logged["episode/reward_grasp_success"] == pytest.approx(0.5)
 
 
 def test_checkpoint_round_trip(tmp_path: Path) -> None:

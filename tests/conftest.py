@@ -147,7 +147,8 @@ def tiny_dinowm_cfg() -> Any:
         {
             "context": 3,
             "action_dim_embed": 4,
-            "feat_pool": "mean",
+            "feat_pool": "task_attention",
+            "pool_heads": 4,
             "cnn_keys": "scene",
             "mlp_keys": "proprio",
             "predictor": {"depth": 1, "heads": 2, "dim_head": 8, "mlp_dim": 16},

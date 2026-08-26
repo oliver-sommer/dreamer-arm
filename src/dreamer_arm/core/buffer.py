@@ -97,11 +97,12 @@ class ReplayBuffer:
 
         Returns ``(data, index, initial)`` where:
 
-        * ``data`` is the ``(B, T)`` training window. ``data["action"]`` and
-          ``data["reward"]`` are shifted one step back so that ``action[t]``
-          is the action that led into ``data[t]`` and ``reward[t]`` is the
-          reward received on *arriving* there (matching the RSSM step
-          semantics and DreamerV3's λ-return convention).
+        * ``data`` is the ``(B, T)`` training window. ``action`` and
+          ``reward`` are shifted one step back so they describe the transition
+          that arrived at ``data[t]``. Episode-end flags stay on the last
+          stored state: the vector env auto-resets and does not store a
+          separate terminal-arrival row, so moving them would erase the only
+          boundary sentinel available to replay returns.
         * ``index`` is the ``(time_idx, env_idx)`` pair of the training
           window — pass these straight back to
           :meth:`update_initial_state`.
@@ -116,10 +117,15 @@ class ReplayBuffer:
         sample_td = self._move_to_device(sample_td)
 
         initial = {key: sample_td[key][:, 0] for key in cache_keys}
-        # A stored row is (obs_t, action_t, reward_t): action/reward describe the
-        # transition *leaving* obs_t, so the arrival-indexed window takes both
-        # from the preceding row.  This is the alignment `losses.lambda_return`
-        # assumes; shifting only `action` offsets every value target by a step.
+        # A stored row is (obs_t, action_t, reward_t, done_t): action/reward
+        # describe what happens after leaving obs_t, so the arrival-indexed
+        # window takes both from the preceding row. `is_last`/`is_terminal`
+        # deliberately remain on the final stored state. SyncVectorEnv returns
+        # a reset observation at done and replay keeps episode IDs disjoint, so
+        # there is no terminal-arrival row to receive shifted flags; shifting
+        # them would silently remove all end-of-episode boundaries from sampled
+        # sequences. A fully arrival-indexed layout would require storing that
+        # extra terminal row per environment rather than merely shifting keys.
         # clone(): the source overlaps the view being written.
         shifted = {key: sample_td[key][:, :-1].clone() for key in ("action", "reward")}
         data = sample_td[:, 1:]

@@ -53,9 +53,12 @@ core:
       # slope: once the backward's recompute stops fitting, the device pages
       # and lands >20x worse than the loop.  Sweep it, don't assume.
       window_chunk: 1
-      # How the actor/critic pool the last frame's (P, tok) tokens into a
-      # vector: "mean" (cheap, discards spatial detail) or "flatten" (tok * P wide).
-      feat_pool: mean
+      # How reward/value/policy heads pool the last frame's spatial DINO
+      # tokens. task_attention uses current proprio + exact task identity as a
+      # cross-attention query, retaining task-relevant spatial information at
+      # fixed width. "mean" and "flatten" remain available as ablations.
+      feat_pool: task_attention
+      pool_heads: 8
       cnn_keys: ${envs.sim.encoder.cnn_keys}
       mlp_keys: ${envs.sim.encoder.mlp_keys}
       encoder:

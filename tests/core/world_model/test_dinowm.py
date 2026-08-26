@@ -90,6 +90,37 @@ def test_feat_pool_flatten_matches_expected_size(tiny_dinowm_cfg) -> None:  # ty
     assert feat.shape == (2, dinowm.feat_size)
 
 
+def test_task_attention_pool_is_task_conditioned(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]
+    tiny_dinowm_cfg.mlp_keys = "proprio|task_id"
+    shapes = {"scene": (32, 32, 3), "proprio": (5,), "task_id": (2,)}
+    dinowm = DinoWM(tiny_dinowm_cfg, shapes, act_dim=4, num_patches=4, embed_dim=384)
+    state = dinowm.initial(2, torch.device("cpu"))
+    # Hold visual state and proprioception exactly fixed: only task identity
+    # may account for a feature difference.
+    tokens = torch.randn(1, dinowm.context, 4, dinowm.tok_dim)
+    state["tokens"] = tokens.expand(2, -1, -1, -1).clone()
+    state["task_id"] = torch.eye(2)
+
+    feat = dinowm.get_feat(state)
+
+    assert feat.shape == (2, dinowm.feat_size)
+    assert not torch.allclose(feat[0, : dinowm.tok_dim], feat[1, : dinowm.tok_dim])
+    assert torch.equal(feat[:, -2:], torch.eye(2))
+
+
+def test_task_attention_pool_gradients_reach_query(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]
+    dinowm = DinoWM(tiny_dinowm_cfg, _shapes(), act_dim=4, num_patches=4, embed_dim=384)
+    state = dinowm.initial(2, torch.device("cpu"))
+    state["tokens"] = torch.randn_like(state["tokens"])
+    state["proprio"] = torch.randn_like(state["proprio"])
+
+    dinowm.get_feat(state).square().mean().backward()
+
+    assert dinowm.task_pool is not None
+    assert dinowm.task_pool.query.weight.grad is not None
+    assert torch.isfinite(dinowm.task_pool.query.weight.grad).all()
+
+
 def test_dinowm_loss_is_chunk_invariant(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]
     """Batching windows into the predictor must not change what is computed.
 

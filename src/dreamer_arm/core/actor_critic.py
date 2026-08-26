@@ -45,30 +45,66 @@ def sanitize_action(action: torch.Tensor, discrete: bool) -> torch.Tensor:
 
 
 class ReturnEMA(nn.Module):
-    """Track running 5th/95th percentile of returns for actor-critic normalisation."""
+    """Track task-local return percentiles for actor-critic normalisation.
 
-    def __init__(self, device: torch.device, alpha: float = 1e-2) -> None:
+    A single-task agent has one row and is exactly the usual DreamerV3 return
+    EMA.  Multi-task agents keep one row per one-hot task.  Sharing these
+    statistics lets a high-return task set the policy-gradient scale for every
+    other task, even when replay itself is balanced.
+    """
+
+    def __init__(self, device: torch.device, num_tasks: int = 1, alpha: float = 1e-2) -> None:
         super().__init__()
+        if num_tasks < 1:
+            raise ValueError(f"num_tasks must be positive, got {num_tasks}")
         self.alpha = alpha
+        self.num_tasks = num_tasks
         self.register_buffer("range", torch.tensor([0.05, 0.95], device=device))
-        self.register_buffer("ema_vals", torch.zeros(2, dtype=torch.float32, device=device))
+        self.register_buffer("ema_vals", torch.zeros(num_tasks, 2, dtype=torch.float32, device=device))
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x_quantile = torch.quantile(x.detach().flatten(), self.range)
-        # ema_vals is a registered buffer; torch types it as Tensor | Module.
-        updated = self.alpha * x_quantile.detach() + (1 - self.alpha) * self.ema_vals  # ty: ignore[unsupported-operator]
-        # Ignore a non-finite batch: ``ema = alpha*NaN + (1-alpha)*ema`` is NaN
-        # forever, which would permanently poison the return normaliser (and via
-        # it every policy loss).  ``torch.where`` stays branchless for compile.
-        # Out-of-place copy also keeps torch.compile happy.
-        self.ema_vals.copy_(torch.where(torch.isfinite(x_quantile), updated, self.ema_vals))
-        scale = torch.clip(self.ema_vals[1] - self.ema_vals[0], min=1.0)
-        offset = self.ema_vals[0]
+    def forward(self, x: torch.Tensor, task_id: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Update percentiles and return row-aligned ``(offset, scale)``.
+
+        ``x`` is ``(N, horizon, 1)`` and ``task_id`` is the one-hot identity
+        of each imagination start, ``(N, num_tasks)``.  The returned tensors
+        are ``(N, 1, 1)`` for multi-task use so broadcasting cannot
+        accidentally mix tasks.
+        """
+        if self.num_tasks == 1:
+            x_quantile = torch.quantile(x.detach().flatten(), self.range)
+            current = self.ema_vals[0]
+            updated = self.alpha * x_quantile.detach() + (1 - self.alpha) * current
+            self.ema_vals[0].copy_(torch.where(torch.isfinite(x_quantile), updated, current))
+            scale = torch.clip(self.ema_vals[0, 1] - self.ema_vals[0, 0], min=1.0)
+            return self.ema_vals[0, 0].detach(), scale.detach()
+
+        if task_id is None:
+            raise ValueError("multi-task return normalisation requires task_id")
+        if task_id.shape != (x.shape[0], self.num_tasks):
+            raise ValueError(f"task_id must have shape {(x.shape[0], self.num_tasks)}, got {tuple(task_id.shape)}")
+        task_index = task_id.detach().argmax(dim=-1)
+        for index in range(self.num_tasks):
+            values = x.detach()[task_index == index]
+            if values.numel() == 0:
+                continue
+            quantile = torch.quantile(values.flatten(), self.range)
+            current = self.ema_vals[index]
+            updated = self.alpha * quantile.detach() + (1 - self.alpha) * current
+            current.copy_(torch.where(torch.isfinite(quantile), updated, current))
+
+        selected = self.ema_vals[task_index]
+        offset = selected[:, 0, None, None]
+        scale = torch.clip(selected[:, 1] - selected[:, 0], min=1.0)[:, None, None]
         return offset.detach(), scale.detach()
 
 
 class ActorCritic(nn.Module):
     """Reward/continue heads + actor + critic + λ-return imagination training."""
+
+    _frozen_reward: networks.MLPHead
+    _frozen_cont: networks.MLPHead
+    _frozen_actor: networks.MLPHead
+    _frozen_slow_value: networks.MLPHead
 
     def __init__(
         self,
@@ -78,6 +114,7 @@ class ActorCritic(nn.Module):
         act_discrete: bool,
         imag_starts: int | None,
         device: torch.device,
+        num_tasks: int = 1,
     ) -> None:
         super().__init__()
         self.act_discrete = act_discrete
@@ -102,7 +139,7 @@ class ActorCritic(nn.Module):
         actor_cfg.dist = config.actor.dist.disc if act_discrete else config.actor.dist.cont
         self.actor = networks.MLPHead(actor_cfg, feat_size)
         self.value = networks.MLPHead(config.critic, feat_size)
-        self.return_ema = ReturnEMA(device=device)
+        self.return_ema = ReturnEMA(device=device, num_tasks=num_tasks)
 
         # slow target value (EMA) — no grad.
         self._slow_value = copy.deepcopy(self.value)
@@ -121,12 +158,22 @@ class ActorCritic(nn.Module):
         return self
 
     def refresh_frozen(self) -> None:
-        """Rebuild the no-grad rollout views after ``.to()`` / checkpoint load moves storage."""
-        self._frozen_reward = freeze_clone(self.reward)
-        self._frozen_cont = freeze_clone(self.cont)
-        self._frozen_actor = freeze_clone(self.actor)
-        self._frozen_value = freeze_clone(self.value)
-        self._frozen_slow_value = freeze_clone(self._slow_value)
+        """Rebuild non-persistent rollout views after storage-moving operations.
+
+        These are derived views over live parameter storage, not independent
+        model state. Bypass ``nn.Module.__setattr__`` so they do not duplicate
+        keys in ``state_dict`` or appear in parameter/module traversal.
+        """
+
+        def frozen[ModuleT: nn.Module](module: ModuleT) -> ModuleT:
+            view = freeze_clone(module)
+            view.train(False)
+            return view
+
+        object.__setattr__(self, "_frozen_reward", frozen(self.reward))
+        object.__setattr__(self, "_frozen_cont", frozen(self.cont))
+        object.__setattr__(self, "_frozen_actor", frozen(self.actor))
+        object.__setattr__(self, "_frozen_slow_value", frozen(self._slow_value))
 
     def trainable_named_parameters(self) -> list[tuple[str, nn.Parameter]]:
         """Params the optimiser should train -- excludes the slow value target."""
@@ -219,7 +266,17 @@ class ActorCritic(nn.Module):
         cont_target = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
         losses["con"] = -self.cont(feat).log_prob(cont_target).mean()
 
-        start = self._gather_imag_starts(state)
+        # Gather task identity with exactly the same random (b, t) indices as
+        # the imagination state.  RSSM absorbs task_id into its latent and does
+        # not retain the raw one-hot, whereas DINO-WM does; sourcing it from the
+        # aligned training data works for both without changing WM state.
+        start_source = dict(state)
+        if self.return_ema.num_tasks > 1:
+            if "task_id" not in data:
+                raise ValueError("multi-task actor-critic batch omitted task_id")
+            start_source["_return_task_id"] = data["task_id"]
+        start = self._gather_imag_starts(start_source)
+        return_task_id = start.pop("_return_task_id", None)
         imag_feat, imag_action = self._imagine(frozen_wm, start, self.imag_horizon + 1)
         imag_feat = imag_feat.detach()
         imag_action = imag_action.detach()
@@ -229,9 +286,7 @@ class ActorCritic(nn.Module):
         # self.value, not the frozen clone: imag_feat is already detached
         # above, so this carries no gradient regardless -- and the value loss
         # further down needs this exact distribution object anyway. Computing
-        # it once here (instead of again via _frozen_value, whose parameters
-        # share storage with self.value and so would return bit-identical
-        # numbers) removes a redundant forward over the same 1024x(H+1)
+        # it once here removes a redundant forward over the same 1024x(H+1)
         # features.
         imag_value_dist = self.value(imag_feat)
         imag_value = imag_value_dist.mode().detach()
@@ -241,8 +296,11 @@ class ActorCritic(nn.Module):
         weight = torch.cumprod(imag_cont * disc, dim=1)
         last = torch.zeros_like(imag_cont)
         term = 1.0 - imag_cont
+        # DreamerV3 uses the live critic for λ-return bootstrapping and keeps
+        # the slow critic as a value-loss regulariser.  This also keeps the
+        # actor baseline and target on the same critic snapshot.
         ret = lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)
-        ret_offset, ret_scale = self.return_ema(ret)
+        ret_offset, ret_scale = self.return_ema(ret, return_task_id)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
         policy = self.actor(imag_feat)
@@ -260,8 +318,12 @@ class ActorCritic(nn.Module):
 
         ret_normed = (ret - ret_offset) / ret_scale
         metrics["ret"] = ret_normed.mean()
-        metrics["ret_005"] = self.return_ema.ema_vals[0]
-        metrics["ret_095"] = self.return_ema.ema_vals[1]
+        metrics["ret_005"] = self.return_ema.ema_vals[:, 0].mean()
+        metrics["ret_095"] = self.return_ema.ema_vals[:, 1].mean()
+        if self.return_ema.num_tasks > 1:
+            for index in range(self.return_ema.num_tasks):
+                metrics[f"ret_005_task_{index}"] = self.return_ema.ema_vals[index, 0]
+                metrics[f"ret_095_task_{index}"] = self.return_ema.ema_vals[index, 1]
         metrics["adv"] = adv.mean()
         metrics["adv_std"] = adv.std()
         metrics["con"] = imag_cont.mean()

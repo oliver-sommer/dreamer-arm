@@ -71,6 +71,8 @@ class Dreamer(nn.Module):
 
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.act_dim, self.act_discrete = _resolve_action_space(act_space)
+        task_shape = shapes.get("task_id")
+        num_tasks = int(task_shape[0]) if task_shape is not None else 1
 
         self._wm_bundle = build_world_model(config, shapes, self.act_dim, self.device)
         # Registers every world-model module (including permanently-frozen
@@ -83,7 +85,13 @@ class Dreamer(nn.Module):
         # MultiDiscrete is `sum(nvec)` rather than the vector length).
         actor_shape = (act_space.n,) if hasattr(act_space, "n") else tuple(int(x) for x in act_space.shape)
         self.ac = ActorCritic(
-            config, self._wm_bundle.feat_size, actor_shape, self.act_discrete, self.imag_starts, self.device
+            config,
+            self._wm_bundle.feat_size,
+            actor_shape,
+            self.act_discrete,
+            self.imag_starts,
+            self.device,
+            num_tasks=num_tasks,
         )
 
         self._loss_scales = dict(config.loss_scales)
@@ -143,7 +151,21 @@ class Dreamer(nn.Module):
         }
 
     def load_checkpoint_state(self, state: Mapping[str, Any]) -> None:
-        self.load_state_dict(state["model"])
+        # Older checkpoints registered the actor-critic's no-grad rollout
+        # views as child modules. Those keys duplicate live weights and are
+        # derived rather than model state; discard them before strict loading
+        # so checkpoints remain readable after the views became non-persistent.
+        model_state = {key: value for key, value in state["model"].items() if not key.startswith("ac._frozen_")}
+
+        # Before task-local return normalisation, this buffer was a single
+        # ``(2,)`` global percentile pair. Seed every task with that pair when
+        # resuming such a checkpoint; subsequent updates specialize the rows.
+        ema_key = "ac.return_ema.ema_vals"
+        old_ema = model_state.get(ema_key)
+        if isinstance(old_ema, torch.Tensor) and old_ema.shape == (2,):
+            model_state[ema_key] = old_ema.unsqueeze(0).repeat(self.ac.return_ema.num_tasks, 1)
+
+        self.load_state_dict(model_state)
         self._optim.load_state_dict(state["optim"])
         self.ac.slow_value_updates = int(state["slow_value_updates"])
         # load_state_dict copies into the existing parameter storages (which
@@ -204,6 +226,13 @@ class Dreamer(nn.Module):
             counterfactual["proprio"] = torch.zeros_like(proprio)
             proprio_action = self.ac.policy_diagnostics(self.frozen_wm.get_feat(counterfactual))["post_mode"]
             diagnostics["proprio_action_sensitivity"] = (proprio_action - baseline).abs().mean(dim=-1)
+
+        tokens = wm_state.get("tokens")
+        if tokens is not None:
+            counterfactual = dict(wm_state)
+            counterfactual["tokens"] = torch.zeros_like(tokens)
+            visual_action = self.ac.policy_diagnostics(self.frozen_wm.get_feat(counterfactual))["post_mode"]
+            diagnostics["visual_action_sensitivity"] = (visual_action - baseline).abs().mean(dim=-1)
         return diagnostics
 
     def update(self, replay_buffer: Any) -> dict[str, torch.Tensor]:

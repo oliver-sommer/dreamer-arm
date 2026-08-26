@@ -117,6 +117,7 @@ def test_evaluate_aggregates_conditioning_and_reward_diagnostics() -> None:
             return {
                 "task_id_action_sensitivity": torch.full((n,), 0.25),
                 "proprio_action_sensitivity": torch.full((n,), 0.5),
+                "visual_action_sensitivity": torch.full((n,), 0.75),
             }
 
     class _DiagnosticEnv(_MockVectorEnv):
@@ -130,6 +131,7 @@ def test_evaluate_aggregates_conditioning_and_reward_diagnostics() -> None:
     result = evaluate(_DiagnosticAgent(), _DiagnosticEnv(done_every=2), episodes=2)
     assert result.metrics["eval/action_task_id_sensitivity"] == pytest.approx(0.25)
     assert result.metrics["eval/action_proprio_sensitivity"] == pytest.approx(0.5)
+    assert result.metrics["eval/action_visual_sensitivity"] == pytest.approx(0.75)
     assert result.metrics["eval/reward_in_place_reward"] == pytest.approx(0.75)
 
 

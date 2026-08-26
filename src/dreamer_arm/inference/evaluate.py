@@ -95,6 +95,7 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     all_pre_stds: list[np.ndarray] = []
     all_task_sensitivity: list[np.ndarray] = []
     all_proprio_sensitivity: list[np.ndarray] = []
+    all_visual_sensitivity: list[np.ndarray] = []
     task_ids_seen: set[int] = set()
     task_id_rows = 0
     task_id_valid_rows = 0
@@ -131,6 +132,7 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
         pre_std_np = policy_diag.get("pre_std")
         task_sensitivity = policy_diag.get("task_id_action_sensitivity")
         proprio_sensitivity = policy_diag.get("proprio_action_sensitivity")
+        visual_sensitivity = policy_diag.get("visual_action_sensitivity")
         pre_mean_arr = pre_mean_np.detach().cpu().numpy() if pre_mean_np is not None else None
         pre_std_arr = pre_std_np.detach().cpu().numpy() if pre_std_np is not None else None
         if pre_mean_arr is not None:
@@ -141,6 +143,8 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
             all_task_sensitivity.append(task_sensitivity.detach().cpu().numpy().copy())
         if proprio_sensitivity is not None:
             all_proprio_sensitivity.append(proprio_sensitivity.detach().cpu().numpy().copy())
+        if visual_sensitivity is not None:
+            all_visual_sensitivity.append(visual_sensitivity.detach().cpu().numpy().copy())
 
         for i in range(n):
             if completed[i] == 0 and episode_steps[i] < ACTION_TRACE_STEPS:
@@ -228,6 +232,8 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
         metrics["eval/action_task_id_sensitivity"] = float(np.concatenate(all_task_sensitivity).mean())
     if all_proprio_sensitivity:
         metrics["eval/action_proprio_sensitivity"] = float(np.concatenate(all_proprio_sensitivity).mean())
+    if all_visual_sensitivity:
+        metrics["eval/action_visual_sensitivity"] = float(np.concatenate(all_visual_sensitivity).mean())
 
     trace_columns = ["task", "timestep"]
     trace_columns += [f"action_{label}" for label in _ACTION_LABELS]
