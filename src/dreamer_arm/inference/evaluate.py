@@ -97,6 +97,13 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     all_task_sensitivity: list[np.ndarray] = []
     all_proprio_sensitivity: list[np.ndarray] = []
     all_visual_sensitivity: list[np.ndarray] = []
+    all_success_probability: list[np.ndarray] = []
+    all_constraint_probability: list[np.ndarray] = []
+    all_constraint_target: list[np.ndarray] = []
+    all_retained_prediction: list[np.ndarray] = []
+    all_retained_target: list[np.ndarray] = []
+    all_achieved_prediction: list[np.ndarray] = []
+    all_achieved_target: list[np.ndarray] = []
     slot_all_actions: list[list[np.ndarray]] = [[] for _ in range(n)]
     slot_task_sensitivity: list[list[float]] = [[] for _ in range(n)]
     slot_proprio_sensitivity: list[list[float]] = [[] for _ in range(n)]
@@ -138,6 +145,10 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
         task_sensitivity = policy_diag.get("task_id_action_sensitivity")
         proprio_sensitivity = policy_diag.get("proprio_action_sensitivity")
         visual_sensitivity = policy_diag.get("visual_action_sensitivity")
+        success_probability = policy_diag.get("success_probability")
+        constraint_probability = policy_diag.get("constraint_probability")
+        retained_prediction = policy_diag.get("constraint_retained_xyz")
+        achieved_prediction = policy_diag.get("constraint_achieved_xyz")
         pre_mean_arr = pre_mean_np.detach().cpu().numpy() if pre_mean_np is not None else None
         pre_std_arr = pre_std_np.detach().cpu().numpy() if pre_std_np is not None else None
         task_sensitivity_arr = task_sensitivity.detach().cpu().numpy() if task_sensitivity is not None else None
@@ -145,6 +156,18 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
             proprio_sensitivity.detach().cpu().numpy() if proprio_sensitivity is not None else None
         )
         visual_sensitivity_arr = visual_sensitivity.detach().cpu().numpy() if visual_sensitivity is not None else None
+        success_probability_arr = (
+            success_probability.detach().cpu().numpy() if success_probability is not None else None
+        )
+        constraint_probability_arr = (
+            constraint_probability.detach().cpu().numpy() if constraint_probability is not None else None
+        )
+        retained_prediction_arr = (
+            retained_prediction.detach().cpu().numpy() if retained_prediction is not None else None
+        )
+        achieved_prediction_arr = (
+            achieved_prediction.detach().cpu().numpy() if achieved_prediction is not None else None
+        )
         if pre_mean_arr is not None:
             all_pre_means.append(pre_mean_arr.copy())
         if pre_std_arr is not None:
@@ -155,6 +178,8 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
             all_proprio_sensitivity.append(proprio_sensitivity_arr.copy())
         if visual_sensitivity_arr is not None:
             all_visual_sensitivity.append(visual_sensitivity_arr.copy())
+        if success_probability_arr is not None:
+            all_success_probability.append(success_probability_arr.copy())
 
         for i in range(n):
             if completed[i] < num_rounds:
@@ -173,6 +198,20 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
                     slot_pre_stds[i].append(pre_std_arr[i].copy())
 
         obs_next_np, rewards, terms, truncs, info = envs.step(action_np)
+        transition_info = info.get("transition", {})
+        ctrl_valid = np.asarray(transition_info.get("ctrl_valid", np.zeros(n, dtype=bool)), dtype=bool)
+        ctrl_target = np.asarray(transition_info.get("ctrl_clamp", np.zeros((n, 3))), dtype=np.float32)
+        retained_target = np.asarray(transition_info.get("ctrl_retained_xyz", np.zeros((n, 3))), dtype=np.float32)
+        achieved_target = np.asarray(transition_info.get("ctrl_achieved_xyz", np.zeros((n, 3))), dtype=np.float32)
+        if constraint_probability_arr is not None and ctrl_valid.shape == (n,) and ctrl_target.shape == (n, 3):
+            all_constraint_probability.append(constraint_probability_arr[ctrl_valid].copy())
+            all_constraint_target.append(ctrl_target[ctrl_valid].copy())
+        if retained_prediction_arr is not None and retained_target.shape == (n, 3) and ctrl_valid.shape == (n,):
+            all_retained_prediction.append(retained_prediction_arr[ctrl_valid].copy())
+            all_retained_target.append(retained_target[ctrl_valid].copy())
+        if achieved_prediction_arr is not None and achieved_target.shape == (n, 3) and ctrl_valid.shape == (n,):
+            all_achieved_prediction.append(achieved_prediction_arr[ctrl_valid].copy())
+            all_achieved_target.append(achieved_target[ctrl_valid].copy())
         episode_returns += rewards
         episode_steps += 1
         done = terms | truncs
@@ -253,6 +292,35 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
         metrics["eval/action_proprio_sensitivity"] = float(np.concatenate(all_proprio_sensitivity).mean())
     if all_visual_sensitivity:
         metrics["eval/action_visual_sensitivity"] = float(np.concatenate(all_visual_sensitivity).mean())
+    if all_success_probability:
+        metrics["eval/predicted_success_probability"] = float(np.concatenate(all_success_probability).mean())
+    if all_constraint_probability:
+        constraint_probability_values = np.concatenate(all_constraint_probability, axis=0)
+        constraint_target_values = np.concatenate(all_constraint_target, axis=0)
+        for index, label in enumerate(("workspace", "lag", "joint_limit")):
+            probability = constraint_probability_values[:, index]
+            target = constraint_target_values[:, index] >= 0.5
+            predicted = probability >= 0.5
+            tp = float(np.sum(predicted & target))
+            fp = float(np.sum(predicted & ~target))
+            fn = float(np.sum(~predicted & target))
+            metrics[f"eval/pred_constraint_{label}_prob"] = float(probability.mean())
+            metrics[f"eval/pred_constraint_{label}_rate"] = float(target.mean())
+            metrics[f"eval/pred_constraint_{label}_brier"] = float(np.mean((probability - target) ** 2))
+            metrics[f"eval/pred_constraint_{label}_precision"] = tp / max(1.0, tp + fp)
+            metrics[f"eval/pred_constraint_{label}_recall"] = tp / max(1.0, tp + fn)
+    for name, predictions, targets in (
+        ("retained", all_retained_prediction, all_retained_target),
+        ("achieved", all_achieved_prediction, all_achieved_target),
+    ):
+        if predictions:
+            prediction_values = np.concatenate(predictions, axis=0)
+            target_values = np.concatenate(targets, axis=0)
+            error = prediction_values - target_values
+            metrics[f"eval/pred_constraint_{name}_mae_m"] = float(np.abs(error).mean())
+            metrics[f"eval/pred_constraint_{name}_vector_error_m"] = float(np.linalg.norm(error, axis=-1).mean())
+            for index, axis in enumerate("xyz"):
+                metrics[f"eval/pred_constraint_{name}_{axis}_mae_m"] = float(np.abs(error[:, index]).mean())
 
     # Aggregate policy conditioning by pinned task slot. A healthy MT actor may
     # legitimately share coarse reaching motion, but these series reveal when

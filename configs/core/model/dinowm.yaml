@@ -53,6 +53,16 @@ core:
       # slope: once the backward's recompute stops fitting, the device pages
       # and lands >20x worse than the loop.  Sweep it, don't assume.
       window_chunk: 1
+      # Predict changes around the exact persistence baseline. The zero-init
+      # output projection starts as a strong slow-video model rather than an
+      # arbitrary absolute DINO-token reconstruction.
+      residual: true
+      # Action-conditioned controller model. Motion targets are stored in
+      # metres; x100 presents centimetre-scale regression targets.
+      constraint:
+        enabled: true
+        hidden: 128
+        motion_scale: 100.0
       # Close the teacher-forcing gap on the autoregressive path used by
       # Dreamer imagination. Eight sampled replay contexts bound the added
       # compute. Gradients reach horizons 3/5/10; horizon 15 is diagnostic-only
@@ -97,3 +107,12 @@ core:
       policy: 1.0
       value: 1.0
       repval: 0.3
+      constraint: 1.0
+      success: 1.0
+
+    # Penalize any predicted controller projection in actor imagination while
+    # preserving the environment's raw reward for comparable reporting.
+    constraint_cost_scale: 2.0
+    success:
+      enabled: true
+      bonus: 5.0

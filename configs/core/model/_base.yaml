@@ -17,6 +17,9 @@ wm: rssm
 
 # RL hyperparameters.
 act_entropy: 3e-4
+# Actor-only shaping. World models without controller supervision return no
+# constraint predictions, making the zero default a strict no-op.
+constraint_cost_scale: 0.0
 kl_free: 1.0
 imag_horizon: 15
 horizon: 333
@@ -51,6 +54,8 @@ loss_scales:
   policy: 1.0
   value: 1.0
   repval: 0.3
+  constraint: 1.0
+  success: 1.0
 
 # RSSM.
 rssm:
@@ -117,6 +122,23 @@ cont:
   device: ${device}
   symlog_inputs: false
   name: "cont"
+
+# Sparse task-completion head. Disabled in the shared recipe so legacy RSSM
+# runs retain their exact module/state-dict shape; DINO/YAM enables it.
+success:
+  enabled: false
+  bonus: 0.0
+  shape: [1]
+  layers: 2
+  units: ${core.model.units}
+  act: ${core.model.act}
+  norm: ${core.model.norm}
+  dist:
+    name: "binary"
+  outscale: 1.0
+  device: ${device}
+  symlog_inputs: false
+  name: "success"
 
 # Actor + critic. The agent picks `dist.disc` vs `dist.cont` at build time
 # from the gymnasium action space.

@@ -261,6 +261,12 @@ def test_reward_shape() -> None:
 
     for td in buffer._transitions:
         assert td["reward"].shape == (N, 1), f"reward shape: {td['reward'].shape}"
+        assert td["success"].shape == (N, 1)
+        assert td["ctrl_valid"].shape == (N, 1)
+        assert td["ctrl_clamp"].shape == (N, 3)
+        assert td["ctrl_retained_xyz"].shape == (N, 3)
+        assert td["ctrl_achieved_xyz"].shape == (N, 3)
+        assert not td["ctrl_valid"].any()
 
 
 def test_episode_score_logged() -> None:

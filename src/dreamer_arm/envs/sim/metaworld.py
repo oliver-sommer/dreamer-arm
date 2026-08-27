@@ -205,7 +205,28 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
             self._mj_viewer.sync()
 
         obs = self._get_obs_dict(render=render)
-        return obs, float(reward), bool(terminated), bool(truncated), self._build_info()
+        info = self._build_info()
+        # Episode summaries alone cannot supervise action feasibility: by the
+        # time they are logged, the individual command that caused a clamp is
+        # lost. Expose the current controller step separately; SyncVectorEnv
+        # aggregates it across action repeats before replay storage.
+        info["step_success"] = float(inner_info.get("success", 0.0))
+        if self._is_yam and diagnostics:
+            info["ctrl_step_diag"] = {
+                key: float(diagnostics.get(key, 0.0))
+                for key in (
+                    "ws_clamped",
+                    "lag_clamped",
+                    "joint_limit_clamped",
+                    "track_cmd_x",
+                    "track_cmd_y",
+                    "track_cmd_z",
+                    "achieved_x",
+                    "achieved_y",
+                    "achieved_z",
+                )
+            }
+        return obs, float(reward), bool(terminated), bool(truncated), info
 
     def close(self) -> None:
         if self._mj_viewer is not None:

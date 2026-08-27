@@ -139,6 +139,11 @@ def test_buffer_sample_alignment() -> None:
                     "obs": torch.full((n_envs, 1), float(t)),
                     "action": torch.full((n_envs, 1), float(t)),
                     "reward": torch.full((n_envs, 1), float(t)),
+                    "success": torch.full((n_envs, 1), float(t)),
+                    "ctrl_valid": torch.full((n_envs, 1), True),
+                    "ctrl_clamp": torch.full((n_envs, 3), float(t)),
+                    "ctrl_retained_xyz": torch.full((n_envs, 3), float(t)),
+                    "ctrl_achieved_xyz": torch.full((n_envs, 3), float(t)),
                     "is_first": torch.full((n_envs,), t == 7),
                     "is_last": torch.full((n_envs,), t % 3 == 0),
                     "is_terminal": torch.full((n_envs,), t % 4 == 0),
@@ -155,6 +160,9 @@ def test_buffer_sample_alignment() -> None:
 
     assert torch.equal(action, obs - 1.0), f"action misaligned:\nobs={obs}\naction={action}"
     assert torch.equal(reward, obs - 1.0), f"reward misaligned:\nobs={obs}\nreward={reward}"
+    for key in ("success", "ctrl_clamp", "ctrl_retained_xyz", "ctrl_achieved_xyz"):
+        expected = (obs - 1.0).expand_as(data[key])
+        assert torch.equal(data[key], expected), f"{key} misaligned"
     current = obs[..., 0].to(torch.int64)
     assert torch.equal(data["is_last"], current % 3 == 0)
     assert torch.equal(data["is_terminal"], current % 4 == 0)

@@ -97,9 +97,10 @@ class ReplayBuffer:
 
         Returns ``(data, index, initial)`` where:
 
-        * ``data`` is the ``(B, T)`` training window. ``action`` and
-          ``reward`` are shifted one step back so they describe the transition
-          that arrived at ``data[t]``. Episode-end flags stay on the last
+        * ``data`` is the ``(B, T)`` training window. Transition-valued fields
+          (action, reward, success, and controller outcomes) are shifted one
+          step back so they describe the transition that arrived at
+          ``data[t]``. Episode-end flags stay on the last
           stored state: the vector env auto-resets and does not store a
           separate terminal-arrival row, so moving them would erase the only
           boundary sentinel available to replay returns.
@@ -127,7 +128,16 @@ class ReplayBuffer:
         # sequences. A fully arrival-indexed layout would require storing that
         # extra terminal row per environment rather than merely shifting keys.
         # clone(): the source overlaps the view being written.
-        shifted = {key: sample_td[key][:, :-1].clone() for key in ("action", "reward")}
+        transition_keys = (
+            "action",
+            "reward",
+            "success",
+            "ctrl_valid",
+            "ctrl_clamp",
+            "ctrl_retained_xyz",
+            "ctrl_achieved_xyz",
+        )
+        shifted = {key: sample_td[key][:, :-1].clone() for key in transition_keys if key in sample_td}
         data = sample_td[:, 1:]
         for key, value in shifted.items():
             data.set_(key, value)

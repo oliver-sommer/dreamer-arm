@@ -23,6 +23,14 @@ class _TinyWorldModel:
         return state["feat"]
 
 
+class _ConstrainedTinyWorldModel(_TinyWorldModel):
+    def predict_constraints(self, state: dict[str, torch.Tensor], action: torch.Tensor) -> dict[str, torch.Tensor]:
+        del state
+        logits = torch.full((*action.shape[:-1], 3), 8.0, device=action.device)
+        zeros = torch.zeros_like(logits)
+        return {"clamp_logits": logits, "retained_xyz": zeros, "achieved_xyz": zeros}
+
+
 def test_actor_critic_loss_shapes_and_gradient(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]
     feat_size, act_dim, b, t = 8, 3, 2, 5
     ac = ActorCritic(
@@ -55,6 +63,53 @@ def test_actor_critic_loss_shapes_and_gradient(tiny_actor_critic_cfg) -> None:  
     assert feat.grad is not None and torch.isfinite(feat.grad).all()
     assert any(p.grad is not None for p in ac.value.parameters())
     assert any(p.grad is not None for p in ac.actor.parameters())
+
+
+def test_actor_objective_penalizes_predicted_controller_clamps(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]
+    tiny_actor_critic_cfg.constraint_cost_scale = 2.0
+    feat_size, act_dim, b, t = 8, 3, 2, 5
+    ac = ActorCritic(
+        tiny_actor_critic_cfg, feat_size, (act_dim,), act_discrete=False, imag_starts=None, device=torch.device("cpu")
+    )
+    feat = torch.randn(b, t, feat_size)
+    data = {
+        "action": torch.randn(b, t, act_dim),
+        "reward": torch.randn(b, t, 1),
+        "is_terminal": torch.zeros(b, t),
+        "is_last": torch.zeros(b, t),
+    }
+
+    _, metrics = ac.loss(feat, data, _ConstrainedTinyWorldModel(), {"feat": feat})
+
+    assert metrics["imag_constraint_prob"] > 0.99
+    assert metrics["imag_constraint_cost"] > 1.99
+    assert torch.allclose(metrics["shaped_rew"], metrics["rew"] - metrics["imag_constraint_cost"])
+
+
+def test_sparse_success_head_is_supervised_and_shapes_imagined_reward(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]
+    tiny_actor_critic_cfg.success.enabled = True
+    tiny_actor_critic_cfg.success.bonus = 5.0
+    feat_size, act_dim, b, t = 8, 3, 2, 5
+    ac = ActorCritic(
+        tiny_actor_critic_cfg, feat_size, (act_dim,), act_discrete=False, imag_starts=None, device=torch.device("cpu")
+    )
+    feat = torch.randn(b, t, feat_size)
+    success = torch.zeros(b, t, 1)
+    success[0, -1] = 1.0
+    data = {
+        "action": torch.randn(b, t, act_dim),
+        "reward": torch.randn(b, t, 1),
+        "success": success,
+        "is_terminal": torch.zeros(b, t),
+        "is_last": torch.zeros(b, t),
+    }
+
+    losses, metrics = ac.loss(feat, data, _TinyWorldModel(), {"feat": feat})
+
+    assert torch.isfinite(losses["success"])
+    assert metrics["success/target_rate"] == 0.1
+    assert metrics["imag_success_bonus"] > 0.0
+    assert torch.allclose(metrics["shaped_rew"], metrics["rew"] + metrics["imag_success_bonus"])
 
 
 def test_imag_starts_none_keeps_every_start(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]

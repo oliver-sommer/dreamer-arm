@@ -206,6 +206,37 @@ class CausalPredictor(nn.Module):
         return x.reshape(b, f, p, c)
 
 
+class ConstraintPredictor(nn.Module):
+    """Predict controller projection from explicit robot state + command."""
+
+    def __init__(self, inp_dim: int, hidden: int) -> None:
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(inp_dim, hidden),
+            nn.RMSNorm(hidden, eps=1e-4, dtype=torch.float32),
+            nn.SiLU(),
+        )
+        self.clamp = nn.Linear(hidden, 3)
+        self.retained = nn.Linear(hidden, 3)
+        self.achieved = nn.Linear(hidden, 3)
+        self.apply(weight_init_)
+        with torch.no_grad():
+            self.clamp.weight.zero_()
+            self.clamp.bias.fill_(-4.59511985013459)  # logit(0.01)
+            self.retained.weight.zero_()
+            self.retained.bias.zero_()
+            self.achieved.weight.zero_()
+            self.achieved.bias.zero_()
+
+    def forward(self, condition: torch.Tensor) -> dict[str, torch.Tensor]:
+        hidden = self.trunk(condition)
+        return {
+            "clamp_logits": self.clamp(hidden),
+            "retained_xyz": self.retained(hidden),
+            "achieved_xyz": self.achieved(hidden),
+        }
+
+
 class DinoWM(nn.Module):
     """Trainable visual + proprioceptive dynamics with static task context.
 
@@ -254,6 +285,7 @@ class DinoWM(nn.Module):
 
         self.action_dim_embed = int(config.action_dim_embed)
         self.action_embed = Embedder(act_dim, self.action_dim_embed)
+        self.act_dim = act_dim
         # Sliding windows per predictor call in `loss`; trades activation memory
         # for GPU occupancy.  1 measured fastest on MPS -- see the config.
         self.window_chunk = int(getattr(config, "window_chunk", 1))
@@ -288,6 +320,22 @@ class DinoWM(nn.Module):
         self.tok_dim = embed_dim
         predictor_dim = self.tok_dim + self.proprio_dim + self.task_dim + self.action_dim_embed
         self.predictor = CausalPredictor(config.predictor, predictor_dim, num_patches, self.context)
+        self.residual = bool(getattr(config, "residual", False))
+        self.prediction_head: nn.Linear | None = None
+        if self.residual:
+            self.prediction_head = nn.Linear(predictor_dim, self.tok_dim + self.proprio_dim)
+            nn.init.zeros_(self.prediction_head.weight)
+            nn.init.zeros_(self.prediction_head.bias)
+
+        constraint_cfg = getattr(config, "constraint", None)
+        self.constraint_enabled = bool(getattr(constraint_cfg, "enabled", False))
+        self.constraint_motion_scale = float(getattr(constraint_cfg, "motion_scale", 100.0))
+        self.constraint: ConstraintPredictor | None = None
+        if self.constraint_enabled:
+            if self.constraint_motion_scale <= 0.0:
+                raise ValueError("constraint.motion_scale must be positive")
+            constraint_dim = self.proprio_dim + self.task_dim + act_dim
+            self.constraint = ConstraintPredictor(constraint_dim, int(getattr(constraint_cfg, "hidden", 128)))
 
         feat_pool = str(config.feat_pool)
         if feat_pool not in ("mean", "flatten", "task_attention"):
@@ -356,12 +404,10 @@ class DinoWM(nn.Module):
         conditioning.append(ctx_actions)
         pred_in = self.tile_and_cat(tokens, torch.cat(conditioning, dim=-1))
         if checkpoint_predictor and torch.is_grad_enabled():
-            pred_out = checkpoint(self.predictor, pred_in, use_reentrant=False)[:, -1]
+            pred_hidden = checkpoint(self.predictor, pred_in, use_reentrant=False)[:, -1]
         else:
-            pred_out = self.predictor(pred_in)[:, -1]
-        pred_tokens = pred_out[..., : self.tok_dim]
-        proprio_start = self.tok_dim
-        pred_proprio = pred_out[..., proprio_start : proprio_start + self.proprio_dim].mean(dim=-2)
+            pred_hidden = self.predictor(pred_in)[:, -1]
+        pred_tokens, pred_proprio = self._decode_prediction(pred_hidden, tokens[:, -1], proprio[:, -1])
         new_tokens = torch.cat([tokens[:, 1:], pred_tokens.unsqueeze(1)], dim=1)
         new_proprio = torch.cat([proprio[:, 1:], pred_proprio.unsqueeze(1)], dim=1)
         new_actions_out = ctx_actions[:, 1:]
@@ -369,6 +415,42 @@ class DinoWM(nn.Module):
         if self.task_key is not None:
             next_state[self.task_key] = state[self.task_key]
         return next_state
+
+    def _decode_prediction(
+        self,
+        hidden: torch.Tensor,
+        latest_tokens: torch.Tensor,
+        latest_proprio: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.prediction_head is None:
+            prediction = hidden[..., : self.tok_dim + self.proprio_dim]
+        else:
+            prediction = self.prediction_head(hidden)
+        pred_tokens = prediction[..., : self.tok_dim]
+        pred_proprio = prediction[..., self.tok_dim :].mean(dim=-2)
+        if self.residual:
+            pred_tokens = latest_tokens + pred_tokens
+            pred_proprio = latest_proprio + pred_proprio
+        return pred_tokens, pred_proprio
+
+    def constraint_outputs(
+        self, state: dict[str, torch.Tensor], action: torch.Tensor
+    ) -> dict[str, torch.Tensor] | None:
+        """Predict clamp events and retained/achieved XYZ for ``(state, action)``."""
+        if self.constraint is None:
+            return None
+        condition = [state["proprio"][..., -1, :]]
+        if self.task_key is not None:
+            condition.append(state[self.task_key])
+        condition.append(action)
+        outputs = self.constraint(torch.cat(condition, dim=-1))
+        # The regression heads train in centimetre-scale units for useful
+        # gradients, but every public controller diagnostic remains SI.
+        return {
+            "clamp_logits": outputs["clamp_logits"],
+            "retained_xyz": outputs["retained_xyz"] / self.constraint_motion_scale,
+            "achieved_xyz": outputs["achieved_xyz"] / self.constraint_motion_scale,
+        }
 
     def rollout_loss(
         self,
@@ -558,15 +640,12 @@ class DinoWM(nn.Module):
             # Recompute this chunk's forward during backward rather than hold
             # every chunk's internal activations live for the single combined
             # backward in model.py::_cal_grad.
-            pred_out = checkpoint(self.predictor, pred_in, use_reentrant=False)
-            pred_last = pred_out[:, -1]
-            token_preds.append(pred_last[..., : self.tok_dim].reshape(b, w, p, self.tok_dim))
-            proprio_start = self.tok_dim
-            proprio_preds.append(
-                pred_last[..., proprio_start : proprio_start + self.proprio_dim]
-                .mean(dim=-2)
-                .reshape(b, w, self.proprio_dim)
-            )
+            pred_hidden = checkpoint(self.predictor, pred_in, use_reentrant=False)[:, -1]
+            flat_tokens = ctx_tokens.reshape(b * w, h, p, self.tok_dim)
+            flat_proprio = ctx_proprio.reshape(b * w, h, self.proprio_dim)
+            pred_tokens, pred_proprio = self._decode_prediction(pred_hidden, flat_tokens[:, -1], flat_proprio[:, -1])
+            token_preds.append(pred_tokens.reshape(b, w, p, self.tok_dim))
+            proprio_preds.append(pred_proprio.reshape(b, w, self.proprio_dim))
 
         token_pred = torch.cat(token_preds, dim=1)
         proprio_pred = torch.cat(proprio_preds, dim=1)
@@ -624,6 +703,11 @@ class DinoWorldModel:
 
     def img_step(self, state: dict[str, torch.Tensor], action: torch.Tensor) -> dict[str, torch.Tensor]:
         return self.dinowm.img_step(state, action)
+
+    def predict_constraints(
+        self, state: dict[str, torch.Tensor], action: torch.Tensor
+    ) -> dict[str, torch.Tensor] | None:
+        return self.dinowm.constraint_outputs(state, action)
 
     def get_feat(self, state: dict[str, torch.Tensor]) -> torch.Tensor:
         return self.dinowm.get_feat(state)
@@ -714,5 +798,76 @@ class DinoWorldModel:
         )
         if overshoot is not None:
             losses["overshoot"] = overshoot
+        constraint_loss, constraint_metrics = self._constraint_loss(state, data)
+        if constraint_loss is not None:
+            losses["constraint"] = constraint_loss
+        metrics.update(constraint_metrics)
         metrics.update(rollout_metrics)
         return state, losses, metrics
+
+    def _constraint_loss(
+        self, state: dict[str, torch.Tensor], data: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+        required = {
+            "action",
+            "ctrl_valid",
+            "ctrl_clamp",
+            "ctrl_retained_xyz",
+            "ctrl_achieved_xyz",
+        }
+        if self.dinowm.constraint is None or not required.issubset(data):
+            return None, {}
+
+        count = state["tokens"].shape[1]
+        if count < 2:
+            return None, {}
+        depart = {key: value[:, :-1] for key, value in state.items()}
+        outputs = self.dinowm.constraint_outputs(depart, data["action"][:, -count + 1 :])
+        assert outputs is not None
+        valid = data["ctrl_valid"][:, -count + 1 :].float()
+        clamp_target = data["ctrl_clamp"][:, -count + 1 :].float()
+        retained_target = data["ctrl_retained_xyz"][:, -count + 1 :].float()
+        achieved_target = data["ctrl_achieved_xyz"][:, -count + 1 :].float()
+        valid_count = valid.sum().clamp_min(1.0)
+
+        logits = outputs["clamp_logits"]
+        positives = (clamp_target * valid).sum(dim=(0, 1))
+        negatives = ((1.0 - clamp_target) * valid).sum(dim=(0, 1))
+        pos_weight = (negatives / positives.clamp_min(1.0)).clamp(1.0, 20.0)
+        clamp_element = F.binary_cross_entropy_with_logits(
+            logits, clamp_target, pos_weight=pos_weight, reduction="none"
+        )
+        clamp_loss = (clamp_element * valid).sum() / (valid_count * clamp_target.shape[-1])
+
+        scale = self.dinowm.constraint_motion_scale
+        retained_element = F.smooth_l1_loss(outputs["retained_xyz"] * scale, retained_target * scale, reduction="none")
+        achieved_element = F.smooth_l1_loss(outputs["achieved_xyz"] * scale, achieved_target * scale, reduction="none")
+        retained_loss = (retained_element * valid).sum() / (valid_count * 3.0)
+        achieved_loss = (achieved_element * valid).sum() / (valid_count * 3.0)
+        total = clamp_loss + retained_loss + achieved_loss
+
+        probability = logits.sigmoid()
+        predicted = probability >= 0.5
+        target_bool = clamp_target >= 0.5
+        mask = valid.bool().expand_as(target_bool)
+        tp = (predicted & target_bool & mask).sum(dim=(0, 1)).float()
+        fp = (predicted & ~target_bool & mask).sum(dim=(0, 1)).float()
+        fn = (~predicted & target_bool & mask).sum(dim=(0, 1)).float()
+        labels = ("workspace", "lag", "joint_limit")
+        metrics: dict[str, torch.Tensor] = {
+            "constraint/clamp_loss": clamp_loss.detach(),
+            "constraint/retained_xyz_loss": retained_loss.detach(),
+            "constraint/achieved_xyz_loss": achieved_loss.detach(),
+            "constraint/valid_fraction": valid.mean().detach(),
+            "constraint/retained_xyz_mae_m": ((outputs["retained_xyz"] - retained_target).abs() * valid).sum().detach()
+            / (valid_count * 3.0),
+            "constraint/achieved_xyz_mae_m": ((outputs["achieved_xyz"] - achieved_target).abs() * valid).sum().detach()
+            / (valid_count * 3.0),
+        }
+        valid_flat = valid.squeeze(-1)
+        for index, label in enumerate(labels):
+            metrics[f"constraint/{label}_prob"] = (probability[..., index] * valid_flat).sum().detach() / valid_count
+            metrics[f"constraint/{label}_rate"] = (clamp_target[..., index] * valid_flat).sum().detach() / valid_count
+            metrics[f"constraint/{label}_precision"] = (tp[index] / (tp[index] + fp[index]).clamp_min(1.0)).detach()
+            metrics[f"constraint/{label}_recall"] = (tp[index] / (tp[index] + fn[index]).clamp_min(1.0)).detach()
+        return total, metrics

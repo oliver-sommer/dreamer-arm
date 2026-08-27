@@ -105,6 +105,7 @@ class ActorCritic(nn.Module):
     _frozen_cont: networks.MLPHead
     _frozen_actor: networks.MLPHead
     _frozen_slow_value: networks.MLPHead
+    _frozen_success: networks.MLPHead | None
 
     def __init__(
         self,
@@ -122,11 +123,17 @@ class ActorCritic(nn.Module):
         self.horizon = int(config.horizon)
         self.lamb = float(config.lamb)
         self.act_entropy = float(config.act_entropy)
+        self.constraint_cost_scale = float(config.get("constraint_cost_scale", 0.0))
         self.imag_starts = imag_starts
         self.device = device
 
         self.reward = networks.MLPHead(config.reward, feat_size)
         self.cont = networks.MLPHead(config.cont, feat_size)
+        success_cfg = config.get("success", None)
+        self.success_bonus = float(success_cfg.get("bonus", 0.0)) if success_cfg is not None else 0.0
+        self.success: networks.MLPHead | None = None
+        if success_cfg is not None and bool(success_cfg.get("enabled", False)):
+            self.success = networks.MLPHead(success_cfg, feat_size)
 
         # Build a local actor-head config (don't mutate the shared cfg object):
         # ``shape`` comes from the env action space, and ``dist`` collapses the
@@ -174,14 +181,14 @@ class ActorCritic(nn.Module):
         object.__setattr__(self, "_frozen_cont", frozen(self.cont))
         object.__setattr__(self, "_frozen_actor", frozen(self.actor))
         object.__setattr__(self, "_frozen_slow_value", frozen(self._slow_value))
+        object.__setattr__(self, "_frozen_success", frozen(self.success) if self.success is not None else None)
 
     def trainable_named_parameters(self) -> list[tuple[str, nn.Parameter]]:
         """Params the optimiser should train -- excludes the slow value target."""
-        return [
-            (f"{name}.{pname}", p)
-            for name in ("reward", "cont", "actor", "value")
-            for pname, p in getattr(self, name).named_parameters()
-        ]
+        names = ["reward", "cont", "actor", "value"]
+        if self.success is not None:
+            names.append("success")
+        return [(f"{name}.{pname}", p) for name in names for pname, p in getattr(self, name).named_parameters()]
 
     def update_slow_target(self) -> None:
         if self.slow_value_updates % self.slow_target_update == 0:
@@ -201,6 +208,8 @@ class ActorCritic(nn.Module):
         """Expose actor values on the exact frozen rollout path used by ``act``."""
         dist = self._frozen_actor(feat)
         diagnostics = {"post_mode": sanitize_action(dist.mode, self.act_discrete)}
+        if self._frozen_success is not None:
+            diagnostics["success_probability"] = self._frozen_success(feat).mean.squeeze(-1)
         if not self.act_discrete and hasattr(dist, "pre_mean") and hasattr(dist, "pre_std"):
             diagnostics["pre_mean"] = dist.pre_mean
             diagnostics["pre_std"] = dist.pre_std
@@ -231,18 +240,33 @@ class ActorCritic(nn.Module):
     @torch.no_grad()
     def _imagine(
         self, frozen_wm: WorldModel, start: dict[str, torch.Tensor], imag_horizon: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Roll out the frozen policy in latent space for ``imag_horizon`` steps."""
         feats: list[torch.Tensor] = []
         actions: list[torch.Tensor] = []
+        constraint_probs: list[torch.Tensor] = []
+        constraint_axes: list[torch.Tensor] = []
         state = start
         for _ in range(imag_horizon):
             feat = frozen_wm.get_feat(state)
             action = sanitize_action(self._frozen_actor(feat).rsample(), self.act_discrete)
+            predict_constraints = getattr(frozen_wm, "predict_constraints", None)
+            constraint = predict_constraints(state, action) if predict_constraints is not None else None
+            if constraint is None:
+                axis_probability = torch.zeros(*action.shape[:-1], 3, device=action.device)
+            else:
+                axis_probability = constraint["clamp_logits"].sigmoid()
             feats.append(feat)
             actions.append(action)
+            constraint_axes.append(axis_probability)
+            constraint_probs.append(axis_probability.max(dim=-1, keepdim=True).values)
             state = frozen_wm.img_step(state, action)
-        return torch.stack(feats, dim=1), torch.stack(actions, dim=1)
+        return (
+            torch.stack(feats, dim=1),
+            torch.stack(actions, dim=1),
+            torch.stack(constraint_probs, dim=1),
+            torch.stack(constraint_axes, dim=1),
+        )
 
     def loss(
         self,
@@ -265,6 +289,33 @@ class ActorCritic(nn.Module):
         losses["rew"] = -self.reward(feat).log_prob(to_f32(data["reward"])).mean()
         cont_target = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
         losses["con"] = -self.cont(feat).log_prob(cont_target).mean()
+        if self.success is not None and "success" in data:
+            success_target = to_f32(data["success"])
+            success_dist = self.success(feat)
+            success_nll = -success_dist.log_prob(success_target)
+            flat_target = success_target.squeeze(-1)
+            total = torch.as_tensor(float(flat_target.numel()), device=flat_target.device)
+            positives = flat_target.sum()
+            negatives = total - positives
+            positive_weight = (total / (2.0 * positives.clamp_min(1.0))).clamp(max=20.0)
+            negative_weight = total / (2.0 * negatives.clamp_min(1.0))
+            success_weight = torch.where(flat_target > 0.5, positive_weight, negative_weight)
+            losses["success"] = (success_nll * success_weight).sum() / success_weight.sum().clamp_min(1.0)
+            success_probability = success_dist.mean
+            metrics["success/target_rate"] = success_target.mean().detach()
+            metrics["success/predicted_rate"] = success_probability.mean().detach()
+            positive_mask = success_target > 0.5
+            negative_mask = ~positive_mask
+            metrics["success/predicted_positive"] = (
+                success_probability[positive_mask].mean().detach()
+                if positive_mask.any()
+                else torch.zeros((), device=feat.device)
+            )
+            metrics["success/predicted_negative"] = (
+                success_probability[negative_mask].mean().detach()
+                if negative_mask.any()
+                else torch.zeros((), device=feat.device)
+            )
 
         # Gather task identity with exactly the same random (b, t) indices as
         # the imagination state.  RSSM absorbs task_id into its latent and does
@@ -277,11 +328,19 @@ class ActorCritic(nn.Module):
             start_source["_return_task_id"] = data["task_id"]
         start = self._gather_imag_starts(start_source)
         return_task_id = start.pop("_return_task_id", None)
-        imag_feat, imag_action = self._imagine(frozen_wm, start, self.imag_horizon + 1)
+        imag_feat, imag_action, imag_constraint, imag_constraint_axes = self._imagine(
+            frozen_wm, start, self.imag_horizon + 1
+        )
         imag_feat = imag_feat.detach()
         imag_action = imag_action.detach()
+        imag_constraint = imag_constraint.detach()
+        imag_constraint_axes = imag_constraint_axes.detach()
 
         imag_reward = self._frozen_reward(imag_feat).mode()
+        imag_success = (
+            self._frozen_success(imag_feat).mean if self._frozen_success is not None else torch.zeros_like(imag_reward)
+        )
+        shaped_reward = imag_reward + self.success_bonus * imag_success - self.constraint_cost_scale * imag_constraint
         imag_cont = self._frozen_cont(imag_feat).mean
         # self.value, not the frozen clone: imag_feat is already detached
         # above, so this carries no gradient regardless -- and the value loss
@@ -299,7 +358,7 @@ class ActorCritic(nn.Module):
         # DreamerV3 uses the live critic for λ-return bootstrapping and keeps
         # the slow critic as a value-loss regulariser.  This also keeps the
         # actor baseline and target on the same critic snapshot.
-        ret = lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)
+        ret = lambda_return(last, term, shaped_reward, imag_value, imag_value, disc, self.lamb)
         ret_offset, ret_scale = self.return_ema(ret, return_task_id)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
@@ -328,6 +387,13 @@ class ActorCritic(nn.Module):
         metrics["adv_std"] = adv.std()
         metrics["con"] = imag_cont.mean()
         metrics["rew"] = imag_reward.mean()
+        metrics["shaped_rew"] = shaped_reward.mean()
+        metrics["imag_success"] = imag_success.mean()
+        metrics["imag_success_bonus"] = (self.success_bonus * imag_success).mean()
+        metrics["imag_constraint_prob"] = imag_constraint.mean()
+        metrics["imag_constraint_cost"] = (self.constraint_cost_scale * imag_constraint).mean()
+        for index, label in enumerate(("workspace", "lag", "joint_limit")):
+            metrics[f"imag_constraint_{label}"] = imag_constraint_axes[..., index].mean()
         metrics["val"] = imag_value.mean()
         metrics["tar"] = ret.mean()
         metrics["slowval"] = imag_slow_value.mean()

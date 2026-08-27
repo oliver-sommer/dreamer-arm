@@ -11,8 +11,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
-from dreamer_arm.core.world_model.dinowm import DinoEncoder, DinoWM, generate_mask_matrix
+from dreamer_arm.core.world_model.dinowm import DinoEncoder, DinoWM, DinoWorldModel, generate_mask_matrix
 
 
 def _shapes() -> dict[str, tuple[int, ...]]:
@@ -82,6 +83,52 @@ def test_dinowm_img_step_gradient_flows_to_action(tiny_dinowm_cfg) -> None:  # t
     feat.sum().backward()
     assert action.grad is not None
     assert torch.isfinite(action.grad).all()
+
+
+def test_residual_dinowm_starts_as_exact_persistence(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]
+    """The new dynamics head must initially preserve, not invent, state."""
+    tiny_dinowm_cfg.residual = True
+    dinowm = DinoWM(tiny_dinowm_cfg, _shapes(), act_dim=4, num_patches=4, embed_dim=384)
+    state = dinowm.initial(2, torch.device("cpu"))
+    state["tokens"] = torch.randn_like(state["tokens"])
+    state["proprio"] = torch.randn_like(state["proprio"])
+
+    next_state = dinowm.img_step(state, torch.randn(2, 4))
+
+    assert torch.equal(next_state["tokens"][:, -1], state["tokens"][:, -1])
+    assert torch.equal(next_state["proprio"][:, -1], state["proprio"][:, -1])
+
+
+def test_constraint_model_is_action_conditioned_and_trained_on_departure_state(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]
+    tiny_dinowm_cfg.constraint = SimpleNamespace(enabled=True, hidden=16, motion_scale=100.0)
+    dinowm = DinoWM(tiny_dinowm_cfg, _shapes(), act_dim=4, num_patches=4, embed_dim=384)
+    world_model = DinoWorldModel(dinowm, nn.Identity(), torch.device("cpu"))  # type: ignore[arg-type]
+    b, t = 2, 7
+    tokens = torch.randn(b, t, 4, dinowm.tok_dim)
+    proprio = torch.randn(b, t, dinowm.proprio_dim)
+    action = torch.randn(b, t, 4)
+    state, _, _ = dinowm.loss(tokens, proprio, action)
+    count = state["tokens"].shape[1]
+    data = {
+        "action": action,
+        "ctrl_valid": torch.ones(b, t, 1, dtype=torch.bool),
+        "ctrl_clamp": torch.randint(0, 2, (b, t, 3)).float(),
+        "ctrl_retained_xyz": torch.randn(b, t, 3) * 0.01,
+        "ctrl_achieved_xyz": torch.randn(b, t, 3) * 0.01,
+    }
+
+    departure = {key: value[:, :-1] for key, value in state.items()}
+    outputs = dinowm.constraint_outputs(departure, action[:, -count + 1 :])
+    loss, metrics = world_model._constraint_loss(state, data)
+
+    assert outputs is not None
+    assert outputs["clamp_logits"].shape == (b, count - 1, 3)
+    assert outputs["retained_xyz"].shape == (b, count - 1, 3)
+    assert loss is not None and torch.isfinite(loss)
+    assert metrics["constraint/valid_fraction"] == 1.0
+    loss.backward()
+    assert dinowm.constraint is not None
+    assert any(parameter.grad is not None for parameter in dinowm.constraint.parameters())
 
 
 def test_feat_pool_flatten_matches_expected_size(tiny_dinowm_cfg) -> None:  # type: ignore[no-untyped-def]

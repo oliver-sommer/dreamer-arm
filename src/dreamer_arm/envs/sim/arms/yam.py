@@ -262,6 +262,15 @@ class YamArm:
         ctrl[self._grip_act_id] = g_ctrl
         env.do_simulation(ctrl, env.frame_skip)
 
+        # Complete the command/execution record after physics advances.  The
+        # trainer aggregates these metre-valued deltas across action repeats
+        # and stores them beside the raw policy command.  Keeping requested,
+        # retained, and achieved motion distinct is essential at workspace and
+        # following-error boundaries, where they intentionally differ.
+        achieved = np.asarray(d.site_xpos[self._grasp_site_id], dtype=np.float64) - tcp
+        for index, axis in enumerate("xyz"):
+            diag[f"achieved_{axis}"] = float(achieved[index])
+
     def _resolve_workspace_bounds(self, env: Any) -> tuple[np.ndarray, np.ndarray, str]:
         """Prefer Meta-World's task bounds, then config, else unbounded."""
 

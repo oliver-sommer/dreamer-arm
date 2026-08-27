@@ -118,11 +118,21 @@ def test_evaluate_aggregates_conditioning_and_reward_diagnostics() -> None:
                 "task_id_action_sensitivity": torch.full((n,), 0.25),
                 "proprio_action_sensitivity": torch.full((n,), 0.5),
                 "visual_action_sensitivity": torch.full((n,), 0.75),
+                "success_probability": torch.full((n,), 0.4),
+                "constraint_probability": torch.tensor([[0.9, 0.1, 0.8]]).expand(n, -1),
+                "constraint_retained_xyz": torch.tensor([[0.001, 0.002, 0.003]]).expand(n, -1),
+                "constraint_achieved_xyz": torch.tensor([[0.0005, 0.001, 0.0015]]).expand(n, -1),
             }
 
     class _DiagnosticEnv(_MockVectorEnv):
         def step(self, actions):
             obs, rew, terms, truncs, info = super().step(actions)
+            info["transition"] = {
+                "ctrl_valid": np.ones(self.num_envs, dtype=bool),
+                "ctrl_clamp": np.tile(np.array([[1.0, 0.0, 1.0]], dtype=np.float32), (self.num_envs, 1)),
+                "ctrl_retained_xyz": np.tile(np.array([[0.002, 0.004, 0.006]], dtype=np.float32), (self.num_envs, 1)),
+                "ctrl_achieved_xyz": np.tile(np.array([[0.001, 0.002, 0.003]], dtype=np.float32), (self.num_envs, 1)),
+            }
             for fin in info["final_info"]:
                 if fin is not None:
                     fin["reward_diag"] = {"in_place_reward": 0.75}
@@ -136,6 +146,13 @@ def test_evaluate_aggregates_conditioning_and_reward_diagnostics() -> None:
     assert result.metrics["eval/action_task_id_sensitivity/mock"] == pytest.approx(0.25)
     assert result.metrics["eval/action_proprio_sensitivity/mock"] == pytest.approx(0.5)
     assert result.metrics["eval/action_visual_sensitivity/mock"] == pytest.approx(0.75)
+    assert result.metrics["eval/predicted_success_probability"] == pytest.approx(0.4)
+    assert result.metrics["eval/pred_constraint_workspace_brier"] == pytest.approx(0.01)
+    assert result.metrics["eval/pred_constraint_workspace_recall"] == 1.0
+    assert result.metrics["eval/pred_constraint_lag_rate"] == 0.0
+    assert result.metrics["eval/pred_constraint_joint_limit_precision"] == 1.0
+    assert result.metrics["eval/pred_constraint_retained_mae_m"] == pytest.approx(0.002)
+    assert result.metrics["eval/pred_constraint_achieved_mae_m"] == pytest.approx(0.001)
     assert result.metrics["eval/action_x_mean/mock"] == 0.0
     assert result.metrics["eval/action_x_std/mock"] == 0.0
     assert result.metrics["eval/ctrl_frac_stuck/mock"] == pytest.approx(0.125)

@@ -212,6 +212,11 @@ class Dreamer(nn.Module):
         wm_state = dict(state)
         diagnostics = self.ac.policy_diagnostics(self.frozen_wm.get_feat(wm_state))
         baseline = diagnostics["post_mode"]
+        constraint = self.frozen_wm.predict_constraints(wm_state, baseline)
+        if constraint is not None:
+            diagnostics["constraint_probability"] = constraint["clamp_logits"].sigmoid()
+            diagnostics["constraint_retained_xyz"] = constraint["retained_xyz"]
+            diagnostics["constraint_achieved_xyz"] = constraint["achieved_xyz"]
 
         task_id = wm_state.get("task_id")
         if task_id is not None and task_id.shape[-1] > 1:

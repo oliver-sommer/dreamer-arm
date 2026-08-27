@@ -70,6 +70,8 @@ def _run_smoke(agent: Dreamer, batch_length: int, task_count: int = 0) -> None:
         if "tokens" in next_state:
             assert policy_diag["visual_action_sensitivity"].shape == (_N,)
             assert torch.isfinite(policy_diag["visual_action_sensitivity"]).all()
+            assert policy_diag["constraint_probability"].shape == (_N, 3)
+            assert policy_diag["success_probability"].shape == (_N,)
         if task_count:
             assert policy_diag["task_id_action_sensitivity"].shape == (_N,)
             assert torch.isfinite(policy_diag["task_id_action_sensitivity"]).all()
@@ -81,6 +83,11 @@ def _run_smoke(agent: Dreamer, batch_length: int, task_count: int = 0) -> None:
                 **({"task_id": obs["task_id"]} if task_count else {}),
                 "action": action.detach(),
                 "reward": torch.randn(_N, 1),
+                "success": torch.tensor([[float(t % 7 == 0)]] * _N),
+                "ctrl_valid": torch.ones(_N, 1, dtype=torch.bool),
+                "ctrl_clamp": torch.zeros(_N, 3),
+                "ctrl_retained_xyz": torch.randn(_N, 3) * 0.001,
+                "ctrl_achieved_xyz": torch.randn(_N, 3) * 0.001,
                 "is_first": obs["is_first"],
                 "is_last": torch.tensor([False] * _N),
                 "is_terminal": torch.tensor([False] * _N),

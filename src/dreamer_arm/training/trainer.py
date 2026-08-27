@@ -228,12 +228,27 @@ class OnlineTrainer:
 
             obs_next_np, rewards, terms, truncs, info = self._train_envs.step(action_np)
             done = terms | truncs  # (N,) bool
+            transition_info = info.get("transition", {})
+
+            def transition_array(
+                name: str, shape: tuple[int, ...], dtype: Any, source: dict[str, Any] = transition_info
+            ) -> np.ndarray:
+                value = np.asarray(source.get(name, np.zeros((N, *shape), dtype=dtype)), dtype=dtype)
+                expected = (N, *shape)
+                if value.shape != expected:
+                    raise ValueError(f"transition info {name!r} must have shape {expected}, got {value.shape}")
+                return value
 
             td = TensorDict(
                 {
                     **obs_cpu,
                     "action": torch.from_numpy(action_np),  # reuses the D2H copy made above
                     "reward": torch.from_numpy(rewards).unsqueeze(-1),  # (N,1)
+                    "success": torch.from_numpy(transition_array("success", (), np.float32)).unsqueeze(-1),
+                    "ctrl_valid": torch.from_numpy(transition_array("ctrl_valid", (), bool)).unsqueeze(-1),
+                    "ctrl_clamp": torch.from_numpy(transition_array("ctrl_clamp", (3,), np.float32)),
+                    "ctrl_retained_xyz": torch.from_numpy(transition_array("ctrl_retained_xyz", (3,), np.float32)),
+                    "ctrl_achieved_xyz": torch.from_numpy(transition_array("ctrl_achieved_xyz", (3,), np.float32)),
                     "is_first": is_first_cpu,  # (N,) bool
                     "is_last": torch.from_numpy(done),  # (N,) bool
                     "is_terminal": torch.from_numpy(terms),  # (N,) bool

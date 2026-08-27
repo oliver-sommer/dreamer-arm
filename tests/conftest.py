@@ -117,10 +117,16 @@ def tiny_actor_critic_cfg() -> Any:
             "horizon": 10,
             "lamb": 0.95,
             "act_entropy": 3e-4,
+            "constraint_cost_scale": 0.0,
             "slow_target_update": 1,
             "slow_target_fraction": 0.02,
             "reward": _head("symexp_twohot", [255], bin_num=255),
             "cont": _head("binary", [1]),
+            "success": {
+                "enabled": False,
+                "bonus": 0.0,
+                **_head("binary", [1]),
+            },
             "critic": _head("symexp_twohot", [255], bin_num=255),
             "actor": {
                 "shape": None,

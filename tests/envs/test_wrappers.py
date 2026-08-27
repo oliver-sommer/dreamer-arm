@@ -117,6 +117,51 @@ def test_sync_vec_env_action_repeat() -> None:
     vec.close()
 
 
+def test_sync_vec_env_aggregates_transition_controller_signals() -> None:
+    env = _make_mock_env()
+    step = 0
+
+    def _step(action: Any, **kwargs: Any) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
+        nonlocal step
+        step += 1
+        obs = {
+            "scene": np.ones((8, 8, 3), dtype=np.uint8),
+            "proprio": np.ones(10, dtype=np.float32),
+        }
+        return (
+            obs,
+            1.0,
+            False,
+            False,
+            {
+                "step_success": float(step == 2),
+                "ctrl_step_diag": {
+                    "ws_clamped": float(step == 1),
+                    "lag_clamped": float(step == 2),
+                    "joint_limit_clamped": 0.0,
+                    "track_cmd_x": 0.001,
+                    "track_cmd_y": 0.002,
+                    "track_cmd_z": 0.003,
+                    "achieved_x": 0.0005,
+                    "achieved_y": 0.001,
+                    "achieved_z": 0.0015,
+                },
+            },
+        )
+
+    env.step = MagicMock(side_effect=_step)
+    vec = SyncVectorEnv([lambda: env], action_repeat=3)
+    vec.reset()
+    *_, info = vec.step(np.zeros((1, 4), dtype=np.float32))
+    transition = info["transition"]
+
+    assert transition["success"].tolist() == [1.0]
+    assert transition["ctrl_valid"].tolist() == [True]
+    assert transition["ctrl_clamp"].tolist() == [[1.0, 1.0, 0.0]]
+    assert transition["ctrl_retained_xyz"][0] == pytest.approx([0.003, 0.006, 0.009])
+    assert transition["ctrl_achieved_xyz"][0] == pytest.approx([0.0015, 0.003, 0.0045])
+
+
 def test_sync_vec_env_done_skips_remaining_repeats() -> None:
     env = _make_done_env()
     vec = SyncVectorEnv([lambda: env], action_repeat=5)

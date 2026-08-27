@@ -38,6 +38,12 @@ class WorldModel(Protocol):
         """One-step prior transition, for imagination rollouts."""
         ...
 
+    def predict_constraints(
+        self, state: dict[str, torch.Tensor], action: torch.Tensor
+    ) -> dict[str, torch.Tensor] | None:
+        """Optional action-conditioned controller outcomes for imagination."""
+        ...
+
     def get_feat(self, state: dict[str, torch.Tensor]) -> torch.Tensor:
         """Flatten ``state`` into the feature vector the heads consume."""
         ...

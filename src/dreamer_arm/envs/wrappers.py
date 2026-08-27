@@ -158,6 +158,11 @@ class SyncVectorEnv:
         truncs = np.zeros(N, dtype=bool)
         final_info_per_env: list[dict[str, Any] | None] = [None] * N
         cur_obs: list[dict[str, np.ndarray]] = [{} for _ in range(N)]
+        step_success = np.zeros(N, dtype=np.float32)
+        ctrl_valid = np.zeros(N, dtype=bool)
+        ctrl_clamp = np.zeros((N, 3), dtype=np.float32)
+        ctrl_retained_xyz = np.zeros((N, 3), dtype=np.float32)
+        ctrl_achieved_xyz = np.zeros((N, 3), dtype=np.float32)
 
         for r in range(self._action_repeat):
             # Only the last repeat's obs is ever read: cur_obs[i] is
@@ -174,6 +179,27 @@ class SyncVectorEnv:
                 )
                 rews[i] += float(rew)
                 cur_obs[i] = o
+                step_success[i] = max(step_success[i], float(info.get("step_success", 0.0)))
+                ctrl_step = info.get("ctrl_step_diag")
+                if ctrl_step is not None:
+                    ctrl_valid[i] = True
+                    ctrl_clamp[i] = np.maximum(
+                        ctrl_clamp[i],
+                        np.asarray(
+                            [
+                                ctrl_step.get("ws_clamped", 0.0),
+                                ctrl_step.get("lag_clamped", 0.0),
+                                ctrl_step.get("joint_limit_clamped", 0.0),
+                            ],
+                            dtype=np.float32,
+                        ),
+                    )
+                    ctrl_retained_xyz[i] += np.asarray(
+                        [ctrl_step.get(f"track_cmd_{axis}", 0.0) for axis in "xyz"], dtype=np.float32
+                    )
+                    ctrl_achieved_xyz[i] += np.asarray(
+                        [ctrl_step.get(f"achieved_{axis}", 0.0) for axis in "xyz"], dtype=np.float32
+                    )
                 if term or trunc:
                     final_info_per_env[i] = {**info}
                     terms[i] = term
@@ -182,11 +208,25 @@ class SyncVectorEnv:
 
         for i in range(N):
             if done[i]:
+                # The live observation below is a reset state rather than the
+                # terminal arrival, so it cannot be paired with the preceding
+                # controller outcome in a state-conditioned training loss.
+                ctrl_valid[i] = False
                 o_reset, _ = self._envs[i].reset()
                 cur_obs[i] = o_reset
 
         obs = self._stack_obs(cur_obs)
-        info_out: dict[str, Any] = {"final_info": final_info_per_env}
+        info_out: dict[str, Any] = {
+            "final_info": final_info_per_env,
+            "transition": {
+                "success": step_success,
+                "ctrl_valid": ctrl_valid,
+                # Columns: workspace, following-error lag, joint limit.
+                "ctrl_clamp": ctrl_clamp,
+                "ctrl_retained_xyz": ctrl_retained_xyz,
+                "ctrl_achieved_xyz": ctrl_achieved_xyz,
+            },
+        }
         return obs, rews, terms, truncs, info_out
 
     def close(self) -> None:

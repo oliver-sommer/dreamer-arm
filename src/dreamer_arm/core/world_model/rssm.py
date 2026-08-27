@@ -320,6 +320,12 @@ class RSSMWorldModel:
         stoch, deter = self.rssm.img_step(state["stoch"], state["deter"], action)
         return {"stoch": stoch, "deter": deter}
 
+    def predict_constraints(
+        self, state: dict[str, torch.Tensor], action: torch.Tensor
+    ) -> dict[str, torch.Tensor] | None:
+        del state, action
+        return None
+
     def get_feat(self, state: dict[str, torch.Tensor]) -> torch.Tensor:
         return self.rssm.get_feat(state["stoch"], state["deter"])
 
