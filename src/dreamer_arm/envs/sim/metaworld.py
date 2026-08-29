@@ -279,9 +279,7 @@ class MetaWorldEnv(gymnasium.Env):  # type: ignore[misc]
         joints = (
             d.qpos[self._arm_qadr].astype(np.float32) if self._arm_qadr is not None else np.zeros(6, dtype=np.float32)
         )
-        lc = np.asarray(d.body("leftclaw").xpos)
-        rc = np.asarray(d.body("rightclaw").xpos)
-        gripper_open = float(np.linalg.norm(rc - lc) / 0.1)
+        gripper_open = float(self._env.get_gripper_open())
         # The shared contract names the Cartesian point controlled by each
         # backend. YAM controls grasp_site; Sawyer's upstream mocap path and
         # rewards use the mean of its two finger sites (tcp_center).

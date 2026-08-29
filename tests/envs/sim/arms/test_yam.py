@@ -9,14 +9,14 @@ import pytest
 _SIGMA_MIN_HOME_FLOOR = 0.12
 
 
-def _make_yam_inner(task_name: str = "reach", arm_cfg: Any | None = None) -> tuple[Any, Any, int]:
+def _make_yam_inner(task_name: str = "reach", arm_cfg: Any | None = None, seed: int = 0) -> tuple[Any, Any, int]:
     import metaworld
     import mujoco
 
     from dreamer_arm.envs.sim.arms import make_arm
 
     metaworld.set_active_arm("yam")
-    benchmark = metaworld.MT1(task_name + "-v3", seed=0)
+    benchmark = metaworld.MT1(task_name + "-v3", seed=seed)
     env_cls = next(iter(benchmark.train_classes.values()))
     inner = env_cls(render_mode=None)
     arm = make_arm("yam", arm_cfg)
@@ -24,6 +24,150 @@ def _make_yam_inner(task_name: str = "reach", arm_cfg: Any | None = None) -> tup
     inner.set_task(benchmark.train_tasks[0])
     site_id = int(mujoco.mj_name2id(inner.model, mujoco.mjtObj.mjOBJ_SITE, "grasp_site"))
     return inner, arm, site_id
+
+
+def _move_yam_to(
+    inner: Any,
+    arm: Any,
+    site_id: int,
+    target: np.ndarray,
+    grip: float,
+    budget: int,
+    max_force_ratio: list[float],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    stable = 0
+    obs = inner._get_obs()
+    info: dict[str, Any] = {}
+    for _ in range(budget):
+        delta = target - arm._p_target
+        distance = float(np.linalg.norm(delta))
+        requested = delta * min(1.0, 0.002 / max(distance, 1e-12))
+        dt = float(inner.model.opt.timestep) * int(inner.frame_skip)
+        xyz = np.clip(requested / (dt * arm._cfg.max_ee_speed_m_s), -1.0, 1.0)
+        obs, _, _, _, info = inner.step(np.array([*xyz, grip], dtype=np.float32))
+        forces = np.abs(inner.data.actuator_force[arm._arm_act_ids])
+        limits = inner.model.actuator_forcerange[arm._arm_act_ids, 1]
+        max_force_ratio[0] = max(max_force_ratio[0], float(np.max(forces / limits)))
+        error = float(np.linalg.norm(np.asarray(inner.data.site_xpos[site_id]) - target))
+        stable = stable + 1 if error < 0.006 else 0
+        if stable >= 8:
+            break
+    return obs, info
+
+
+def _gripper_geom_ids(inner: Any) -> set[int]:
+    roots = {int(inner.model.body("leftclaw").id), int(inner.model.body("rightclaw").id)}
+    bodies: set[int] = set()
+    for body_id in range(inner.model.nbody):
+        cursor = body_id
+        while cursor > 0:
+            if cursor in roots:
+                bodies.add(body_id)
+                break
+            cursor = int(inner.model.body_parentid[cursor])
+    return {geom_id for geom_id in range(inner.model.ngeom) if int(inner.model.geom_bodyid[geom_id]) in bodies}
+
+
+def test_yam_gripper_opens_closes_and_has_no_internal_contacts() -> None:
+    inner, arm, _ = _make_yam_inner()
+    try:
+        obs, _ = inner.reset()
+        for _ in range(50):
+            obs, *_ = inner.step(np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float32))
+        left = np.asarray(inner.data.body("leftpad").xpos)
+        right = np.asarray(inner.data.body("rightpad").xpos)
+        open_aperture = float(np.linalg.norm(left - right))
+        open_observation = float(obs[3])
+
+        gripper_geoms = _gripper_geom_ids(inner)
+        internal_contacts = [
+            contact
+            for contact in inner.data.contact
+            if int(contact.geom1) in gripper_geoms and int(contact.geom2) in gripper_geoms
+        ]
+
+        for _ in range(80):
+            obs, *_ = inner.step(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32))
+        left = np.asarray(inner.data.body("leftpad").xpos)
+        right = np.asarray(inner.data.body("rightpad").xpos)
+        closed_aperture = float(np.linalg.norm(left - right))
+        closed_observation = float(obs[3])
+    finally:
+        inner.close()
+
+    assert not internal_contacts
+    assert open_aperture > 0.070
+    assert closed_aperture < 0.005
+    assert open_observation > 0.9
+    assert closed_observation < 0.1
+    assert closed_observation < open_observation
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_yam_pick_place_scripted_grasp_lifts_original_object(seed: int) -> None:
+    from dreamer_arm.envs.sim.arms import ArmConfig
+
+    cfg = ArmConfig(
+        name="yam",
+        workspace_low=(-0.5, 0.4, 0.01),
+        workspace_high=(0.5, 1.0, 0.5),
+    )
+    inner, arm, site_id = _make_yam_inner("pick-place", cfg, seed=seed)
+    max_force_ratio = [0.0]
+    try:
+        obs, _ = inner.reset()
+        obj_start = np.asarray(obs[4:7], dtype=np.float64).copy()
+        obs, _ = _move_yam_to(
+            inner,
+            arm,
+            site_id,
+            obj_start + np.array([0.0, 0.0, 0.08]),
+            -1.0,
+            160,
+            max_force_ratio,
+        )
+        obs, info = _move_yam_to(
+            inner,
+            arm,
+            site_id,
+            obj_start + np.array([0.0, 0.0, 0.003]),
+            -1.0,
+            100,
+            max_force_ratio,
+        )
+        assert float(np.linalg.norm(np.asarray(inner.data.site_xpos[site_id]) - obs[4:7])) < 0.006
+
+        for _ in range(60):
+            obs, _, _, _, info = inner.step(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32))
+        assert inner.touching_main_object
+        assert float(info["grasp_reward"]) > 0.97
+        assert float(info["mw_v2_grasp_reward"]) < 0.5
+
+        lift_target = np.asarray(inner.data.site_xpos[site_id], dtype=np.float64).copy()
+        lift_target[2] += 0.10
+        obs, info = _move_yam_to(inner, arm, site_id, lift_target, 1.0, 120, max_force_ratio)
+        object_lift = float(obs[6] - obj_start[2])
+    finally:
+        inner.close()
+
+    assert object_lift > 0.05
+    assert float(info["grasp_success"]) == 1.0
+    assert np.isfinite(float(info["mw_v2_reward"]))
+    assert max_force_ratio[0] < 0.8
+
+
+@pytest.mark.parametrize("task_name", ["push-back", "soccer", "stick-push", "sweep", "sweep-into"])
+def test_yam_custom_caging_rewards_expose_finite_original_shadow(task_name: str) -> None:
+    inner, _, _ = _make_yam_inner(task_name)
+    try:
+        inner.reset()
+        _, reward, _, _, info = inner.step(np.zeros(4, dtype=np.float32))
+    finally:
+        inner.close()
+
+    assert np.isfinite(float(reward))
+    assert np.isfinite(float(info["mw_v2_reward"]))
+    assert np.isfinite(float(info["mw_v2_grasp_reward"]))
 
 
 def test_yam_home_pose_well_conditioned() -> None:
@@ -317,7 +461,7 @@ def test_yam_targets_reset_independently_in_sync_vector_env() -> None:
         vec.close()
 
 
-def test_yam_prefers_metaworld_workspace_bounds() -> None:
+def test_yam_uses_metaworld_workspace_bounds_as_fallback() -> None:
     inner, arm, _ = _make_yam_inner()
     try:
         np.testing.assert_allclose(arm._ws_low, inner.mocap_low)
@@ -326,7 +470,7 @@ def test_yam_prefers_metaworld_workspace_bounds() -> None:
         inner.close()
 
 
-def test_yam_workspace_config_is_a_fallback() -> None:
+def test_yam_workspace_config_overrides_environment() -> None:
     from dreamer_arm.envs.sim.arms import ArmConfig, make_arm
 
     arm = make_arm(
@@ -337,7 +481,8 @@ def test_yam_workspace_config_is_a_fallback() -> None:
             workspace_high=(0.4, 0.5, 0.6),
         ),
     )
-    low, high, source = arm._resolve_workspace_bounds(SimpleNamespace())
+    env = SimpleNamespace(mocap_low=(-9.0, -9.0, -9.0), mocap_high=(9.0, 9.0, 9.0))
+    low, high, source = arm._resolve_workspace_bounds(env)
     np.testing.assert_allclose(low, [-0.1, 0.2, 0.3])
     np.testing.assert_allclose(high, [0.4, 0.5, 0.6])
     assert source == "config"

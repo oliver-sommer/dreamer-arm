@@ -34,6 +34,8 @@ _ARM_JOINT_NAMES = [f"joint{i}" for i in range(1, 7)]
 _GRASP_SITE_NAME = "grasp_site"
 _GRIPPER_ACT_NAME = "gripper"
 _GRIPPER_MAX_OPEN = 0.041  # ctrlrange hi = fully open
+_GRIPPER_CLOSED_APERTURE_M = 0.002
+_GRIPPER_OPEN_APERTURE_M = 0.078
 
 
 class YamArm:
@@ -121,6 +123,16 @@ class YamArm:
 
         env._external_actuation = self.actuate
         env._external_reset_hand = self.reset_hand
+        env._external_gripper_open = self.gripper_open
+        env._caging_reward_frame = "pad_axis"
+
+    def gripper_open(self, env: Any) -> float:
+        """Measure normalized physical pad aperture (0 closed, 1 open)."""
+        left = np.asarray(env.data.body("leftpad").xpos, dtype=np.float64)
+        right = np.asarray(env.data.body("rightpad").xpos, dtype=np.float64)
+        aperture = float(np.linalg.norm(left - right))
+        span = _GRIPPER_OPEN_APERTURE_M - _GRIPPER_CLOSED_APERTURE_M
+        return float(np.clip((aperture - _GRIPPER_CLOSED_APERTURE_M) / span, 0.0, 1.0))
 
     def actuate(self, env: Any, action: Any) -> None:
         """Advance physics for one control step using DLS-IK.
@@ -272,12 +284,7 @@ class YamArm:
             diag[f"achieved_{axis}"] = float(achieved[index])
 
     def _resolve_workspace_bounds(self, env: Any) -> tuple[np.ndarray, np.ndarray, str]:
-        """Prefer Meta-World's task bounds, then config, else unbounded."""
-
-        env_low = getattr(env, "mocap_low", None)
-        env_high = getattr(env, "mocap_high", None)
-        if env_low is not None and env_high is not None:
-            return (*self._validate_workspace_bounds(env_low, env_high, "env.mocap_low/high"), "environment")
+        """Prefer explicit arm bounds, then task bounds, else unbounded."""
 
         cfg_low = self._cfg.workspace_low
         cfg_high = self._cfg.workspace_high
@@ -285,6 +292,11 @@ class YamArm:
             raise ValueError("workspace_low and workspace_high must be supplied together")
         if cfg_low is not None and cfg_high is not None:
             return (*self._validate_workspace_bounds(cfg_low, cfg_high, "ArmConfig"), "config")
+
+        env_low = getattr(env, "mocap_low", None)
+        env_high = getattr(env, "mocap_high", None)
+        if env_low is not None and env_high is not None:
+            return (*self._validate_workspace_bounds(env_low, env_high, "env.mocap_low/high"), "environment")
 
         return np.full(3, -np.inf), np.full(3, np.inf), "unbounded"
 

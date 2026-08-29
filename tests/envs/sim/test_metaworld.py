@@ -41,6 +41,7 @@ def test_sticky_success(monkeypatch: pytest.MonkeyPatch) -> None:
         *_, next_info = env.step(np.zeros(4, dtype=np.float32))
         assert next_info["success"]
         assert next_info["reward_diag"]
+        assert "mw_v2_reward" in next_info["reward_diag"]
         assert all(np.isfinite(value) for value in next_info["reward_diag"].values())
     finally:
         env.close()
@@ -71,6 +72,7 @@ def test_proprio_reports_the_backend_controlled_tool_point(monkeypatch: pytest.M
             np.asarray(inner.data.site_xpos[env._grasp_site_id]) if arm_name == "yam" else np.asarray(inner.tcp_center)
         )
         np.testing.assert_allclose(observation["proprio"][ObservationSpec.TOOL_POSITION], expected, atol=1e-7)
+        assert observation["proprio"][ObservationSpec.GRIPPER_OPEN] == pytest.approx(inner.get_gripper_open())
         assert env.observation_space.contains(observation)
     finally:
         env.close()

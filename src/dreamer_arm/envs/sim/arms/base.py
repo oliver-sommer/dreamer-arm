@@ -1,11 +1,12 @@
 """Arm protocol and factory.
 
-Each ``Arm`` implementation installs Meta-World's two injectable hooks
-(``_external_actuation`` / ``_external_reset_hand``) on a task env instance.
+Each ``Arm`` implementation may install Meta-World's injectable hooks on a
+task env instance.
 The hook API is a fixed contract defined by the fork:
 
 * ``_external_actuation(env, action) -> None``: fully advances physics.
 * ``_external_reset_hand(env, steps) -> None``: must set ``env.init_tcp``.
+* ``_external_gripper_open(env) -> float``: normalized physical aperture.
 
 ``SawyerArm`` leaves both hooks unset so the default mocap path runs.
 ``YamArm`` installs full DLS-IK actuation.
@@ -40,11 +41,11 @@ class ArmConfig:
     """
 
     workspace_low: tuple[float, float, float] | None = None
-    """Fallback Cartesian workspace lower bound ``(x, y, z)`` in metres.
+    """Cartesian workspace lower bound ``(x, y, z)`` in metres.
 
-    YAM prefers the attached Meta-World environment's ``mocap_low`` bound;
-    this value is used only when the environment exposes no bound.
-    ``None`` together with ``workspace_high=None`` leaves it unbounded.
+    Explicit arm bounds override Meta-World's Sawyer-specific mocap bounds.
+    ``None`` together with ``workspace_high=None`` uses the environment bound,
+    or leaves the workspace unbounded when the environment exposes none.
     """
 
     workspace_high: tuple[float, float, float] | None = None
@@ -118,6 +119,8 @@ class Arm(Protocol):
     def actuate(self, env: Any, action: Any) -> None: ...
 
     def reset_hand(self, env: Any, steps: int) -> None: ...
+
+    def gripper_open(self, env: Any) -> float: ...
 
 
 def make_arm(name: str, cfg: ArmConfig | None = None) -> Arm:

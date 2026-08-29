@@ -4,9 +4,10 @@
 # max_ee_speed_m_s: maximum Cartesian speed per axis at action magnitude 1
 # max_lag_m:       per-axis anti-windup leash between retained target and TCP;
 #                  0.035 m preserves the former 0.35 m/s * 0.10 s servo lead
-# workspace_low/high: fallback XYZ workspace bounds [m]; Meta-World's
-#                  mocap_low/high are preferred for Sawyer parity, and null
-#                  leaves the workspace unbounded when env bounds are absent
+# workspace_low/high: grasp-site XYZ workspace bounds [m]. These explicit
+#                  YAM bounds override Sawyer's mocap-body bounds; in
+#                  particular the lower Z permits the pads to reach objects
+#                  resting at z=0.02.
 # damping:         DLS regularisation λ on the length-scaled task Jacobian;
 #                  bounds ‖dq‖ near true kinematic degeneracies
 # nullspace_gain:  strength of home-pose pull in the arm's nullspace
@@ -23,8 +24,8 @@
 name: yam
 max_ee_speed_m_s: 0.35
 max_lag_m: 0.035
-workspace_low: null
-workspace_high: null
+workspace_low: [-0.5, 0.4, 0.01]
+workspace_high: [0.5, 1.0, 0.5]
 damping: 0.10
 nullspace_gain: 1.0
 ori_gain: 1.0
