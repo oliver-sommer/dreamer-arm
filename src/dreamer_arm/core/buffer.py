@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 from tensordict import TensorDict
@@ -41,6 +42,88 @@ class BufferConfig:
     storage_device: str = "cpu"
     episode_key: str = "episode"
     prefetch: int = 0
+    task_balanced: bool = False
+
+
+class _TaskBalancedSliceSampler(SliceSampler):
+    """Choose trajectory slices evenly across stored one-hot task ids."""
+
+    def __init__(self, *args: Any, task_balanced: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.task_balanced = bool(task_balanced)
+        self._task_cursor = 0
+
+    def _sample_slices(
+        self,
+        lengths: torch.Tensor,
+        start_idx: torch.Tensor,
+        stop_idx: torch.Tensor,
+        seq_length: int,
+        num_slices: int,
+        storage_length: int,
+        traj_idx: torch.Tensor | None = None,
+        *,
+        storage: Any,
+    ) -> tuple[tuple[torch.Tensor, ...], dict[str, Any]]:
+        args = (lengths, start_idx, stop_idx, seq_length, num_slices, storage_length)
+        if not self.task_balanced or traj_idx is not None:
+            return super()._sample_slices(*args, traj_idx, storage=storage)
+
+        eligible = lengths >= seq_length
+        if not eligible.any():
+            return super()._sample_slices(*args, storage=storage)
+        lengths = lengths[eligible]
+        start_idx = start_idx[eligible]
+        stop_idx = stop_idx[eligible]
+
+        try:
+            task_id = storage[start_idx[:, 0], start_idx[:, 1]]["task_id"]
+        except (IndexError, KeyError):
+            return super()._sample_slices(
+                lengths, start_idx, stop_idx, seq_length, num_slices, storage_length, storage=storage
+            )
+        if task_id.ndim < 2 or task_id.shape[-1] <= 1:
+            return super()._sample_slices(
+                lengths, start_idx, stop_idx, seq_length, num_slices, storage_length, storage=storage
+            )
+
+        trajectory_task = task_id.argmax(dim=-1)
+        present_tasks = torch.unique(trajectory_task, sorted=True)
+        if present_tasks.numel() <= 1:
+            return super()._sample_slices(
+                lengths, start_idx, stop_idx, seq_length, num_slices, storage_length, storage=storage
+            )
+
+        task_count = int(present_tasks.numel())
+        offsets = (torch.arange(num_slices, device=present_tasks.device) + self._task_cursor) % task_count
+        target_tasks = present_tasks[offsets]
+        self._task_cursor = (self._task_cursor + num_slices) % task_count
+
+        selected: list[torch.Tensor] = []
+        for task in target_tasks.unbind():
+            candidates = torch.nonzero(trajectory_task == task, as_tuple=False).squeeze(-1)
+            choice = torch.randint(candidates.numel(), (), device=candidates.device, generator=self._rng)
+            selected.append(candidates[choice])
+        balanced_traj = torch.stack(selected)
+        return super()._sample_slices(
+            lengths,
+            start_idx,
+            stop_idx,
+            seq_length,
+            num_slices,
+            storage_length,
+            balanced_traj,
+            storage=storage,
+        )
+
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        state["task_cursor"] = self._task_cursor
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        super().load_state_dict(state_dict)
+        self._task_cursor = int(state_dict.get("task_cursor", 0))
 
 
 class ReplayBuffer:
@@ -65,12 +148,13 @@ class ReplayBuffer:
                 device=self.storage_device,
                 ndim=2,
             ),
-            sampler=SliceSampler(
+            sampler=_TaskBalancedSliceSampler(
                 num_slices=self.batch_size,
                 end_key=None,
                 traj_key=self._episode_key,
                 truncated_key=None,
                 strict_length=True,
+                task_balanced=config.task_balanced,
             ),
             # >0 samples the next batch(es) on a background thread while the
             # current update runs, so sample()'s gather + pin_memory() + H2D

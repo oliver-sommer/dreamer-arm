@@ -100,6 +100,22 @@ def _run_smoke(agent: Dreamer, batch_length: int, task_count: int = 0) -> None:
         state = next_state
         cache_zeros = {k: torch.zeros_like(state[k]) for k in agent.replay_cache_keys}
 
+    actor_before = [parameter.detach().clone() for parameter in agent.ac.parameters()]
+    wm_before = [parameter.detach().clone() for parameter in agent.wm_modules.parameters() if parameter.requires_grad]
+    wm_mets = agent.update_world_model(buffer)
+    assert all(torch.isfinite(torch.as_tensor(value)).all() for value in wm_mets.values())
+    assert all(torch.equal(before, after) for before, after in zip(actor_before, agent.ac.parameters(), strict=True)), (
+        "world-model burn-in changed actor-critic parameters"
+    )
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(
+            wm_before,
+            (parameter for parameter in agent.wm_modules.parameters() if parameter.requires_grad),
+            strict=True,
+        )
+    ), "world-model burn-in did not update world-model parameters"
+
     for _ in range(2):
         mets = agent.update(buffer)
         for v in mets.values():

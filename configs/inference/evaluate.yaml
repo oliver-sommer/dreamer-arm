@@ -19,7 +19,7 @@ entrypoint:
   _target_: dreamer_arm.inference.evaluate._run
 
 # Checkpoint to evaluate (mandatory).  Any of a run's checkpoints works:
-# best.pt (highest eval/success_mean), latest.pt, or checkpoints/step_<N>.pt.
+# best.pt (highest eval_robust/success_mean), latest.pt, or checkpoints/step_<N>.pt.
 checkpoint: ???
 
 seed: 0

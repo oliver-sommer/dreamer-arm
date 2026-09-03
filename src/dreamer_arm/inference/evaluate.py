@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 
 #: Fixed seed for evaluation resets, so eval is deterministic across checkpoints.
 EVAL_SEED = 12345
+EVAL_SEEDS = (12345, 23456, 34567, 45678, 56789)
 ACTION_TRACE_STEPS = 20
 _ACTION_LABELS = ("x", "y", "z", "gripper")
 
@@ -56,7 +57,14 @@ class EvalResult:
     action_trace: ActionTrace | None = None
 
 
-def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
+def evaluate(
+    agent: Any,
+    envs: Any,
+    episodes: int,
+    *,
+    seeds: tuple[int, ...] | None = None,
+    capture_artifacts: bool = True,
+) -> EvalResult:
     """Run at least ``episodes`` evaluation episodes and summarise them.
 
     Episodes are collected in parallel across the vector env, so the effective
@@ -69,6 +77,11 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     device = agent.device
     obs_keys = sorted(envs.observation_space.spaces.keys())
     num_rounds = max(1, math.ceil(episodes / n))
+    eval_seeds = seeds or tuple(
+        EVAL_SEEDS[index] if index < len(EVAL_SEEDS) else EVAL_SEED + 1009 * index for index in range(num_rounds)
+    )
+    if len(eval_seeds) < num_rounds:
+        raise ValueError(f"evaluation needs {num_rounds} seeds, got {len(eval_seeds)}")
 
     task_success: dict[str, list[float]] = {}
     task_returns: dict[str, list[float]] = {}
@@ -77,7 +90,7 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     ctrl_diags_by_task: dict[str, dict[str, list[float]]] = {}
     reward_diags: dict[str, list[float]] = {}
 
-    obs_np = envs.reset(seed=EVAL_SEED)
+    obs_np = envs.reset(seed=eval_seeds[0])
     state = agent.get_initial_state(n)
     is_first = np.ones(n, dtype=bool)
     completed = np.zeros(n, dtype=np.int32)  # episodes done per env slot
@@ -114,9 +127,10 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
 
     video_frames: list[np.ndarray] = []
     video_done = False
+    seeded_round = 0
 
     while completed.min() < num_rounds:
-        if not video_done and "scene" in obs_np:
+        if capture_artifacts and not video_done and "scene" in obs_np:
             video_frames.append(obs_np["scene"][0])
 
         obs_torch: dict[str, torch.Tensor] = {
@@ -190,7 +204,7 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
                     slot_proprio_sensitivity[i].append(float(proprio_sensitivity_arr[i]))
                 if visual_sensitivity_arr is not None:
                     slot_visual_sensitivity[i].append(float(visual_sensitivity_arr[i]))
-            if completed[i] == 0 and episode_steps[i] < ACTION_TRACE_STEPS:
+            if capture_artifacts and completed[i] == 0 and episode_steps[i] < ACTION_TRACE_STEPS:
                 slot_actions[i].append(action_np[i].copy())
                 if pre_mean_arr is not None:
                     slot_pre_means[i].append(pre_mean_arr[i].copy())
@@ -243,7 +257,16 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
             done_t = torch.from_numpy(done).to(device)
             state["prev_action"][done_t] = 0.0
 
-        obs_np = obs_next_np
+        completed_round = int(completed.min())
+        if completed_round > seeded_round and completed_round < num_rounds:
+            seeded_round = completed_round
+            obs_np = envs.reset(seed=eval_seeds[seeded_round])
+            state = agent.get_initial_state(n)
+            is_first = np.ones(n, dtype=bool)
+            episode_returns[:] = 0.0
+            episode_steps[:] = 0
+        else:
+            obs_np = obs_next_np
 
     metrics: dict[str, float] = {}
     all_successes: list[float] = []
@@ -271,6 +294,8 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
 
     if all_actions:
         actions = np.concatenate(all_actions, axis=0)
+        xyz = actions[:, : min(3, actions.shape[-1])]
+        metrics["eval/action_xyz_near_bound_fraction"] = float(np.mean(np.abs(xyz) >= 0.95))
         for index in range(actions.shape[-1]):
             label = _ACTION_LABELS[index] if index < len(_ACTION_LABELS) else str(index)
             component = actions[:, index]
@@ -297,6 +322,9 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     if all_constraint_probability:
         constraint_probability_values = np.concatenate(all_constraint_probability, axis=0)
         constraint_target_values = np.concatenate(all_constraint_target, axis=0)
+        metrics["eval/pred_constraint_brier"] = float(
+            np.mean((constraint_probability_values - constraint_target_values) ** 2)
+        )
         for index, label in enumerate(("workspace", "lag", "joint_limit")):
             probability = constraint_probability_values[:, index]
             target = constraint_target_values[:, index] >= 0.5
@@ -392,7 +420,7 @@ def evaluate(agent: Any, envs: Any, episodes: int) -> EvalResult:
     for diag_name, diag_vals in reward_diags.items():
         metrics[f"eval/reward_{diag_name}"] = float(np.mean(diag_vals))
 
-    action_trace = ActionTrace(columns=trace_columns, rows=trace_rows) if trace_rows else None
+    action_trace = ActionTrace(columns=trace_columns, rows=trace_rows) if capture_artifacts and trace_rows else None
     return EvalResult(
         metrics=metrics,
         video=np.stack(video_frames) if video_frames else None,

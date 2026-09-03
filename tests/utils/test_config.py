@@ -189,7 +189,14 @@ def test_bare_train_defaults_to_mt10() -> None:
     cfg = _compose("training/dreamer", [])
     assert cfg.envs.sim.task == "MT10"
     assert cfg.core.model.wm == "dinowm"
+    assert cfg.core.model.lr == pytest.approx(4e-5)
+    assert cfg.core.model.act_entropy == pytest.approx(1e-3)
+    assert cfg.core.model.imag_starts == 80
     assert list(cfg.envs.sim.size) == [128, 128]
+    assert cfg.trainer.prefill == 10000
+    assert cfg.trainer.pretrain == 500
+    assert cfg.trainer.robust_eval_every == 100000
+    assert cfg.trainer.robust_eval_episode_num == 50
     validate_config(cfg)
 
 
@@ -205,7 +212,7 @@ def test_default_policy_rate_preserves_metaworld_horizon() -> None:
 
 def test_default_eval_warmup_schedule() -> None:
     cfg = _compose("training/dreamer", [])
-    assert list(cfg.trainer.eval_warmup_steps) == [2500, 5000, 10000, 15000]
+    assert list(cfg.trainer.eval_warmup_steps) == [12500, 15000, 20000]
 
 
 def test_dinowm_disables_monolithic_inductor_compile() -> None:
@@ -229,6 +236,9 @@ def test_single_task_group_requires_a_task() -> None:
         ("envs.sim.action_repeat=0", "envs.sim.action_repeat must be positive"),
         ("core.buffer.max_size=10", "buffer.max_size"),
         ("trainer.replay_ratio=-1", "trainer.replay_ratio must be non-negative"),
+        ("trainer.prefill=-1", "trainer.prefill and trainer.pretrain must be non-negative"),
+        ("trainer.pretrain=-1", "trainer.prefill and trainer.pretrain must be non-negative"),
+        ("trainer.robust_eval_every=0", "robust_eval_every"),
         ("trainer.eval_warmup_steps=[0,1000]", "eval_warmup_steps"),
         ("logging.wandb.mode=sometimes", "Unsupported logging.wandb.mode"),
     ],

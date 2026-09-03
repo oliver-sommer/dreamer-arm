@@ -23,3 +23,7 @@ storage_device: cpu
 # it, instead of blocking the update loop on the gather + H2D copy every step.
 # 0 disables prefetching (fully synchronous sample()).
 prefetch: 2
+
+# Equalise sampled trajectories across one-hot task ids. This is a no-op for
+# single-task buffers and rotates subsets when task_count exceeds batch_size.
+task_balanced: true

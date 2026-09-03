@@ -16,6 +16,7 @@ from dreamer_arm.core.frozen import freeze_clone
 from dreamer_arm.inference.evaluate import (
     ACTION_TRACE_STEPS,
     EVAL_SEED,
+    EVAL_SEEDS,
     EvalResult,
     _actor_parameter_metrics,
     evaluate,
@@ -77,6 +78,23 @@ def test_evaluate_uses_a_fixed_seed() -> None:
     envs = _SeedRecordingEnv(num_envs=2, done_every=3)
     evaluate(_MockAgent(num_envs=2), envs, episodes=2)
     assert envs.reset_seeds == [EVAL_SEED]
+
+
+def test_evaluate_uses_one_fixed_seed_per_round() -> None:
+    envs = _SeedRecordingEnv(num_envs=2, done_every=3)
+    evaluate(_MockAgent(num_envs=2), envs, episodes=6)
+    assert envs.reset_seeds == list(EVAL_SEEDS[:3])
+
+
+def test_evaluate_can_skip_heavy_artifacts() -> None:
+    result = evaluate(
+        _MockAgent(num_envs=2),
+        _MockVectorEnv(num_envs=2, done_every=3),
+        episodes=2,
+        capture_artifacts=False,
+    )
+    assert result.video is None
+    assert result.action_trace is None
 
 
 def test_evaluate_rounds_up_to_whole_rounds() -> None:
@@ -193,8 +211,8 @@ def test_evaluate_reports_no_video_without_scene_frames() -> None:
     assert result.video.ndim == 4  # (T, H, W, C)
 
 
-def test_trainer_forwards_eval_metrics_to_the_logger() -> None:
-    """The in-loop eval path must log exactly what evaluate() returns."""
+def test_trainer_logs_compact_eval_metrics_and_artifacts() -> None:
+    """The in-loop path keeps outcomes and artifacts without scalar fan-out."""
     envs = _MockVectorEnv(num_envs=2, done_every=3)
     logger = _MockLogger()
     trainer = OnlineTrainer(
@@ -209,5 +227,49 @@ def test_trainer_forwards_eval_metrics_to_the_logger() -> None:
     logged = dict(logger.recorded)
     assert logged["eval/success_mean"] == 0.0
     assert logged["eval/success/mock"] == 0.0
+    assert "eval/actor_param_checksum" not in logged
+    assert not any(name.startswith("eval/action_x_mean/") for name in logged)
     assert logger.videos == ["eval/video"]
     assert logger.tables == ["eval/action_trace"]
+
+
+def test_robust_eval_uses_separate_namespace_without_artifacts() -> None:
+    envs = _MockVectorEnv(num_envs=2, done_every=3)
+    logger = _MockLogger()
+    trainer = OnlineTrainer(
+        _make_trainer_cfg(robust_eval_episode_num=4),
+        _MockBuffer(),
+        logger,
+        envs,
+        envs,
+    )
+
+    trainer._run_eval(_MockAgent(num_envs=2), env_step=100, robust=True)
+
+    logged = dict(logger.recorded)
+    assert logged["eval_robust/success_mean"] == 0.0
+    assert logged["eval_robust/success/mock"] == 0.0
+    assert not any(name.startswith("eval/success") for name in logged)
+    assert logger.videos == []
+    assert logger.tables == []
+
+
+def test_coincident_fast_and_robust_eval_flush_once() -> None:
+    envs = _MockVectorEnv(num_envs=2, done_every=3)
+    logger = _MockLogger()
+    trainer = OnlineTrainer(
+        _make_trainer_cfg(eval_episode_num=2, robust_eval_episode_num=4),
+        _MockBuffer(),
+        logger,
+        envs,
+        envs,
+    )
+    agent = _MockAgent(num_envs=2)
+
+    trainer._run_eval(agent, env_step=100, flush=False)
+    trainer._run_eval(agent, env_step=100, robust=True)
+
+    logged = dict(logger.recorded)
+    assert "eval/success_mean" in logged
+    assert "eval_robust/success_mean" in logged
+    assert logger.write_steps == [100]

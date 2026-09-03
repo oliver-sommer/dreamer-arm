@@ -57,7 +57,7 @@ class CheckpointManager:
     ) -> None:
         path = self._root / "best.pt"
         self._write(self.payload(agent, env_step, trainer_state), path)
-        log.info("new best eval/success_mean %.4f at step %d → %s", success, env_step, path)
+        log.info("new best eval_robust/success_mean %.4f at step %d → %s", success, env_step, path)
 
     @staticmethod
     def _write(payload: dict[str, Any], path: Path) -> None:

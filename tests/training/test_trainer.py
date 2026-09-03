@@ -22,6 +22,7 @@ from dreamer_arm.training.trainer import OnlineTrainer, TrainerConfig
 def _make_trainer_cfg(**overrides: Any) -> TrainerConfig:
     defaults: dict[str, Any] = dict(  # noqa: C408
         steps=10,
+        prefill=0,
         pretrain=0,
         replay_ratio=0.0,  # no replay updates by default in unit tests
         batch_size=2,
@@ -29,6 +30,8 @@ def _make_trainer_cfg(**overrides: Any) -> TrainerConfig:
         action_repeat=1,
         eval_every=9999,
         eval_episode_num=0,  # disable eval
+        robust_eval_every=9999,
+        robust_eval_episode_num=0,
         update_log_every=9999,
         checkpoint_every=9999,
         # Writable but shared: tests that assert on checkpoint contents pass
@@ -158,6 +161,9 @@ class _MockAgent:
     def update(self, buffer: Any) -> dict[str, torch.Tensor]:
         return {"loss/dyn": torch.tensor(0.5)}
 
+    def update_world_model(self, buffer: Any) -> dict[str, torch.Tensor]:
+        return {"loss/dyn": torch.tensor(0.5)}
+
     def checkpoint_state(self) -> dict[str, Any]:
         return {"dummy": "state"}
 
@@ -177,6 +183,7 @@ class _MockLogger:
         self.recorded: list[tuple[str, float]] = []
         self.videos: list[str] = []
         self.tables: list[str] = []
+        self.write_steps: list[int] = []
 
     def scalar(self, name: str, value: Any) -> None:
         self.recorded.append((name, float(value)))
@@ -192,7 +199,7 @@ class _MockLogger:
         self.tables.append(name)
 
     def write(self, step: int, fps: bool = False) -> None:
-        pass
+        self.write_steps.append(step)
 
     def keepalive(self, step: int) -> None:
         pass
@@ -286,7 +293,7 @@ def test_episode_score_logged() -> None:
     assert len(score_logs) >= 1, "Expected at least one episode/score log"
 
 
-def test_episode_reward_components_logged() -> None:
+def test_episode_reward_components_are_not_wandb_scalars() -> None:
     class _RewardDiagnosticEnv(_MockVectorEnv):
         def step(self, actions):
             obs, rewards, terms, truncs, info = super().step(actions)
@@ -300,11 +307,11 @@ def test_episode_reward_components_logged() -> None:
     trainer = OnlineTrainer(_make_trainer_cfg(steps=4), _MockBuffer(), logger, envs, eval_envs=None)
     trainer.begin(_MockAgent())
 
-    assert ("episode/reward_grasp_reward", 0.25) in logger.recorded
+    assert not any(name.startswith("episode/reward_") for name, _ in logger.recorded)
 
 
-def test_synchronized_episode_logs_are_averaged_and_split_by_task() -> None:
-    """MT episode metrics must not silently retain only the final env slot."""
+def test_synchronized_episode_logs_are_compact_aggregate_means() -> None:
+    """MT episode metrics describe the vector mean without per-task fan-out."""
 
     class _TwoTaskEnv(_MockVectorEnv):
         def step(self, actions):
@@ -314,13 +321,13 @@ def test_synchronized_episode_logs_are_averaged_and_split_by_task() -> None:
                 {
                     "task_name": "task-a",
                     "success": False,
-                    "ctrl_diag": {"frac_stuck": 0.2},
+                    "ctrl_diag": {"frac_undertracking": 0.2},
                     "reward_diag": {"grasp_success": 0.0},
                 },
                 {
                     "task_name": "task-b",
                     "success": True,
-                    "ctrl_diag": {"frac_stuck": 0.8},
+                    "ctrl_diag": {"frac_undertracking": 0.8},
                     "reward_diag": {"grasp_success": 1.0},
                 },
             ]
@@ -333,13 +340,10 @@ def test_synchronized_episode_logs_are_averaged_and_split_by_task() -> None:
     logged = dict(logger.recorded)
 
     assert logged["episode/score"] == pytest.approx(2.0)
-    assert logged["episode/score/task_a"] == pytest.approx(1.0)
-    assert logged["episode/score/task_b"] == pytest.approx(3.0)
     assert logged["episode/success"] == pytest.approx(0.5)
-    assert logged["episode/success/task_a"] == pytest.approx(0.0)
-    assert logged["episode/success/task_b"] == pytest.approx(1.0)
-    assert logged["episode/ctrl_frac_stuck"] == pytest.approx(0.5)
-    assert logged["episode/reward_grasp_success"] == pytest.approx(0.5)
+    assert logged["episode/ctrl_frac_undertracking"] == pytest.approx(0.5)
+    assert not any(name.startswith("episode/score/") for name in logged)
+    assert not any(name.startswith("episode/reward_") for name in logged)
 
 
 def test_checkpoint_round_trip(tmp_path: Path) -> None:
@@ -403,7 +407,7 @@ def test_no_updates_during_prefill() -> None:
     update_calls: list[int] = []
 
     class _CountingAgent(_MockAgent):
-        def update(self, buffer: Any) -> dict[str, torch.Tensor]:
+        def update_world_model(self, buffer: Any) -> dict[str, torch.Tensor]:
             update_calls.append(1)
             return {}
 
@@ -526,7 +530,7 @@ def test_heartbeat_disabled_by_zero(caplog: Any) -> None:
 
 
 def test_pretrain_runs_once_after_prefill() -> None:
-    """`pretrain` warms the model on the collected prefill.
+    """`pretrain` warms only the world model on the collected prefill.
 
     It used to run before any collection, where its own buffer-size guard was
     always false -- so the knob silently did nothing.
@@ -535,7 +539,7 @@ def test_pretrain_runs_once_after_prefill() -> None:
     update_calls: list[int] = []
 
     class _CountingAgent(_MockAgent):
-        def update(self, buffer: Any) -> dict[str, torch.Tensor]:
+        def update_world_model(self, buffer: Any) -> dict[str, torch.Tensor]:
             update_calls.append(1)
             return {}
 
@@ -627,21 +631,33 @@ class _ScriptedSuccessEnv(_MockVectorEnv):
 
 def test_best_checkpoint_written_on_improvement_only(tmp_path: Path) -> None:
     envs = _ScriptedSuccessEnv(num_envs=2, done_every=3)
-    cfg = _make_trainer_cfg(eval_episode_num=2, checkpoint_dir=str(tmp_path))
+    cfg = _make_trainer_cfg(robust_eval_episode_num=2, checkpoint_dir=str(tmp_path))
     trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
     agent = _MockAgent(num_envs=2)
 
     envs.success = True
-    trainer._run_eval(agent, env_step=100)
+    trainer._run_eval(agent, env_step=100, robust=True)
     assert (tmp_path / "best.pt").exists()
     first_mtime = (tmp_path / "best.pt").stat().st_mtime_ns
     assert trainer._best_success == 1.0
 
     # A worse eval must not overwrite best.pt.
     envs.success = False
-    trainer._run_eval(agent, env_step=200)
+    trainer._run_eval(agent, env_step=200, robust=True)
     assert trainer._best_success == 1.0
     assert (tmp_path / "best.pt").stat().st_mtime_ns == first_mtime
+
+
+def test_fast_eval_does_not_promote_best_checkpoint(tmp_path: Path) -> None:
+    envs = _ScriptedSuccessEnv(num_envs=2, done_every=3)
+    cfg = _make_trainer_cfg(eval_episode_num=2, checkpoint_dir=str(tmp_path))
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
+    envs.success = True
+
+    trainer._run_eval(_MockAgent(num_envs=2), env_step=100)
+
+    assert not (tmp_path / "best.pt").exists()
+    assert trainer._best_success == -math.inf
 
 
 def test_best_checkpoint_survives_missing_success_key(monkeypatch: Any, tmp_path: Path) -> None:
@@ -681,13 +697,14 @@ def test_trainer_state_round_trips_through_resume(tmp_path: Path) -> None:
 
     cfg = _make_trainer_cfg(steps=20, checkpoint_every=20, checkpoint_dir=str(tmp_path))
     trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, eval_envs=None)
-    trainer._best_success = 0.75  # simulate an eval having already run
+    trainer._best_success = 0.75  # simulate a robust eval in the first run
     trainer.begin(agent)
 
     ckpt = torch.load(tmp_path / "latest.pt", map_location="cpu", weights_only=False)
     saved_next_id = ckpt["trainer"]["next_ep_id"]
     assert saved_next_id > N  # episodes actually turned over during the run
     assert ckpt["trainer"]["best_success"] == 0.75
+    assert ckpt["trainer"]["best_metric"] == "eval_robust/success_mean"
 
     # A fresh trainer (new process, in effect) resuming with that state must
     # not reissue any id the first run already used.
@@ -695,6 +712,41 @@ def test_trainer_state_round_trips_through_resume(tmp_path: Path) -> None:
     resumed.begin(agent, start_step=20, trainer_state=ckpt["trainer"])
     assert resumed._next_ep_id >= saved_next_id
     assert resumed._best_success == 0.75
+
+
+def test_legacy_fast_best_is_not_reused_as_robust_best() -> None:
+    envs = _MockVectorEnv(num_envs=2, done_every=99)
+    cfg = _make_trainer_cfg(steps=2)
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, eval_envs=None)
+
+    trainer.begin(
+        _MockAgent(),
+        start_step=2,
+        trainer_state={"best_success": 0.9, "next_ep_id": 2},
+    )
+
+    assert trainer._best_success == -math.inf
+
+
+def test_completed_wm_pretrain_is_not_repeated_after_resume() -> None:
+    calls = 0
+
+    class _CountingAgent(_MockAgent):
+        def update_world_model(self, buffer: Any) -> dict[str, torch.Tensor]:
+            nonlocal calls
+            calls += 1
+            return {}
+
+    envs = _MockVectorEnv(num_envs=2, done_every=99)
+    cfg = _make_trainer_cfg(steps=8, pretrain=5)
+    trainer = OnlineTrainer(cfg, _FilledBuffer(), _MockLogger(), envs, eval_envs=None)
+    trainer.begin(
+        _CountingAgent(),
+        start_step=2,
+        trainer_state={"wm_pretrain_complete": True},
+    )
+
+    assert calls == 0
 
 
 def test_eval_at_start_runs_before_any_collection(monkeypatch: Any) -> None:
@@ -705,7 +757,7 @@ def test_eval_at_start_runs_before_any_collection(monkeypatch: Any) -> None:
 
     call_order: list[str] = []
 
-    def fake_evaluate(agent: Any, envs: Any, episodes: int) -> Any:
+    def fake_evaluate(agent: Any, envs: Any, episodes: int, **kwargs: Any) -> Any:
         call_order.append("eval")
         return EvalResult(metrics={"eval/success_mean": 0.0}, video=None)
 
@@ -740,7 +792,7 @@ def test_eval_at_start_false_waits_for_normal_cadence(monkeypatch: Any) -> None:
 
     eval_calls = 0
 
-    def fake_evaluate(agent: Any, envs: Any, episodes: int) -> Any:
+    def fake_evaluate(agent: Any, envs: Any, episodes: int, **kwargs: Any) -> Any:
         nonlocal eval_calls
         eval_calls += 1
         return EvalResult(metrics={"eval/success_mean": 0.0}, video=None)
@@ -776,7 +828,11 @@ def test_eval_warmup_steps_do_not_wait_for_episode_boundaries(monkeypatch: Any) 
     )
     trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
     eval_steps: list[int] = []
-    monkeypatch.setattr(trainer, "_run_eval", lambda _agent, env_step: eval_steps.append(env_step))
+    monkeypatch.setattr(
+        trainer,
+        "_run_eval",
+        lambda _agent, env_step, *, robust=False, **kwargs: eval_steps.append(env_step),
+    )
 
     trainer.begin(agent)
 
@@ -798,7 +854,11 @@ def test_eval_warmup_steps_before_resume_are_not_replayed(monkeypatch: Any) -> N
     )
     trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
     eval_steps: list[int] = []
-    monkeypatch.setattr(trainer, "_run_eval", lambda _agent, env_step: eval_steps.append(env_step))
+    monkeypatch.setattr(
+        trainer,
+        "_run_eval",
+        lambda _agent, env_step, *, robust=False, **kwargs: eval_steps.append(env_step),
+    )
 
     trainer.begin(agent, start_step=10)
 
@@ -818,11 +878,38 @@ def test_eval_warmup_and_periodic_trigger_coalesce(monkeypatch: Any) -> None:
     )
     trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
     eval_steps: list[int] = []
-    monkeypatch.setattr(trainer, "_run_eval", lambda _agent, env_step: eval_steps.append(env_step))
+    monkeypatch.setattr(
+        trainer,
+        "_run_eval",
+        lambda _agent, env_step, *, robust=False, **kwargs: eval_steps.append(env_step),
+    )
 
     trainer.begin(agent)
 
     assert eval_steps == [4, 8]
+
+
+def test_fast_and_robust_eval_use_independent_cadences(monkeypatch: Any) -> None:
+    envs = _MockVectorEnv(num_envs=2, done_every=99)
+    cfg = _make_trainer_cfg(
+        steps=12,
+        eval_episode_num=2,
+        eval_every=4,
+        robust_eval_episode_num=10,
+        robust_eval_every=8,
+        eval_at_start=False,
+    )
+    trainer = OnlineTrainer(cfg, _MockBuffer(), _MockLogger(), envs, envs)
+    calls: list[tuple[int, bool]] = []
+    monkeypatch.setattr(
+        trainer,
+        "_run_eval",
+        lambda _agent, env_step, *, robust=False, **kwargs: calls.append((env_step, robust)),
+    )
+
+    trainer.begin(_MockAgent())
+
+    assert calls == [(4, False), (8, False), (8, True)]
 
 
 def test_eval_at_start_is_a_noop_when_eval_disabled(monkeypatch: Any) -> None:

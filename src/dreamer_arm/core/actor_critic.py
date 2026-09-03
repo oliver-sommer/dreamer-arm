@@ -233,7 +233,27 @@ class ActorCritic(nn.Module):
         if self.imag_starts is None:
             return {key: v.reshape(-1, *v.shape[2:]).detach() for key, v in state.items()}
         k = min(self.imag_starts, b * t)
-        flat = torch.randperm(b * t, device=self.device)[:k]
+        task_id = state.get("_return_task_id")
+        if task_id is None or task_id.shape[-1] <= 1:
+            flat = torch.randperm(b * t, device=self.device)[:k]
+        else:
+            flat_task = task_id.reshape(-1, task_id.shape[-1]).argmax(dim=-1)
+            present_tasks = torch.unique(flat_task, sorted=True)
+            task_count = int(present_tasks.numel())
+            per_task, remainder = divmod(k, task_count)
+            selected: list[torch.Tensor] = []
+            for rank, task in enumerate(present_tasks.unbind()):
+                candidates = torch.nonzero(flat_task == task, as_tuple=False).squeeze(-1)
+                count = per_task + int(rank < remainder)
+                if candidates.numel() < count:
+                    raise RuntimeError(
+                        f"task-balanced imagination needs {count} states for task {int(task)}, "
+                        f"but replay supplied {candidates.numel()}"
+                    )
+                order = torch.randperm(candidates.numel(), device=self.device)[:count]
+                selected.append(candidates[order])
+            flat = torch.cat(selected)
+            flat = flat[torch.randperm(flat.numel(), device=self.device)]
         rows, cols = flat // t, flat % t
         return {key: v[rows, cols].detach() for key, v in state.items()}
 
@@ -399,6 +419,9 @@ class ActorCritic(nn.Module):
         metrics["slowval"] = imag_slow_value.mean()
         metrics["weight"] = weight.mean()
         metrics["action_entropy"] = entropy.mean()
+        if not self.act_discrete:
+            xyz = imag_action[..., : min(3, imag_action.shape[-1])]
+            metrics["action_xyz_near_bound_fraction"] = (xyz.abs() >= 0.95).float().mean()
         metrics.update(tensorstats(imag_action, "action"))
         if not self.act_discrete:
             # The aggregate action_mean mixes XYZ motion with the gripper and

@@ -132,10 +132,14 @@ def validate_config(cfg: DictConfig) -> None:
 
     trainer = cfg.get("trainer")
     if trainer is not None:
+        if int(trainer.get("prefill", 0)) < 0 or int(trainer.pretrain) < 0:
+            raise ValueError("trainer.prefill and trainer.pretrain must be non-negative")
         if float(trainer.replay_ratio) < 0:
             raise ValueError("trainer.replay_ratio must be non-negative")
         if int(trainer.eval_episode_num) > 0 and int(trainer.eval_every) <= 0:
             raise ValueError("trainer.eval_every must be positive when eval is enabled")
+        if int(trainer.get("robust_eval_episode_num", 0)) > 0 and int(trainer.robust_eval_every) <= 0:
+            raise ValueError("trainer.robust_eval_every must be positive when robust eval is enabled")
         warmup_steps = [int(step) for step in trainer.get("eval_warmup_steps", [])]
         if any(step <= 0 for step in warmup_steps):
             raise ValueError("trainer.eval_warmup_steps must contain only positive steps")

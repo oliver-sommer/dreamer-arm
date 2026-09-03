@@ -13,11 +13,11 @@ Design notes
   ``batch_size * batch_length`` samples, so update-call credit is
   ``replay_ratio / batch_steps`` per environment step.
 * Eval reuses the train envs (``eval_envs is train_envs``), so no extra EGL
-  contexts are created.  Eval is triggered when the step counter crosses a
-  multiple of ``eval_every`` or a one-shot ``eval_warmup_steps`` milestone,
-  then runs before the next collection step.  A shared-env evaluation resets
-  the interrupted training rollout and allocates fresh episode ids, preventing
-  long synchronized MT episodes from delaying and coalescing early evals.
+  contexts are created. Fast eval follows ``eval_every`` and the early warmup
+  milestones; robust fixed-seed eval follows ``robust_eval_every`` and alone
+  selects ``best.pt``. A shared-env evaluation resets the interrupted training
+  rollout and allocates fresh episode ids, preventing long synchronized MT
+  episodes from delaying and coalescing early evals.
   ``eval_at_start`` additionally seeds this trigger before the loop's first
   iteration, so a run's first eval reads the policy exactly as ``begin``
   received it -- untrained on a fresh run, whatever ``resume`` restored on a
@@ -45,6 +45,7 @@ from tensordict import TensorDict
 
 from dreamer_arm.inference.evaluate import evaluate
 from dreamer_arm.training.checkpoint import CheckpointManager
+from dreamer_arm.training.metrics import compact_eval_metrics, compact_train_metrics
 from dreamer_arm.utils.logging import phase, set_phase
 
 log = logging.getLogger(__name__)
@@ -55,13 +56,16 @@ class TrainerConfig:
     """Hyperparameters for the online training loop."""
 
     steps: int  # total environment steps to train for
-    pretrain: int  # extra agent.update calls once the prefill is collected
+    prefill: int  # transitions to collect before the first update
+    pretrain: int  # world-model-only updates once the prefill is collected
     replay_ratio: float  # replayed transition samples per new env transition
     batch_size: int  # stored here for documentation / config round-trip
     batch_length: int  # stored here for documentation / config round-trip
     action_repeat: int  # inner steps per outer step (owned by SyncVectorEnv)
     eval_every: int  # eval after this many env steps
     eval_episode_num: int  # episodes to collect during each eval pass
+    robust_eval_every: int  # robust eval after this many env steps
+    robust_eval_episode_num: int  # episodes to collect during robust eval
     update_log_every: int  # write logger scalars every N env steps
     checkpoint_every: int  # refresh latest.pt every N env steps
     checkpoint_dir: str  # directory holding latest.pt / best.pt / checkpoints/
@@ -95,6 +99,7 @@ class OnlineTrainer:
         # carried in the checkpoint: see begin() and _save_checkpoint().
         self._best_success = -math.inf
         self._next_ep_id = 0
+        self._wm_pretrain_complete = False
 
     def begin(self, agent: Any, start_step: int = 0, trainer_state: Mapping[str, Any] | None = None) -> None:
         """Run or resume training, including the checkpointed episode-id and best-score state."""
@@ -104,7 +109,11 @@ class OnlineTrainer:
             # Restarting them at N would make SliceSampler treat old and new
             # transitions as one trajectory and splice across the join.
             self._next_ep_id = int(trainer_state.get("next_ep_id", self._next_ep_id))
-            self._best_success = float(trainer_state.get("best_success", self._best_success))
+            if trainer_state.get("best_metric") == "eval_robust/success_mean":
+                self._best_success = float(trainer_state.get("best_success", self._best_success))
+            self._wm_pretrain_complete = bool(trainer_state.get("wm_pretrain_complete", start_step > 0))
+        elif start_step > 0:
+            self._wm_pretrain_complete = True
         cfg = self._cfg
         N = self._N
         device = agent.device
@@ -139,7 +148,7 @@ class OnlineTrainer:
         batch_steps = cfg.batch_size * cfg.batch_length
         # At least one full training batch, while still guaranteeing every
         # vector slot has a long enough contiguous trajectory to sample.
-        prefill_min = max(cfg.batch_size * (cfg.batch_length + 1), N * (cfg.batch_length + 1))
+        prefill_min = max(cfg.prefill, cfg.batch_size * (cfg.batch_length + 1), N * (cfg.batch_length + 1))
         train_budget = 0.0
 
         env_step = start_step
@@ -150,8 +159,12 @@ class OnlineTrainer:
         # a baseline read on the (possibly untrained) policy.  Gated the same
         # way as the periodic trigger below, so eval_at_start is a no-op
         # when eval is disabled entirely rather than a surprise first pass.
-        eval_pending = bool(cfg.eval_at_start and cfg.eval_episode_num > 0 and self._eval_envs is not None)
+        eval_enabled = cfg.eval_episode_num > 0 and self._eval_envs is not None
+        robust_eval_enabled = cfg.robust_eval_episode_num > 0 and self._eval_envs is not None
+        eval_pending = bool(cfg.eval_at_start and eval_enabled)
+        robust_eval_pending = False
         _last_eval_trigger = (start_step // cfg.eval_every) * cfg.eval_every
+        _last_robust_eval_trigger = (start_step // cfg.robust_eval_every) * cfg.robust_eval_every
         # Normalise here as well as validating the Hydra config because unit
         # tests and library users construct TrainerConfig directly.  bisect
         # semantics are implemented by advancing past every milestone at or
@@ -192,9 +205,13 @@ class OnlineTrainer:
             # milestones: with MT50, a 250-policy-step episode spans 12,500
             # global steps. The episode-id seam and is_first below make the
             # interrupted fragment safe for trajectory sampling.
-            if eval_pending:
-                self._run_eval(agent, env_step)
+            if eval_pending or robust_eval_pending:
+                if eval_pending:
+                    self._run_eval(agent, env_step, robust=False, flush=not robust_eval_pending)
+                if robust_eval_pending:
+                    self._run_eval(agent, env_step, robust=True)
                 eval_pending = False
+                robust_eval_pending = False
                 if self._eval_envs is self._train_envs:
                     # Evaluation reset the shared envs. Start new training
                     # trajectories rather than splicing them onto the fragments
@@ -288,12 +305,13 @@ class OnlineTrainer:
                 if not _training_started:
                     log.info("prefill complete at step %d; training updates started", env_step)
                     _training_started = True
-                    # Warm the model on the prefill before collection continues
-                    # at the online replay ratio.
-                    for _ in range(cfg.pretrain):
-                        agent.update(self._buffer)
-                        updates += 1
-                        self._heartbeat(env_step, updates, prefill_min)
+                    if not self._wm_pretrain_complete:
+                        log.info("running %d world-model-only pretrain updates", cfg.pretrain)
+                        for _ in range(cfg.pretrain):
+                            agent.update_world_model(self._buffer)
+                            updates += 1
+                            self._heartbeat(env_step, updates, prefill_min)
+                        self._wm_pretrain_complete = True
                 ratio_env_steps += N
                 train_budget += cfg.replay_ratio * N / batch_steps
                 while train_budget >= 1.0:
@@ -307,35 +325,32 @@ class OnlineTrainer:
                     # so an eager sync here would pay a device->host stall
                     # once per update just to discard nearly all of them.
                     # See WandbLogger._flush_pending.
-                    self._logger.scalars(
-                        {(k if k.startswith("train/") else f"train/{k}"): v for k, v in metrics.items()},
-                        defer=True,
-                    )
+                    compact_metrics = compact_train_metrics(metrics)
+                    self._logger.scalars({f"train/{k}": v for k, v in compact_metrics.items()}, defer=True)
                     # Beat between updates too: one update can outlast the interval.
                     self._heartbeat(env_step, updates, prefill_min)
 
             if env_step - _last_log >= cfg.update_log_every:
                 _last_log = (env_step // cfg.update_log_every) * cfg.update_log_every
-                self._logger.scalar("train/replay_ratio_configured", cfg.replay_ratio)
                 if ratio_env_steps:
                     actual_ratio = ratio_updates * batch_steps / ratio_env_steps
                     self._logger.scalar("train/replay_ratio_actual", actual_ratio)
                 self._logger.write(env_step, fps=True)
 
-            if (
-                cfg.eval_episode_num > 0
-                and self._eval_envs is not None
-                and env_step - _last_eval_trigger >= cfg.eval_every
-            ):
+            if eval_enabled and env_step - _last_eval_trigger >= cfg.eval_every:
                 _last_eval_trigger = (env_step // cfg.eval_every) * cfg.eval_every
                 eval_pending = True
+
+            if robust_eval_enabled and env_step - _last_robust_eval_trigger >= cfg.robust_eval_every:
+                _last_robust_eval_trigger = (env_step // cfg.robust_eval_every) * cfg.robust_eval_every
+                robust_eval_pending = True
 
             # One-shot early-training evaluations.  Advance across every
             # crossed milestone so an uneven vector-env step cannot trigger
             # the same one twice.  A bool is intentional: if a warmup and
             # periodic trigger become due before the same safe boundary, one
             # evaluation represents both instead of running identical passes.
-            if cfg.eval_episode_num > 0 and self._eval_envs is not None:
+            if eval_enabled:
                 while _next_warmup < len(_eval_warmup_steps) and env_step >= _eval_warmup_steps[_next_warmup]:
                     eval_pending = True
                     _next_warmup += 1
@@ -359,43 +374,40 @@ class OnlineTrainer:
         episode_returns: np.ndarray,
         episode_lengths: np.ndarray,
     ) -> None:
-        """Log means plus per-task values for every episode ending together.
+        """Log a compact aggregate summary for episodes ending together.
 
         MT10 environments are synchronized, so ten episodes normally finish
         on one vector step. Writing the same scalar name in a loop makes the
-        logger's dict retain only env 9, which previously made training score,
-        success, reward, and controller charts describe one arbitrary task.
+        logger's dict retain only env 9. Per-task success and return live in
+        deterministic evaluation; duplicating every controller/reward field
+        here was the largest source of W&B metric proliferation.
         """
         values: dict[str, list[float]] = defaultdict(list)
-        task_values: dict[tuple[str, str], list[float]] = defaultdict(list)
+        retained_ctrl_diags = {
+            "frac_ws_clamped",
+            "frac_lag_clamped",
+            "frac_joint_limit_clamped",
+            "frac_undertracking",
+        }
 
-        def add(name: str, task: str, value: float) -> None:
+        def add(name: str, value: float) -> None:
             values[name].append(value)
-            task_values[(name, task)].append(value)
 
         for index in np.flatnonzero(done):
             i = int(index)
             fin = final_info[i]
-            task_name = str(fin.get("task_name", f"env_{i}")) if fin is not None else f"env_{i}"
-            safe_task = task_name.replace("-", "_").replace(" ", "_")
-            add("episode/score", safe_task, float(episode_returns[i]))
-            add("episode/length", safe_task, float(episode_lengths[i]))
+            add("episode/score", float(episode_returns[i]))
+            add("episode/length", float(episode_lengths[i]))
             if fin is None:
                 continue
             if "success" in fin:
-                add("episode/success", safe_task, float(fin["success"]))
-            # YamArm episode diagnostics (YAM only): singularity,
-            # orientation fighting, joint-velocity saturation, and the
-            # achieved-vs-commanded TCP ratio (the stuck signal).
+                add("episode/success", float(fin["success"]))
             for key, value in fin.get("ctrl_diag", {}).items():
-                add(f"episode/ctrl_{key}", safe_task, float(value))
-            for key, value in fin.get("reward_diag", {}).items():
-                add(f"episode/reward_{key}", safe_task, float(value))
+                if key in retained_ctrl_diags:
+                    add(f"episode/ctrl_{key}", float(value))
 
         for name, samples in values.items():
             self._logger.scalar(name, float(np.mean(samples)))
-        for (name, task), samples in task_values.items():
-            self._logger.scalar(f"{name}/{task}", float(np.mean(samples)))
 
     def _heartbeat(self, env_step: int, updates: int, prefill_min: int) -> None:
         """Print a console liveness line if ``heartbeat_secs`` has elapsed.
@@ -427,15 +439,26 @@ class OnlineTrainer:
 
         self._hb_time = now
 
-    def _run_eval(self, agent: Any, env_step: int) -> None:
+    def _run_eval(self, agent: Any, env_step: int, *, robust: bool = False, flush: bool = True) -> None:
         """Evaluate the current policy and log the result.
 
         The rollout itself lives in :func:`dreamer_arm.inference.evaluate.evaluate`
         so the standalone eval entrypoint runs exactly the same code; this
-        method only forwards the metrics to the logger.
+        method forwards its compact dashboard subset to the logger.
         """
-        with phase("eval"):
-            result = evaluate(agent, self._eval_envs, self._cfg.eval_episode_num)
+        namespace = "eval_robust" if robust else "eval"
+        episodes = self._cfg.robust_eval_episode_num if robust else self._cfg.eval_episode_num
+        with phase(namespace):
+            result = evaluate(
+                agent,
+                self._eval_envs,
+                episodes,
+                capture_artifacts=not robust,
+            )
+            metrics = {
+                name.replace("eval/", f"{namespace}/", 1) if robust else name: value
+                for name, value in result.metrics.items()
+            }
             if result.video is not None:
                 self._logger.video("eval/video", result.video)
             if result.action_trace is not None:
@@ -444,20 +467,23 @@ class OnlineTrainer:
                     result.action_trace.columns,
                     result.action_trace.rows,
                 )
-            self._logger.scalars(result.metrics)
-            self._logger.write(env_step, fps=False)
+            logged_metrics = compact_eval_metrics(metrics)
+            self._logger.scalars(logged_metrics)
+            if flush:
+                self._logger.write(env_step, fps=False)
 
-            # best.pt is promoted here, not on the checkpoint cadence: eval is
-            # the only success signal and it runs more often than checkpointing,
-            # so a peak between two checkpoints would otherwise be lost.
+            # best.pt is promoted from robust eval here, not on the checkpoint
+            # cadence, so a peak between two checkpoints is not lost.
             # `evaluate` omits the key entirely when no episode completed.
-            success = result.metrics.get("eval/success_mean")
+            success = logged_metrics.get("eval_robust/success_mean") if robust else None
             if success is not None and success > self._best_success:
                 self._best_success = float(success)
                 self._checkpoints.save_best(agent, env_step, self._trainer_state(), self._best_success)
 
-    def _trainer_state(self) -> dict[str, int | float]:
+    def _trainer_state(self) -> dict[str, int | float | bool | str]:
         return {
             "next_ep_id": int(self._next_ep_id),
             "best_success": float(self._best_success),
+            "best_metric": "eval_robust/success_mean",
+            "wm_pretrain_complete": bool(self._wm_pretrain_complete),
         }

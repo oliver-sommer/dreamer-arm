@@ -37,7 +37,10 @@ core:
     # RSSM's 2560-d vector -- see the plan's Cost table. Mandatory
     # (validate_config and build_world_model both reject wm=dinowm with
     # imag_starts unset).
-    imag_starts: 64
+    imag_starts: 80
+
+    # Fixed coefficient: no entropy schedule or learned temperature.
+    act_entropy: 1e-3
 
     dinowm:
       # Fixed context window (frames) the causal predictor conditions on.

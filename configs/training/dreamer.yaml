@@ -44,7 +44,10 @@ batch_length: 64
 
 trainer:
   steps: ${envs.sim.steps}
-  pretrain: 0
+  # MT10 uses one pinned env per task, so this yields 1,000 transitions/task.
+  prefill: 10000
+  # Burn in dynamics/constraint prediction before actor-critic learning starts.
+  pretrain: 500
   # Eval is expensive with shared train/eval envs: each eval steps the envs
   # for a full episode (time_limit × env_num global policy steps — 12500 for
   # MT50), so eval_every must be several times that or most env
@@ -52,6 +55,10 @@ trainer:
   # episode, then resumes with fresh episode ids so milestones are not delayed.
   eval_every: 25000
   eval_episode_num: ${envs.sim.eval_episode_num}
+  # Five fixed-seed episodes per MT10 task. This is the only evaluation used
+  # to promote best.pt; the cheaper pass above remains the frequent signal.
+  robust_eval_every: 100000
+  robust_eval_episode_num: 50
   # Run one eval pass before the first training step, so W&B gets a baseline
   # (untrained on a fresh run, whatever `resume` restored on a resumed one)
   # instead of waiting eval_every steps for the first data point.  A no-op
@@ -60,10 +67,9 @@ trainer:
   # Additional one-shot evaluations during the early learning transient.
   # Each runs before the first collection step after its milestone; milestones
   # at or below a resumed checkpoint's step are not replayed.
-  # The prefill is 1,040 transitions with the defaults, so a 1k evaluation
-  # would be an exact repeat of the untrained step-0 baseline. Start after
-  # optimisation has actually begun.
-  eval_warmup_steps: [2500, 5000, 10000, 15000]
+  # The 10k prefill already has a step-0 baseline, so early follow-ups start
+  # only after WM burn-in and online actor-critic updates have begun.
+  eval_warmup_steps: [12500, 15000, 20000]
   # Agent checkpoint cadence (env steps).  Refreshes <logdir>/latest.pt
   # (~a few hundred MB: weights+optimiser), atomically replaced each time.
   checkpoint_every: 50000

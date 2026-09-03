@@ -856,6 +856,10 @@ class DinoWorldModel:
         labels = ("workspace", "lag", "joint_limit")
         metrics: dict[str, torch.Tensor] = {
             "constraint/clamp_loss": clamp_loss.detach(),
+            "constraint/clamp_probability": (probability * valid).sum().detach() / (valid_count * 3.0),
+            "constraint/clamp_rate": (clamp_target * valid).sum().detach() / (valid_count * 3.0),
+            "constraint/clamp_brier": (((probability - clamp_target).square() * valid).sum().detach())
+            / (valid_count * 3.0),
             "constraint/retained_xyz_loss": retained_loss.detach(),
             "constraint/achieved_xyz_loss": achieved_loss.detach(),
             "constraint/valid_fraction": valid.mean().detach(),

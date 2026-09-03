@@ -66,7 +66,9 @@ def _run(cfg: DictConfig) -> None:
     # Reuse train_envs for eval to avoid doubling the EGL renderer count.
     # With MT50 (50 train + 50 eval envs), 100 EGL contexts exhaust VRAM on
     # most GPUs.  The trainer resets shared envs after eval to resync obs state.
-    eval_envs = train_envs if int(cfg.envs.sim.eval_episode_num) > 0 else None
+    eval_envs = (
+        train_envs if int(cfg.trainer.eval_episode_num) > 0 or int(cfg.trainer.robust_eval_episode_num) > 0 else None
+    )
 
     agent = Dreamer(cfg.core.model, train_envs.observation_space, train_envs.action_space).to(cfg.device)
     _log_run_shape(f"{cfg.envs.sim.name}:{cfg.envs.sim.task}", cfg, train_envs, agent)
@@ -79,6 +81,7 @@ def _run(cfg: DictConfig) -> None:
             device=str(cfg.core.buffer.device),
             storage_device=str(cfg.core.buffer.storage_device),
             prefetch=int(cfg.core.buffer.prefetch),
+            task_balanced=bool(cfg.core.buffer.task_balanced),
         )
     )
 
@@ -96,6 +99,7 @@ def _run(cfg: DictConfig) -> None:
 
     trainer_cfg = TrainerConfig(
         steps=int(cfg.trainer.steps),
+        prefill=int(cfg.trainer.prefill),
         pretrain=int(cfg.trainer.pretrain),
         replay_ratio=float(cfg.trainer.replay_ratio),
         batch_size=int(cfg.trainer.batch_size),
@@ -103,6 +107,8 @@ def _run(cfg: DictConfig) -> None:
         action_repeat=int(cfg.trainer.action_repeat),
         eval_every=int(cfg.trainer.eval_every),
         eval_episode_num=int(cfg.trainer.eval_episode_num),
+        robust_eval_every=int(cfg.trainer.robust_eval_every),
+        robust_eval_episode_num=int(cfg.trainer.robust_eval_episode_num),
         update_log_every=int(cfg.trainer.update_log_every),
         checkpoint_every=int(cfg.trainer.checkpoint_every),
         checkpoint_dir=str(cfg.logdir),

@@ -14,7 +14,9 @@ from tensordict import TensorDict
 from dreamer_arm.core.buffer import BufferConfig, ReplayBuffer
 
 
-def _make_buf(batch_size: int = 2, batch_length: int = 4, prefetch: int = 0) -> ReplayBuffer:
+def _make_buf(
+    batch_size: int = 2, batch_length: int = 4, prefetch: int = 0, *, task_balanced: bool = False
+) -> ReplayBuffer:
     cfg = BufferConfig(
         max_size=128,
         batch_size=batch_size,
@@ -22,8 +24,54 @@ def _make_buf(batch_size: int = 2, batch_length: int = 4, prefetch: int = 0) -> 
         device="cpu",
         storage_device="cpu",
         prefetch=prefetch,
+        task_balanced=task_balanced,
     )
     return ReplayBuffer(cfg)
+
+
+def test_task_balanced_buffer_covers_every_mt10_task() -> None:
+    task_count = 10
+    buf = _make_buf(batch_size=16, batch_length=4, task_balanced=True)
+    for _ in range(12):
+        buf.add_transition(
+            TensorDict(
+                {
+                    "task_id": torch.eye(task_count),
+                    "action": torch.zeros(task_count, 1),
+                    "reward": torch.zeros(task_count, 1),
+                    "episode": torch.arange(task_count, dtype=torch.int32),
+                },
+                batch_size=(task_count,),
+            )
+        )
+
+    data, _, _ = buf.sample(())
+    sampled_tasks = data["task_id"][:, 0].argmax(dim=-1)
+    counts = torch.bincount(sampled_tasks, minlength=task_count)
+    assert torch.all((counts == 1) | (counts == 2))
+
+
+def test_task_balanced_buffer_rotates_when_tasks_exceed_batch() -> None:
+    task_count = 20
+    buf = _make_buf(batch_size=6, batch_length=4, task_balanced=True)
+    for _ in range(12):
+        buf.add_transition(
+            TensorDict(
+                {
+                    "task_id": torch.eye(task_count),
+                    "action": torch.zeros(task_count, 1),
+                    "reward": torch.zeros(task_count, 1),
+                    "episode": torch.arange(task_count, dtype=torch.int32),
+                },
+                batch_size=(task_count,),
+            )
+        )
+
+    seen: set[int] = set()
+    for _ in range(4):
+        data, _, _ = buf.sample(())
+        seen.update(data["task_id"][:, 0].argmax(dim=-1).tolist())
+    assert seen == set(range(task_count))
 
 
 def test_buffer_sample_shape() -> None:

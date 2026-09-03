@@ -112,6 +112,7 @@ class Dreamer(nn.Module):
             # "default" compiles in seconds; "reduce-overhead" (CUDA graphs) can
             # take 5-10 min on first run before any progress shows in the logs.
             self._cal_grad = torch.compile(self._cal_grad, mode="default")  # type: ignore[method-assign]
+            self._cal_wm_grad = torch.compile(self._cal_wm_grad, mode="default")  # type: ignore[method-assign]
 
     @property
     def wm(self) -> WorldModel:
@@ -241,12 +242,23 @@ class Dreamer(nn.Module):
         return diagnostics
 
     def update(self, replay_buffer: Any) -> dict[str, torch.Tensor]:
+        """Run one complete world-model and actor-critic update."""
+
+        self.ac.update_slow_target()
+        return self._update(replay_buffer, world_model_only=False)
+
+    def update_world_model(self, replay_buffer: Any) -> dict[str, torch.Tensor]:
+        """Run one world-model-only burn-in update without touching actor/critic."""
+
+        return self._update(replay_buffer, world_model_only=True)
+
+    def _update(self, replay_buffer: Any, *, world_model_only: bool) -> dict[str, torch.Tensor]:
         data, index, initial = replay_buffer.sample(self.replay_cache_keys)
         p_data = self._preprocess(dict(data))
-        self.ac.update_slow_target()
 
         with autocast(device_type=self.device.type, dtype=torch.float16, enabled=self._optim.amp_enabled):
-            state, mets = self._cal_grad(p_data, initial)
+            grad_fn = self._cal_wm_grad if world_model_only else self._cal_grad
+            state, mets = grad_fn(p_data, initial)
 
         mets.update(self._optim.step())
 
@@ -257,6 +269,19 @@ class Dreamer(nn.Module):
             cache = {k: state[k].detach() for k in self.replay_cache_keys}
             replay_buffer.update_initial_state(index, cache)
         return mets
+
+    def _cal_wm_grad(
+        self, data: dict[str, torch.Tensor], initial: dict[str, torch.Tensor]
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        state, losses, metrics = self.wm.loss(data, initial)
+        total_loss = sum(
+            (value * self._loss_scales.get(name, 1.0) for name, value in losses.items()),
+            start=torch.zeros((), device=self.device),
+        )
+        self._optim.backward(total_loss)
+        metrics.update({f"loss/{name}": value.detach() for name, value in losses.items()})
+        metrics["opt/loss"] = total_loss.detach()
+        return state, metrics
 
     def _cal_grad(
         self, data: dict[str, torch.Tensor], initial: dict[str, torch.Tensor]

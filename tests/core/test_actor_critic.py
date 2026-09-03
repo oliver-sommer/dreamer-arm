@@ -131,6 +131,24 @@ def test_imag_starts_subsamples_to_requested_count(tiny_actor_critic_cfg) -> Non
     assert sub["feat"].shape == (3, 4)
 
 
+def test_imag_starts_are_balanced_across_present_tasks(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]
+    task_count = 10
+    ac = ActorCritic(
+        tiny_actor_critic_cfg,
+        4,
+        (2,),
+        act_discrete=False,
+        imag_starts=80,
+        device=torch.device("cpu"),
+        num_tasks=task_count,
+    )
+    task_id = torch.eye(task_count).unsqueeze(1).expand(-1, 10, -1)
+    gathered = ac._gather_imag_starts({"feat": torch.randn(task_count, 10, 4), "_return_task_id": task_id})
+
+    counts = torch.bincount(gathered["_return_task_id"].argmax(dim=-1), minlength=task_count)
+    assert torch.equal(counts, torch.full((task_count,), 8))
+
+
 def test_imag_starts_pair_indexing_matches_flattening(tiny_actor_critic_cfg) -> None:  # type: ignore[no-untyped-def]
     """(b, t) indexing must pick the same starts a flatten-then-index would.
 
