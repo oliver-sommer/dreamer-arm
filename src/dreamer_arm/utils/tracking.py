@@ -90,6 +90,8 @@ class WandbLogger:
         self._warned_no_ffmpeg = False
         self._scalars: dict[str, _Scalar] = {}
         self._pending: dict[str, torch.Tensor] = {}
+        self._pending_counts: dict[str, int] = {}
+        self._pending_latest: set[str] = set()
         self._videos: dict[str, np.ndarray] = {}
         self._images: dict[str, np.ndarray] = {}
         self._histograms: dict[str, np.ndarray] = {}
@@ -118,12 +120,19 @@ class WandbLogger:
             value = float(value.detach().cpu().item())
         self._scalars[name] = float(value)
 
-    def scalars(self, values: Mapping[str, _Scalar | torch.Tensor], defer: bool = False) -> None:
+    def scalars(
+        self,
+        values: Mapping[str, _Scalar | torch.Tensor],
+        defer: bool = False,
+        *,
+        latest: frozenset[str] = frozenset(),
+    ) -> None:
         """Log a batch of scalars.
 
-        With ``defer=True`` (the update-loop path), tensor values are kept as
-        tensors in ``_pending`` and only synced to host in :meth:`write` --
-        see :meth:`_flush_pending` for why that matters. With ``defer=False``
+        With ``defer=True`` (the update-loop path), tensor values are summed
+        on-device and averaged in :meth:`write`, producing one representative
+        value for every update in the logging window without intermediate
+        host syncs. Keys in ``latest`` retain only their newest value. With ``defer=False``
         (the default), tensors are synced immediately: at most one CUDA sync
         per device, not one per key, so a handful of scalars logged outside
         the update loop still don't pay a sync per key.
@@ -137,7 +146,15 @@ class WandbLogger:
         """
         tensors = {k: v for k, v in values.items() if isinstance(v, torch.Tensor)}
         if defer:
-            self._pending.update({k: v.detach() for k, v in tensors.items()})
+            for key, value in tensors.items():
+                value = value.detach()
+                if key in latest:
+                    self._pending[key] = value
+                    self._pending_counts[key] = 1
+                    self._pending_latest.add(key)
+                else:
+                    self._pending[key] = self._pending[key] + value if key in self._pending else value
+                    self._pending_counts[key] = self._pending_counts.get(key, 0) + 1
         else:
             by_device: dict[torch.device, list[str]] = {}
             for k, v in tensors.items():
@@ -156,13 +173,8 @@ class WandbLogger:
         """Sync every deferred tensor scalar to host, once, grouped by device.
 
         The update loop calls :meth:`scalars` with ``defer=True`` after every
-        ``agent.update`` -- but only the last update's metrics before the next
-        :meth:`write` are ever read (each call overwrites the last). Syncing
-        immediately, as ``scalars(defer=False)`` does, would pay a blocking
-        device->host stall after every update just to throw away all but one
-        of them. Deferring collapses that to one sync per ``write``, no matter
-        how many updates ran in between -- the same "one sync, not N" argument
-        ``scalars`` used to make per-call, now amortised across the window.
+        update. Sums and counts stay on device, so the window mean still costs
+        only one device-to-host sync per device at write time.
         """
         if not self._pending:
             return
@@ -170,10 +182,19 @@ class WandbLogger:
         for k, v in self._pending.items():
             by_device.setdefault(v.device, []).append(k)
         for _device, keys in by_device.items():
-            stacked = torch.stack([self._pending[k].reshape(()) for k in keys])
+            stacked = torch.stack(
+                [
+                    (
+                        self._pending[k] if k in self._pending_latest else self._pending[k] / self._pending_counts[k]
+                    ).reshape(())
+                    for k in keys
+                ]
+            )
             for k, val in zip(keys, stacked.tolist(), strict=True):
                 self._scalars[k] = float(val)
         self._pending.clear()
+        self._pending_counts.clear()
+        self._pending_latest.clear()
 
     def video(self, name: str, frames: _Array, cols: int | None = None) -> None:
         self._videos[name] = as_uint8_video(frames, cols=cols)
@@ -195,7 +216,7 @@ class WandbLogger:
         log.info(self._console_line(step))
         payload: dict[str, Any] = {"env_step": step, **self._scalars}
         if fps_value is not None:
-            payload["fps/fps"] = fps_value
+            payload["system/env_steps_per_sec"] = fps_value
         for name, arr in self._videos.items():
             video = self._encode_video(arr)
             if video is not None:
@@ -298,18 +319,17 @@ class WandbLogger:
     def _console_line(self, step: int) -> str:
         # The logging formatter prepends the bracketed timestamp + level.
         parts = [f"step {step:>8}"]
-        for key, label in (("episode/score", "score"), ("episode/eval_score", "eval")):
+        for key, label in (("episode/return_mean", "return"), ("eval/return_mean", "eval")):
             if key in self._scalars:
                 parts.append(f"{label} {self._scalars[key]:.2f}")
         header = "  ".join(parts)
 
         loss_keys = [
-            ("train/loss/dyn", "dyn"),
-            ("train/loss/rep", "rep"),
-            ("train/loss/rew", "rew"),
-            ("train/loss/con", "con"),
-            ("train/loss/policy", "policy"),
-            ("train/loss/value", "value"),
+            ("train/wm/loss_total", "wm"),
+            ("train/wm/loss_prediction", "pred"),
+            ("train/wm/loss_reward", "rew"),
+            ("train/actor/loss", "actor"),
+            ("train/critic/loss_imagined", "critic"),
         ]
         loss_parts = [f"{label} {self._scalars[key]:.3f}" for key, label in loss_keys if key in self._scalars]
         # Indent the continuation line flush under the message column (the

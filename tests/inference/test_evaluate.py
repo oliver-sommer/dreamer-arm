@@ -104,6 +104,7 @@ def test_evaluate_rounds_up_to_whole_rounds() -> None:
     # ceil(5/4) = 2 rounds across 4 envs = 8 episodes, all from task "mock".
     assert result.metrics["eval/success/mock"] == 0.0
     assert result.metrics["eval/episodes_completed"] == 8.0
+    assert result.metrics["eval/episodes_per_task"] == 8.0
     assert result.metrics["eval/task_count"] == 1.0
 
 
@@ -115,6 +116,8 @@ def test_evaluate_logs_rewards_and_first_twenty_deterministic_actions() -> None:
     assert result.metrics["eval/return_mean"] == 25.0
     assert not any(key.startswith("eval/action_trace/") for key in result.metrics)
     assert result.action_trace is not None
+    assert result.task_metrics is not None
+    assert result.task_metrics.rows[0][:6] == ["mock", 2, 0.0, 25.0, 0.0, 25.0]
     assert len(result.action_trace.rows) == ACTION_TRACE_STEPS
     assert result.action_trace.columns[:6] == [
         "task",
@@ -230,10 +233,10 @@ def test_trainer_logs_compact_eval_metrics_and_artifacts() -> None:
     assert "eval/actor_param_checksum" not in logged
     assert not any(name.startswith("eval/action_x_mean/") for name in logged)
     assert logger.videos == ["eval/video"]
-    assert logger.tables == ["eval/action_trace"]
+    assert logger.tables == ["eval/action_trace", "eval/task_metrics"]
 
 
-def test_robust_eval_uses_separate_namespace_without_artifacts() -> None:
+def test_large_eval_uses_unified_namespace_without_heavy_artifacts() -> None:
     envs = _MockVectorEnv(num_envs=2, done_every=3)
     logger = _MockLogger()
     trainer = OnlineTrainer(
@@ -247,14 +250,14 @@ def test_robust_eval_uses_separate_namespace_without_artifacts() -> None:
     trainer._run_eval(_MockAgent(num_envs=2), env_step=100, robust=True)
 
     logged = dict(logger.recorded)
-    assert logged["eval_robust/success_mean"] == 0.0
-    assert logged["eval_robust/success/mock"] == 0.0
-    assert not any(name.startswith("eval/success") for name in logged)
+    assert logged["eval/success_mean"] == 0.0
+    assert logged["eval/success/mock"] == 0.0
+    assert not any(name.startswith("eval_robust/") for name in logged)
     assert logger.videos == []
-    assert logger.tables == []
+    assert logger.tables == ["eval/task_metrics"]
 
 
-def test_coincident_fast_and_robust_eval_flush_once() -> None:
+def test_large_eval_writes_unified_metrics_once() -> None:
     envs = _MockVectorEnv(num_envs=2, done_every=3)
     logger = _MockLogger()
     trainer = OnlineTrainer(
@@ -266,10 +269,9 @@ def test_coincident_fast_and_robust_eval_flush_once() -> None:
     )
     agent = _MockAgent(num_envs=2)
 
-    trainer._run_eval(agent, env_step=100, flush=False)
     trainer._run_eval(agent, env_step=100, robust=True)
 
     logged = dict(logger.recorded)
     assert "eval/success_mean" in logged
-    assert "eval_robust/success_mean" in logged
+    assert not any(name.startswith("eval_robust/") for name in logged)
     assert logger.write_steps == [100]

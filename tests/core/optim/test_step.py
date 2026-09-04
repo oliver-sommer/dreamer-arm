@@ -69,3 +69,22 @@ def test_step_state_dict_round_trips() -> None:
     state = step.state_dict()
     step2 = OptimStep(named, _cfg(), torch.device("cpu"))
     step2.load_state_dict(state)  # must not raise
+
+
+def test_diagnostic_step_reports_gradient_and_update_health() -> None:
+    lin, named = _linear_and_named()
+    step = OptimStep(named, _cfg(), torch.device("cpu"))
+    step.backward(lin(torch.randn(4, 2)).sum())
+
+    mets = step.step(diagnostics=True)
+
+    for key in (
+        "opt/grad_norm_before_clip",
+        "opt/grad_norm_after_clip",
+        "opt/param_rms",
+        "opt/update_rms",
+        "opt/update_to_param_ratio",
+    ):
+        assert torch.isfinite(mets[key])
+    assert mets["opt/grad_norm_after_clip"] <= mets["opt/grad_norm_before_clip"]
+    assert "opt/grad_scale" not in mets  # CPU has no active AMP scaler.

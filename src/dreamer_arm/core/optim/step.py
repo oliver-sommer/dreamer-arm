@@ -48,19 +48,21 @@ class OptimStep:
     def backward(self, loss: torch.Tensor) -> None:
         self._scaler.scale(loss).backward()
 
-    def step(self) -> dict[str, torch.Tensor]:
+    def step(self, *, diagnostics: bool = False) -> dict[str, torch.Tensor]:
         """Unscale, AGC-clip, guard against non-finite gradients, step, schedule."""
         mets: dict[str, torch.Tensor] = {}
         self._scaler.unscale_(self._optimizer)
         params = list(self._named_params.values())
 
-        if self._log_grads:
+        collect_diagnostics = diagnostics or self._log_grads
+        if collect_diagnostics:
             old_params = [p.data.clone().detach() for p in params]
             grads = [p.grad for p in params if p.grad is not None]
-            mets["opt/grad_norm"] = compute_global_norm(grads)
-            mets["opt/grad_rms"] = compute_rms(grads)
+            mets["opt/grad_norm_before_clip"] = compute_global_norm(grads)
 
         adaptive_grad_clip(params, self._agc_clip, self._agc_pmin)
+        if collect_diagnostics:
+            mets["opt/grad_norm_after_clip"] = compute_global_norm(grads)
 
         # Non-finite gradient guard.  A single NaN/inf gradient must never reach
         # the optimizer: without GradScaler (CUDA-only here), a disabled scaler
@@ -98,11 +100,13 @@ class OptimStep:
         # defaults to CPU and torch.stack refuses to mix devices.
         mets["opt/grad_skipped"] = torch.tensor(0.0 if stepped else 1.0, device=self.device)
         mets["opt/lr"] = torch.tensor(self._scheduler.get_last_lr()[0], device=self.device)
-        mets["opt/grad_scale"] = torch.tensor(scale_after, device=self.device)
-        if self._log_grads:
+        if self.amp_enabled:
+            mets["opt/grad_scale"] = torch.tensor(scale_after, device=self.device)
+        if collect_diagnostics:
             updates = [(p.data - old) for p, old in zip(params, old_params, strict=True)]
             mets["opt/param_rms"] = compute_rms([p.data for p in params])
             mets["opt/update_rms"] = compute_rms(updates)
+            mets["opt/update_to_param_ratio"] = mets["opt/update_rms"] / mets["opt/param_rms"].clamp_min(1e-12)
         return mets
 
     def state_dict(self) -> dict[str, Any]:

@@ -109,25 +109,23 @@ def test_scalars_stacks_each_device_group_separately(monkeypatch: Any) -> None:
 def test_scalars_deferred_does_not_sync_until_write(monkeypatch: Any) -> None:
     """scalars(defer=True) must not call .item()/tolist() -- only write() may.
 
-    The update loop logs metrics after every agent.update but only the last
-    call's values before the next write() are ever read (each overwrites the
-    last). Deferring means only one device->host sync happens per write(), no
-    matter how many updates ran in between.
+    The update loop averages every update without syncing until write().
     """
     logger = _make_logger()
     item_calls: list[int] = []
     monkeypatch.setattr(torch.Tensor, "tolist", lambda self: item_calls.append(1) or [self.item()])
 
     logger.scalars({"loss/dyn": torch.tensor(1.0)}, defer=True)
-    logger.scalars({"loss/dyn": torch.tensor(2.0)}, defer=True)  # overwrites the first
+    logger.scalars({"loss/dyn": torch.tensor(2.0)}, defer=True)
     assert item_calls == [], "deferred scalars() must not sync before write()"
     assert logger._scalars == {}
-    assert logger._pending["loss/dyn"].item() == 2.0
+    assert logger._pending["loss/dyn"].item() == 3.0
 
     logger._flush_pending()
     assert item_calls == [1]
-    assert logger._scalars == {"loss/dyn": 2.0}
+    assert logger._scalars == {"loss/dyn": 1.5}
     assert logger._pending == {}
+    assert logger._pending_counts == {}
 
 
 def test_write_flushes_pending_deferred_scalars(monkeypatch: Any) -> None:
@@ -139,6 +137,17 @@ def test_write_flushes_pending_deferred_scalars(monkeypatch: Any) -> None:
 
     assert logger._pending == {}
     assert logger._scalars == {}  # write() clears after flushing into the payload
+
+
+def test_deferred_latest_metric_is_not_averaged() -> None:
+    logger = _make_logger()
+    latest = frozenset({"train/optimizer/learning_rate"})
+    logger.scalars({"train/optimizer/learning_rate": torch.tensor(1e-4)}, defer=True, latest=latest)
+    logger.scalars({"train/optimizer/learning_rate": torch.tensor(2e-4)}, defer=True, latest=latest)
+
+    logger._flush_pending()
+
+    assert logger._scalars["train/optimizer/learning_rate"] == pytest.approx(2e-4)
 
 
 def test_table_is_buffered_as_one_wandb_payload_and_cleared(monkeypatch: Any) -> None:

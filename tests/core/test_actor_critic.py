@@ -54,6 +54,27 @@ def test_actor_critic_loss_shapes_and_gradient(tiny_actor_critic_cfg) -> None:  
         assert losses[key].shape == ()
         assert torch.isfinite(losses[key])
     assert "ret" in metrics and "action_mean" in metrics
+    for key in (
+        "actor/advantage_mean",
+        "actor/advantage_std",
+        "actor/advantage_abs_mean",
+        "actor/advantage_positive_fraction",
+        "actor/log_probability_mean",
+        "critic/value_bias",
+        "critic/value_mae",
+        "critic/value_rmse",
+        "critic/explained_variance",
+        "critic/replay_value_mae",
+        "critic/replay_explained_variance",
+        "critic/slow_value_gap_mae",
+        "reward/mae",
+        "continue/brier",
+    ):
+        assert metrics[key].shape == ()
+        assert torch.isfinite(metrics[key])
+    assert 0.0 <= metrics["actor/advantage_positive_fraction"] <= 1.0
+    assert metrics["diagnostic/advantage"].numel() <= 4096
+    assert metrics["diagnostic/value_error"].numel() <= 4096
     for label in ("x", "y", "z"):
         assert f"action_{label}_mean" in metrics
         assert f"action_{label}_std" in metrics
@@ -108,6 +129,7 @@ def test_sparse_success_head_is_supervised_and_shapes_imagined_reward(tiny_actor
 
     assert torch.isfinite(losses["success"])
     assert metrics["success/target_rate"] == 0.1
+    assert torch.isfinite(metrics["success/brier"])
     assert metrics["imag_success_bonus"] > 0.0
     assert torch.allclose(metrics["shaped_rew"], metrics["rew"] + metrics["imag_success_bonus"])
 

@@ -44,6 +44,30 @@ def sanitize_action(action: torch.Tensor, discrete: bool) -> torch.Tensor:
     return torch.nan_to_num(action).clamp(-1.0, 1.0)
 
 
+def _weighted_mean(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Mean over Dreamer's discounted imagination weights."""
+
+    return (value * weight).sum() / weight.sum().clamp_min(1e-8)
+
+
+def _weighted_stats(value: torch.Tensor, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = _weighted_mean(value, weight)
+    variance = _weighted_mean((value - mean).square(), weight)
+    return mean, variance.sqrt()
+
+
+def _explained_variance(target: torch.Tensor, prediction: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Weighted explained variance, defined as zero for constant targets."""
+
+    target_mean = _weighted_mean(target, weight)
+    target_variance = _weighted_mean((target - target_mean).square(), weight)
+    residual = target - prediction
+    residual_mean = _weighted_mean(residual, weight)
+    residual_variance = _weighted_mean((residual - residual_mean).square(), weight)
+    score = 1.0 - residual_variance / target_variance.clamp_min(1e-8)
+    return torch.where(target_variance > 1e-8, score, torch.zeros_like(score))
+
+
 class ReturnEMA(nn.Module):
     """Track task-local return percentiles for actor-critic normalisation.
 
@@ -306,9 +330,14 @@ class ActorCritic(nn.Module):
         metrics: dict[str, torch.Tensor] = {}
         b, t = data["action"].shape[:2]
 
-        losses["rew"] = -self.reward(feat).log_prob(to_f32(data["reward"])).mean()
+        reward_target = to_f32(data["reward"])
+        reward_dist = self.reward(feat)
+        losses["rew"] = -reward_dist.log_prob(reward_target).mean()
+        metrics["reward/mae"] = (reward_dist.mode() - reward_target).abs().mean().detach()
         cont_target = (1.0 - to_f32(data["is_terminal"])).unsqueeze(-1)
-        losses["con"] = -self.cont(feat).log_prob(cont_target).mean()
+        cont_dist = self.cont(feat)
+        losses["con"] = -cont_dist.log_prob(cont_target).mean()
+        metrics["continue/brier"] = (cont_dist.mean - cont_target).square().mean().detach()
         if self.success is not None and "success" in data:
             success_target = to_f32(data["success"])
             success_dist = self.success(feat)
@@ -324,6 +353,7 @@ class ActorCritic(nn.Module):
             success_probability = success_dist.mean
             metrics["success/target_rate"] = success_target.mean().detach()
             metrics["success/predicted_rate"] = success_probability.mean().detach()
+            metrics["success/brier"] = (success_probability - success_target).square().mean().detach()
             positive_mask = success_target > 0.5
             negative_mask = ~positive_mask
             metrics["success/predicted_positive"] = (
@@ -385,7 +415,8 @@ class ActorCritic(nn.Module):
         policy = self.actor(imag_feat)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
-        losses["policy"] = (weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy)).mean()
+        actor_weight = weight[:, :-1].detach()
+        losses["policy"] = (actor_weight * -(logpi * adv.detach() + self.act_entropy * entropy)).mean()
 
         tar_padded = torch.cat([ret, torch.zeros_like(ret[:, -1:])], dim=1)
         losses["value"] = (
@@ -403,8 +434,14 @@ class ActorCritic(nn.Module):
             for index in range(self.return_ema.num_tasks):
                 metrics[f"ret_005_task_{index}"] = self.return_ema.ema_vals[index, 0]
                 metrics[f"ret_095_task_{index}"] = self.return_ema.ema_vals[index, 1]
-        metrics["adv"] = adv.mean()
-        metrics["adv_std"] = adv.std()
+        advantage_mean, advantage_std = _weighted_stats(adv, actor_weight)
+        metrics["adv"] = advantage_mean
+        metrics["adv_std"] = advantage_std
+        metrics["actor/advantage_mean"] = advantage_mean
+        metrics["actor/advantage_std"] = advantage_std
+        metrics["actor/advantage_abs_mean"] = _weighted_mean(adv.abs(), actor_weight)
+        metrics["actor/advantage_positive_fraction"] = _weighted_mean((adv > 0).float(), actor_weight)
+        metrics["actor/log_probability_mean"] = _weighted_mean(logpi, actor_weight)
         metrics["con"] = imag_cont.mean()
         metrics["rew"] = imag_reward.mean()
         metrics["shaped_rew"] = shaped_reward.mean()
@@ -419,6 +456,11 @@ class ActorCritic(nn.Module):
         metrics["slowval"] = imag_slow_value.mean()
         metrics["weight"] = weight.mean()
         metrics["action_entropy"] = entropy.mean()
+        if hasattr(policy, "pre_std"):
+            metrics["actor/policy_std_mean"] = policy.pre_std.mean()
+        metrics["ret_scale_mean"] = ret_scale.mean()
+        metrics["ret_scale_min"] = ret_scale.min()
+        metrics["ret_scale_max"] = ret_scale.max()
         if not self.act_discrete:
             xyz = imag_action[..., : min(3, imag_action.shape[-1])]
             metrics["action_xyz_near_bound_fraction"] = (xyz.abs() >= 0.95).float().mean()
@@ -469,6 +511,37 @@ class ActorCritic(nn.Module):
         metrics.update(tensorstats(rep_ret, "ret_replay"))
         metrics.update(tensorstats(rep_value, "value_replay"))
         metrics.update(tensorstats(rep_slow, "slow_value_replay"))
+
+        imag_prediction = imag_value[:, :-1]
+        imag_slow = imag_slow_value[:, :-1]
+        imag_error = imag_prediction - ret
+        critic_value_mean, _ = _weighted_stats(imag_prediction, actor_weight)
+        critic_target_mean, _ = _weighted_stats(ret, actor_weight)
+        metrics["critic/value_mean"] = critic_value_mean
+        metrics["critic/target_mean"] = critic_target_mean
+        metrics["critic/value_bias"] = _weighted_mean(imag_error, actor_weight)
+        metrics["critic/value_mae"] = _weighted_mean(imag_error.abs(), actor_weight)
+        metrics["critic/value_rmse"] = _weighted_mean(imag_error.square(), actor_weight).sqrt()
+        metrics["critic/explained_variance"] = _explained_variance(ret, imag_prediction, actor_weight)
+        metrics["critic/slow_value_mean"] = _weighted_mean(imag_slow, actor_weight)
+        metrics["critic/slow_value_gap_mae"] = _weighted_mean((imag_prediction - imag_slow).abs(), actor_weight)
+
+        replay_prediction = rep_value[:, :-1]
+        replay_error = replay_prediction - rep_ret
+        replay_metric_weight = rep_weight[:, :-1]
+        metrics["critic/replay_value_mean"] = _weighted_mean(replay_prediction, replay_metric_weight)
+        metrics["critic/replay_target_mean"] = _weighted_mean(rep_ret, replay_metric_weight)
+        metrics["critic/replay_value_mae"] = _weighted_mean(replay_error.abs(), replay_metric_weight)
+        metrics["critic/replay_explained_variance"] = _explained_variance(
+            rep_ret, replay_prediction, replay_metric_weight
+        )
+
+        # The trainer turns these bounded samples into occasional histograms;
+        # they never enter the scalar contract.
+        metrics["diagnostic/advantage"] = adv.detach().reshape(-1)[:4096]
+        metrics["diagnostic/action"] = imag_action.detach().reshape(-1)[:4096]
+        metrics["diagnostic/value_error"] = imag_error.detach().reshape(-1)[:4096]
+        metrics["diagnostic/replay_value_error"] = replay_error.detach().reshape(-1)[:4096]
 
         return losses, metrics
 

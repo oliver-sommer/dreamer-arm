@@ -50,11 +50,13 @@ class EvalResult:
         action_trace: One compact table containing the first deterministic
                       actions for every task, rather than hundreds of scalar
                       series that W&B renders as separate charts.
+        task_metrics: One row per task with detailed outcomes and diagnostics.
     """
 
     metrics: dict[str, float] = field(default_factory=dict)
     video: np.ndarray | None = None
     action_trace: ActionTrace | None = None
+    task_metrics: ActionTrace | None = None
 
 
 def evaluate(
@@ -85,6 +87,7 @@ def evaluate(
 
     task_success: dict[str, list[float]] = {}
     task_returns: dict[str, list[float]] = {}
+    task_lengths: dict[str, list[float]] = {}
     # YamArm controller diagnostics, averaged across eval episodes (YAM only).
     ctrl_diags: dict[str, list[float]] = {}
     ctrl_diags_by_task: dict[str, dict[str, list[float]]] = {}
@@ -111,6 +114,7 @@ def evaluate(
     all_proprio_sensitivity: list[np.ndarray] = []
     all_visual_sensitivity: list[np.ndarray] = []
     all_success_probability: list[np.ndarray] = []
+    all_success_target: list[np.ndarray] = []
     all_constraint_probability: list[np.ndarray] = []
     all_constraint_target: list[np.ndarray] = []
     all_retained_prediction: list[np.ndarray] = []
@@ -121,6 +125,12 @@ def evaluate(
     slot_task_sensitivity: list[list[float]] = [[] for _ in range(n)]
     slot_proprio_sensitivity: list[list[float]] = [[] for _ in range(n)]
     slot_visual_sensitivity: list[list[float]] = [[] for _ in range(n)]
+    slot_success_probability: list[list[float]] = [[] for _ in range(n)]
+    slot_success_target: list[list[float]] = [[] for _ in range(n)]
+    slot_constraint_probability: list[list[np.ndarray]] = [[] for _ in range(n)]
+    slot_constraint_target: list[list[np.ndarray]] = [[] for _ in range(n)]
+    slot_retained_error: list[list[np.ndarray]] = [[] for _ in range(n)]
+    slot_achieved_error: list[list[np.ndarray]] = [[] for _ in range(n)]
     task_ids_seen: set[int] = set()
     task_id_rows = 0
     task_id_valid_rows = 0
@@ -204,6 +214,8 @@ def evaluate(
                     slot_proprio_sensitivity[i].append(float(proprio_sensitivity_arr[i]))
                 if visual_sensitivity_arr is not None:
                     slot_visual_sensitivity[i].append(float(visual_sensitivity_arr[i]))
+                if success_probability_arr is not None:
+                    slot_success_probability[i].append(float(success_probability_arr[i]))
             if capture_artifacts and completed[i] == 0 and episode_steps[i] < ACTION_TRACE_STEPS:
                 slot_actions[i].append(action_np[i].copy())
                 if pre_mean_arr is not None:
@@ -217,15 +229,31 @@ def evaluate(
         ctrl_target = np.asarray(transition_info.get("ctrl_clamp", np.zeros((n, 3))), dtype=np.float32)
         retained_target = np.asarray(transition_info.get("ctrl_retained_xyz", np.zeros((n, 3))), dtype=np.float32)
         achieved_target = np.asarray(transition_info.get("ctrl_achieved_xyz", np.zeros((n, 3))), dtype=np.float32)
+        success_target = np.asarray(transition_info.get("success", np.zeros(n)), dtype=np.float32)
+        if success_probability_arr is not None and success_target.shape == (n,):
+            all_success_target.append(success_target.copy())
+            for i in range(n):
+                if completed[i] < num_rounds:
+                    slot_success_target[i].append(float(success_target[i]))
         if constraint_probability_arr is not None and ctrl_valid.shape == (n,) and ctrl_target.shape == (n, 3):
             all_constraint_probability.append(constraint_probability_arr[ctrl_valid].copy())
             all_constraint_target.append(ctrl_target[ctrl_valid].copy())
+            for i in range(n):
+                if completed[i] < num_rounds and ctrl_valid[i]:
+                    slot_constraint_probability[i].append(constraint_probability_arr[i].copy())
+                    slot_constraint_target[i].append(ctrl_target[i].copy())
         if retained_prediction_arr is not None and retained_target.shape == (n, 3) and ctrl_valid.shape == (n,):
             all_retained_prediction.append(retained_prediction_arr[ctrl_valid].copy())
             all_retained_target.append(retained_target[ctrl_valid].copy())
+            for i in range(n):
+                if completed[i] < num_rounds and ctrl_valid[i]:
+                    slot_retained_error[i].append((retained_prediction_arr[i] - retained_target[i]).copy())
         if achieved_prediction_arr is not None and achieved_target.shape == (n, 3) and ctrl_valid.shape == (n,):
             all_achieved_prediction.append(achieved_prediction_arr[ctrl_valid].copy())
             all_achieved_target.append(achieved_target[ctrl_valid].copy())
+            for i in range(n):
+                if completed[i] < num_rounds and ctrl_valid[i]:
+                    slot_achieved_error[i].append((achieved_prediction_arr[i] - achieved_target[i]).copy())
         episode_returns += rewards
         episode_steps += 1
         done = terms | truncs
@@ -237,6 +265,7 @@ def evaluate(
                 success = float(fin.get("success", 0.0)) if fin is not None else 0.0
                 task_success.setdefault(task_name, []).append(success)
                 task_returns.setdefault(task_name, []).append(float(episode_returns[i]))
+                task_lengths.setdefault(task_name, []).append(float(episode_steps[i]))
                 slot_task_names[i] = task_name
                 if fin is not None:
                     for k, v in fin.get("ctrl_diag", {}).items():
@@ -276,7 +305,10 @@ def evaluate(
         all_successes.extend(successes)
 
     if all_successes:
-        metrics["eval/success_mean"] = float(np.mean(all_successes))
+        success_means = np.asarray([np.mean(values) for values in task_success.values()])
+        metrics["eval/success_mean"] = float(success_means.mean())
+        metrics["eval/success_min"] = float(success_means.min())
+        metrics["eval/success_std"] = float(success_means.std())
 
     all_returns: list[float] = []
     for task_name, returns in task_returns.items():
@@ -284,10 +316,15 @@ def evaluate(
         metrics[f"eval/return/{safe_name}"] = float(np.mean(returns))
         all_returns.extend(returns)
     if all_returns:
-        metrics["eval/return_mean"] = float(np.mean(all_returns))
+        return_means = np.asarray([np.mean(values) for values in task_returns.values()])
+        metrics["eval/return_mean"] = float(return_means.mean())
+        metrics["eval/return_min"] = float(return_means.min())
+        metrics["eval/return_std"] = float(return_means.std())
 
     metrics["eval/episodes_completed"] = float(completed.sum())
     metrics["eval/task_count"] = float(len(task_success))
+    if task_success:
+        metrics["eval/episodes_per_task"] = float(completed.sum() / len(task_success))
     if task_id_rows:
         metrics["eval/task_id_valid_fraction"] = task_id_valid_rows / task_id_rows
         metrics["eval/task_id_unique_count"] = float(len(task_ids_seen))
@@ -319,6 +356,10 @@ def evaluate(
         metrics["eval/action_visual_sensitivity"] = float(np.concatenate(all_visual_sensitivity).mean())
     if all_success_probability:
         metrics["eval/predicted_success_probability"] = float(np.concatenate(all_success_probability).mean())
+        probabilities = np.concatenate(all_success_probability).reshape(-1)
+        targets = np.concatenate(all_success_target).reshape(-1)
+        if probabilities.shape == targets.shape:
+            metrics["eval/predicted_success_brier"] = float(np.mean((probabilities - targets) ** 2))
     if all_constraint_probability:
         constraint_probability_values = np.concatenate(all_constraint_probability, axis=0)
         constraint_target_values = np.concatenate(all_constraint_target, axis=0)
@@ -420,11 +461,84 @@ def evaluate(
     for diag_name, diag_vals in reward_diags.items():
         metrics[f"eval/reward_{diag_name}"] = float(np.mean(diag_vals))
 
+    task_columns = [
+        "task",
+        "episodes",
+        "success_rate",
+        "return_mean",
+        "return_std",
+        "episode_length_mean",
+        "controller_workspace_clamp_rate",
+        "controller_lag_clamp_rate",
+        "controller_joint_limit_clamp_rate",
+        "controller_undertracking_rate",
+        "action_xyz_near_bound_fraction",
+        "predicted_success_probability",
+        "predicted_success_brier",
+        "constraint_brier",
+        "retained_xyz_mae_m",
+        "achieved_xyz_mae_m",
+    ]
+    task_rows: list[list[str | int | float]] = []
+
+    def combine_slots[T](values: list[list[T]], slots: list[int]) -> list[T]:
+        return [item for slot in slots for item in values[slot]]
+
+    def mean_or_nan(values: list[float]) -> float:
+        return float(np.mean(values)) if values else math.nan
+
+    for task_name in sorted(task_success):
+        slots = [index for index, name in enumerate(slot_task_names) if name == task_name]
+        actions = np.asarray(combine_slots(slot_all_actions, slots))
+        near_bound = (
+            float(np.mean(np.abs(actions[:, : min(3, actions.shape[-1])]) >= 0.95)) if actions.size else math.nan
+        )
+        success_probabilities = combine_slots(slot_success_probability, slots)
+        success_targets = combine_slots(slot_success_target, slots)
+        success_brier = (
+            float(np.mean((np.asarray(success_probabilities) - np.asarray(success_targets)) ** 2))
+            if success_probabilities and len(success_probabilities) == len(success_targets)
+            else math.nan
+        )
+        constraint_probabilities = np.asarray(combine_slots(slot_constraint_probability, slots))
+        constraint_targets = np.asarray(combine_slots(slot_constraint_target, slots))
+        constraint_brier = (
+            float(np.mean((constraint_probabilities - constraint_targets) ** 2))
+            if constraint_probabilities.size and constraint_probabilities.shape == constraint_targets.shape
+            else math.nan
+        )
+        retained_errors = np.asarray(combine_slots(slot_retained_error, slots))
+        achieved_errors = np.asarray(combine_slots(slot_achieved_error, slots))
+        task_ctrl = ctrl_diags_by_task.get(task_name, {})
+        returns = task_returns[task_name]
+        task_rows.append(
+            [
+                task_name,
+                len(task_success[task_name]),
+                float(np.mean(task_success[task_name])),
+                float(np.mean(returns)),
+                float(np.std(returns)),
+                float(np.mean(task_lengths[task_name])),
+                mean_or_nan(task_ctrl.get("frac_ws_clamped", [])),
+                mean_or_nan(task_ctrl.get("frac_lag_clamped", [])),
+                mean_or_nan(task_ctrl.get("frac_joint_limit_clamped", [])),
+                mean_or_nan(task_ctrl.get("frac_undertracking", [])),
+                near_bound,
+                mean_or_nan(success_probabilities),
+                success_brier,
+                constraint_brier,
+                float(np.abs(retained_errors).mean()) if retained_errors.size else math.nan,
+                float(np.abs(achieved_errors).mean()) if achieved_errors.size else math.nan,
+            ]
+        )
+
     action_trace = ActionTrace(columns=trace_columns, rows=trace_rows) if capture_artifacts and trace_rows else None
+    task_metrics = ActionTrace(columns=task_columns, rows=task_rows) if task_rows else None
     return EvalResult(
         metrics=metrics,
         video=np.stack(video_frames) if video_frames else None,
         action_trace=action_trace,
+        task_metrics=task_metrics,
     )
 
 

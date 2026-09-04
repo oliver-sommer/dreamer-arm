@@ -8,6 +8,7 @@ from __future__ import annotations
 import itertools
 import math
 import tempfile
+from dataclasses import MISSING, fields
 from pathlib import Path
 from typing import Any
 
@@ -33,13 +34,25 @@ def _make_trainer_cfg(**overrides: Any) -> TrainerConfig:
         robust_eval_every=9999,
         robust_eval_episode_num=0,
         update_log_every=9999,
+        diagnostic_log_every=5000,
         checkpoint_every=9999,
         # Writable but shared: tests that assert on checkpoint contents pass
         # their own tmp_path.  Only created if a test actually writes.
         checkpoint_dir=str(Path(tempfile.gettempdir()) / "dreamer-arm-test-checkpoints"),
+        checkpoint_keep_every=0,
+        checkpoint_buffer=False,
+        eval_at_start=True,
+        eval_warmup_steps=(),
+        heartbeat_secs=30.0,
     )
     defaults.update(overrides)
     return TrainerConfig(**defaults)
+
+
+def test_trainer_config_has_no_python_defaults() -> None:
+    """Hydra YAML, not the runtime dataclass, owns every training default."""
+
+    assert all(field.default is MISSING and field.default_factory is MISSING for field in fields(TrainerConfig))
 
 
 class _MockVectorEnv:
@@ -158,7 +171,7 @@ class _MockAgent:
         )
         return action, next_state
 
-    def update(self, buffer: Any) -> dict[str, torch.Tensor]:
+    def update(self, buffer: Any, *, diagnostics: bool = False) -> dict[str, torch.Tensor]:
         return {"loss/dyn": torch.tensor(0.5)}
 
     def update_world_model(self, buffer: Any) -> dict[str, torch.Tensor]:
@@ -183,12 +196,19 @@ class _MockLogger:
         self.recorded: list[tuple[str, float]] = []
         self.videos: list[str] = []
         self.tables: list[str] = []
+        self.histograms: list[str] = []
         self.write_steps: list[int] = []
 
     def scalar(self, name: str, value: Any) -> None:
         self.recorded.append((name, float(value)))
 
-    def scalars(self, values: dict[str, Any], defer: bool = False) -> None:
+    def scalars(
+        self,
+        values: dict[str, Any],
+        defer: bool = False,
+        *,
+        latest: frozenset[str] = frozenset(),
+    ) -> None:
         for k, v in values.items():
             self.scalar(k, v)
 
@@ -197,6 +217,9 @@ class _MockLogger:
 
     def table(self, name: str, columns: list[str], rows: list[list[Any]]) -> None:
         self.tables.append(name)
+
+    def histogram(self, name: str, values: Any) -> None:
+        self.histograms.append(name)
 
     def write(self, step: int, fps: bool = False) -> None:
         self.write_steps.append(step)
@@ -288,9 +311,9 @@ def test_episode_score_logged() -> None:
     trainer = OnlineTrainer(cfg, buffer, logger, envs, eval_envs=None)
     trainer.begin(agent)
 
-    score_logs = [v for name, v in logger.recorded if name == "episode/score"]
+    score_logs = [v for name, v in logger.recorded if name == "episode/return_mean"]
     # With 9 steps / 3 steps per episode * 2 envs, expect ~6 episode ends
-    assert len(score_logs) >= 1, "Expected at least one episode/score log"
+    assert len(score_logs) >= 1, "Expected at least one episode return log"
 
 
 def test_episode_reward_components_are_not_wandb_scalars() -> None:
@@ -339,10 +362,10 @@ def test_synchronized_episode_logs_are_compact_aggregate_means() -> None:
     trainer.begin(_MockAgent())
     logged = dict(logger.recorded)
 
-    assert logged["episode/score"] == pytest.approx(2.0)
-    assert logged["episode/success"] == pytest.approx(0.5)
-    assert logged["episode/ctrl_frac_undertracking"] == pytest.approx(0.5)
-    assert not any(name.startswith("episode/score/") for name in logged)
+    assert logged["episode/return_mean"] == pytest.approx(2.0)
+    assert logged["episode/success_rate"] == pytest.approx(0.5)
+    assert logged["episode/controller_undertracking_rate"] == pytest.approx(0.5)
+    assert not any(name.startswith("episode/return_mean/") for name in logged)
     assert not any(name.startswith("episode/reward_") for name in logged)
 
 
@@ -375,7 +398,7 @@ def test_replay_ratio_uses_sampled_transition_semantics() -> None:
     update_calls: list[int] = []
 
     class _CountingAgent(_MockAgent):
-        def update(self, buffer: Any) -> dict[str, torch.Tensor]:
+        def update(self, buffer: Any, *, diagnostics: bool = False) -> dict[str, torch.Tensor]:
             update_calls.append(1)
             return {"loss/dyn": torch.tensor(0.0)}
 
@@ -400,6 +423,38 @@ def test_replay_ratio_uses_sampled_transition_semantics() -> None:
     # 20 * 4 / 8 = 10 optimizer updates (not 80 calls).
     expected = 10
     assert len(update_calls) == expected, f"Expected {expected} update calls, got {len(update_calls)}"
+
+
+def test_expensive_diagnostics_follow_their_own_cadence() -> None:
+    calls: list[bool] = []
+
+    class _DiagnosticAgent(_MockAgent):
+        def update(self, buffer: Any, *, diagnostics: bool = False) -> dict[str, torch.Tensor]:
+            calls.append(diagnostics)
+            metrics = {"loss/pred": torch.tensor(1.0)}
+            if diagnostics:
+                metrics.update(
+                    {
+                        "ret_scale_max": torch.tensor(2.0),
+                        "diagnostic/advantage": torch.arange(4),
+                    }
+                )
+            return metrics
+
+    envs = _MockVectorEnv(num_envs=2, done_every=99)
+    logger = _MockLogger()
+    cfg = _make_trainer_cfg(
+        steps=8,
+        replay_ratio=4.0,
+        diagnostic_log_every=4,
+        update_log_every=2,
+    )
+    trainer = OnlineTrainer(cfg, _FilledBuffer(), logger, envs, eval_envs=None)
+    trainer.begin(_DiagnosticAgent())
+
+    assert calls == [False, True, False, True]
+    assert logger.histograms == ["train/actor/advantage_histogram"] * 2
+    assert any(name == "train/actor/return_scale_max" for name, _ in logger.recorded)
 
 
 def test_no_updates_during_prefill() -> None:
@@ -704,7 +759,7 @@ def test_trainer_state_round_trips_through_resume(tmp_path: Path) -> None:
     saved_next_id = ckpt["trainer"]["next_ep_id"]
     assert saved_next_id > N  # episodes actually turned over during the run
     assert ckpt["trainer"]["best_success"] == 0.75
-    assert ckpt["trainer"]["best_metric"] == "eval_robust/success_mean"
+    assert ckpt["trainer"]["best_metric"] == "eval/success_mean"
 
     # A fresh trainer (new process, in effect) resuming with that state must
     # not reissue any id the first run already used.
@@ -909,7 +964,7 @@ def test_fast_and_robust_eval_use_independent_cadences(monkeypatch: Any) -> None
 
     trainer.begin(_MockAgent())
 
-    assert calls == [(4, False), (8, False), (8, True)]
+    assert calls == [(4, False), (8, True)]
 
 
 def test_eval_at_start_is_a_noop_when_eval_disabled(monkeypatch: Any) -> None:

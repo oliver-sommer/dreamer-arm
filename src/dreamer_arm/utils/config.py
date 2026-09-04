@@ -140,6 +140,8 @@ def validate_config(cfg: DictConfig) -> None:
             raise ValueError("trainer.eval_every must be positive when eval is enabled")
         if int(trainer.get("robust_eval_episode_num", 0)) > 0 and int(trainer.robust_eval_every) <= 0:
             raise ValueError("trainer.robust_eval_every must be positive when robust eval is enabled")
+        if int(trainer.diagnostic_log_every) <= 0:
+            raise ValueError("trainer.diagnostic_log_every must be positive")
         warmup_steps = [int(step) for step in trainer.get("eval_warmup_steps", [])]
         if any(step <= 0 for step in warmup_steps):
             raise ValueError("trainer.eval_warmup_steps must contain only positive steps")

@@ -14,8 +14,9 @@ Design notes
   ``replay_ratio / batch_steps`` per environment step.
 * Eval reuses the train envs (``eval_envs is train_envs``), so no extra EGL
   contexts are created. Fast eval follows ``eval_every`` and the early warmup
-  milestones; robust fixed-seed eval follows ``robust_eval_every`` and alone
-  selects ``best.pt``. A shared-env evaluation resets the interrupted training
+  milestones; the larger fixed-seed pass follows ``robust_eval_every``, writes
+  the same ``eval/*`` series, and alone selects ``best.pt``. A shared-env
+  evaluation resets the interrupted training
   rollout and allocates fresh episode ids, preventing long synchronized MT
   episodes from delaying and coalescing early evals.
   ``eval_at_start`` additionally seeds this trigger before the loop's first
@@ -45,7 +46,7 @@ from tensordict import TensorDict
 
 from dreamer_arm.inference.evaluate import evaluate
 from dreamer_arm.training.checkpoint import CheckpointManager
-from dreamer_arm.training.metrics import compact_eval_metrics, compact_train_metrics
+from dreamer_arm.training.metrics import compact_eval_metrics, compact_train_histograms, compact_train_metrics
 from dreamer_arm.utils.logging import phase, set_phase
 
 log = logging.getLogger(__name__)
@@ -64,16 +65,17 @@ class TrainerConfig:
     action_repeat: int  # inner steps per outer step (owned by SyncVectorEnv)
     eval_every: int  # eval after this many env steps
     eval_episode_num: int  # episodes to collect during each eval pass
-    robust_eval_every: int  # robust eval after this many env steps
-    robust_eval_episode_num: int  # episodes to collect during robust eval
+    robust_eval_every: int  # larger fixed-seed eval after this many env steps
+    robust_eval_episode_num: int  # episodes to collect during the larger eval
     update_log_every: int  # write logger scalars every N env steps
     checkpoint_every: int  # refresh latest.pt every N env steps
     checkpoint_dir: str  # directory holding latest.pt / best.pt / checkpoints/
-    checkpoint_keep_every: int = 0  # also archive on this grid (0 = no archives)
-    checkpoint_buffer: bool = False  # persist the replay buffer beside latest.pt
-    eval_at_start: bool = True  # run one eval pass before the first training step
-    eval_warmup_steps: tuple[int, ...] = ()  # additional one-shot eval milestones
-    heartbeat_secs: float = 30.0  # console liveness line cadence (0 disables)
+    diagnostic_log_every: int  # expensive model/optimizer diagnostics cadence
+    checkpoint_keep_every: int  # also archive on this grid (0 = no archives)
+    checkpoint_buffer: bool  # persist the replay buffer beside latest.pt
+    eval_at_start: bool  # run one eval pass before the first training step
+    eval_warmup_steps: tuple[int, ...]  # additional one-shot eval milestones
+    heartbeat_secs: float  # console liveness line cadence (0 disables)
 
 
 class OnlineTrainer:
@@ -100,6 +102,7 @@ class OnlineTrainer:
         self._best_success = -math.inf
         self._next_ep_id = 0
         self._wm_pretrain_complete = False
+        self._episode_metrics: dict[str, list[float]] = defaultdict(list)
 
     def begin(self, agent: Any, start_step: int = 0, trainer_state: Mapping[str, Any] | None = None) -> None:
         """Run or resume training, including the checkpointed episode-id and best-score state."""
@@ -109,7 +112,7 @@ class OnlineTrainer:
             # Restarting them at N would make SliceSampler treat old and new
             # transitions as one trajectory and splice across the join.
             self._next_ep_id = int(trainer_state.get("next_ep_id", self._next_ep_id))
-            if trainer_state.get("best_metric") == "eval_robust/success_mean":
+            if trainer_state.get("best_metric") in {"eval/success_mean", "eval_robust/success_mean"}:
                 self._best_success = float(trainer_state.get("best_success", self._best_success))
             self._wm_pretrain_complete = bool(trainer_state.get("wm_pretrain_complete", start_step > 0))
         elif start_step > 0:
@@ -176,6 +179,11 @@ class OnlineTrainer:
             _next_warmup += 1
         _last_ckpt = (start_step // cfg.checkpoint_every) * cfg.checkpoint_every
         _last_log = (start_step // cfg.update_log_every) * cfg.update_log_every
+        _last_diagnostic = (
+            (start_step // cfg.diagnostic_log_every) * cfg.diagnostic_log_every
+            if cfg.diagnostic_log_every > 0
+            else start_step
+        )
         # Archives ride a coarser grid than latest.pt.  Watermarked, not
         # `env_step % keep_every == 0`: env_step advances by N per iteration and
         # only lands on exact multiples when N divides the interval.
@@ -197,6 +205,8 @@ class OnlineTrainer:
         updates = 0
         ratio_updates = 0
         ratio_env_steps = 0
+        progress_time = time.time()
+        progress_updates = 0
         self._hb_time = time.time()
 
         while env_step < cfg.steps:
@@ -206,10 +216,13 @@ class OnlineTrainer:
             # global steps. The episode-id seam and is_first below make the
             # interrupted fragment safe for trajectory sampling.
             if eval_pending or robust_eval_pending:
-                if eval_pending:
-                    self._run_eval(agent, env_step, robust=False, flush=not robust_eval_pending)
+                # A 50-episode pass subsumes a coincident fast pass. Both write
+                # the same eval/* series, so running both would waste rollout
+                # time and make the smaller estimate immediately disappear.
                 if robust_eval_pending:
                     self._run_eval(agent, env_step, robust=True)
+                else:
+                    self._run_eval(agent, env_step, robust=False)
                 eval_pending = False
                 robust_eval_pending = False
                 if self._eval_envs is self._train_envs:
@@ -308,14 +321,18 @@ class OnlineTrainer:
                     if not self._wm_pretrain_complete:
                         log.info("running %d world-model-only pretrain updates", cfg.pretrain)
                         for _ in range(cfg.pretrain):
-                            agent.update_world_model(self._buffer)
+                            metrics = agent.update_world_model(self._buffer)
                             updates += 1
+                            self._logger.scalars(compact_train_metrics(metrics), defer=True)
                             self._heartbeat(env_step, updates, prefill_min)
                         self._wm_pretrain_complete = True
                 ratio_env_steps += N
                 train_budget += cfg.replay_ratio * N / batch_steps
+                diagnostics_due = (
+                    cfg.diagnostic_log_every > 0 and env_step - _last_diagnostic >= cfg.diagnostic_log_every
+                )
                 while train_budget >= 1.0:
-                    metrics = agent.update(self._buffer)
+                    metrics = agent.update(self._buffer, diagnostics=diagnostics_due)
                     train_budget -= 1.0
                     updates += 1
                     ratio_updates += 1
@@ -325,17 +342,39 @@ class OnlineTrainer:
                     # so an eager sync here would pay a device->host stall
                     # once per update just to discard nearly all of them.
                     # See WandbLogger._flush_pending.
-                    compact_metrics = compact_train_metrics(metrics)
-                    self._logger.scalars({f"train/{k}": v for k, v in compact_metrics.items()}, defer=True)
+                    compact_metrics = compact_train_metrics(metrics, diagnostics=diagnostics_due)
+                    self._logger.scalars(
+                        compact_metrics,
+                        defer=True,
+                        latest=frozenset({"train/optimizer/learning_rate"}),
+                    )
+                    if diagnostics_due:
+                        for name, values in compact_train_histograms(metrics).items():
+                            self._logger.histogram(name, values)
+                        _last_diagnostic = (env_step // cfg.diagnostic_log_every) * cfg.diagnostic_log_every
+                        diagnostics_due = False
                     # Beat between updates too: one update can outlast the interval.
                     self._heartbeat(env_step, updates, prefill_min)
 
             if env_step - _last_log >= cfg.update_log_every:
                 _last_log = (env_step // cfg.update_log_every) * cfg.update_log_every
+                now = time.time()
                 if ratio_env_steps:
                     actual_ratio = ratio_updates * batch_steps / ratio_env_steps
-                    self._logger.scalar("train/replay_ratio_actual", actual_ratio)
+                    self._logger.scalar("train/progress/replay_ratio", actual_ratio)
+                self._logger.scalar("train/progress/update_step", updates)
+                self._logger.scalar("train/progress/buffer_size", len(self._buffer))
+                capacity = int(getattr(self._buffer, "capacity", 0))
+                if capacity > 0:
+                    self._logger.scalar("train/progress/buffer_fill_fraction", len(self._buffer) / capacity)
+                self._logger.scalar("train/progress/wm_pretrain_complete", float(self._wm_pretrain_complete))
+                self._logger.scalar(
+                    "system/updates_per_sec", (updates - progress_updates) / max(now - progress_time, 1e-8)
+                )
+                self._flush_episode_metrics()
                 self._logger.write(env_step, fps=True)
+                progress_time = now
+                progress_updates = updates
 
             if eval_enabled and env_step - _last_eval_trigger >= cfg.eval_every:
                 _last_eval_trigger = (env_step // cfg.eval_every) * cfg.eval_every
@@ -365,6 +404,7 @@ class OnlineTrainer:
             self._heartbeat(env_step, updates, prefill_min)
             self._logger.keepalive(env_step)
 
+        self._flush_episode_metrics()
         self._logger.write(env_step, fps=True)
 
     def _log_completed_episodes(
@@ -396,18 +436,32 @@ class OnlineTrainer:
         for index in np.flatnonzero(done):
             i = int(index)
             fin = final_info[i]
-            add("episode/score", float(episode_returns[i]))
-            add("episode/length", float(episode_lengths[i]))
+            add("episode/return_mean", float(episode_returns[i]))
+            add("episode/length_mean", float(episode_lengths[i]))
             if fin is None:
                 continue
             if "success" in fin:
-                add("episode/success", float(fin["success"]))
+                add("episode/success_rate", float(fin["success"]))
             for key, value in fin.get("ctrl_diag", {}).items():
                 if key in retained_ctrl_diags:
-                    add(f"episode/ctrl_{key}", float(value))
+                    public_key = {
+                        "frac_ws_clamped": "workspace_clamp_rate",
+                        "frac_lag_clamped": "lag_clamp_rate",
+                        "frac_joint_limit_clamped": "joint_limit_clamp_rate",
+                        "frac_undertracking": "undertracking_rate",
+                    }[key]
+                    add(f"episode/controller_{public_key}", float(value))
 
         for name, samples in values.items():
-            self._logger.scalar(name, float(np.mean(samples)))
+            self._episode_metrics[name].extend(samples)
+
+    def _flush_episode_metrics(self) -> None:
+        """Emit one episode-weighted mean for every completion since the last write."""
+
+        for name, samples in self._episode_metrics.items():
+            if samples:
+                self._logger.scalar(name, float(np.mean(samples)))
+        self._episode_metrics.clear()
 
     def _heartbeat(self, env_step: int, updates: int, prefill_min: int) -> None:
         """Print a console liveness line if ``heartbeat_secs`` has elapsed.
@@ -439,26 +493,21 @@ class OnlineTrainer:
 
         self._hb_time = now
 
-    def _run_eval(self, agent: Any, env_step: int, *, robust: bool = False, flush: bool = True) -> None:
+    def _run_eval(self, agent: Any, env_step: int, *, robust: bool = False) -> None:
         """Evaluate the current policy and log the result.
 
         The rollout itself lives in :func:`dreamer_arm.inference.evaluate.evaluate`
         so the standalone eval entrypoint runs exactly the same code; this
         method forwards its compact dashboard subset to the logger.
         """
-        namespace = "eval_robust" if robust else "eval"
         episodes = self._cfg.robust_eval_episode_num if robust else self._cfg.eval_episode_num
-        with phase(namespace):
+        with phase("eval"):
             result = evaluate(
                 agent,
                 self._eval_envs,
                 episodes,
                 capture_artifacts=not robust,
             )
-            metrics = {
-                name.replace("eval/", f"{namespace}/", 1) if robust else name: value
-                for name, value in result.metrics.items()
-            }
             if result.video is not None:
                 self._logger.video("eval/video", result.video)
             if result.action_trace is not None:
@@ -467,15 +516,20 @@ class OnlineTrainer:
                     result.action_trace.columns,
                     result.action_trace.rows,
                 )
-            logged_metrics = compact_eval_metrics(metrics)
+            if result.task_metrics is not None:
+                self._logger.table(
+                    "eval/task_metrics",
+                    result.task_metrics.columns,
+                    result.task_metrics.rows,
+                )
+            logged_metrics = compact_eval_metrics(result.metrics)
             self._logger.scalars(logged_metrics)
-            if flush:
-                self._logger.write(env_step, fps=False)
+            self._logger.write(env_step, fps=False)
 
-            # best.pt is promoted from robust eval here, not on the checkpoint
+            # best.pt is promoted from the larger eval here, not on the checkpoint
             # cadence, so a peak between two checkpoints is not lost.
             # `evaluate` omits the key entirely when no episode completed.
-            success = logged_metrics.get("eval_robust/success_mean") if robust else None
+            success = logged_metrics.get("eval/success_mean") if robust else None
             if success is not None and success > self._best_success:
                 self._best_success = float(success)
                 self._checkpoints.save_best(agent, env_step, self._trainer_state(), self._best_success)
@@ -484,6 +538,6 @@ class OnlineTrainer:
         return {
             "next_ep_id": int(self._next_ep_id),
             "best_success": float(self._best_success),
-            "best_metric": "eval_robust/success_mean",
+            "best_metric": "eval/success_mean",
             "wm_pretrain_complete": bool(self._wm_pretrain_complete),
         }

@@ -36,17 +36,20 @@ def rpad(x: torch.Tensor, pad: int) -> torch.Tensor:
 
 
 def compute_global_norm(tensors: list[torch.Tensor | None]) -> torch.Tensor:
-    flat = torch.cat([t.reshape(-1) for t in tensors if t is not None])
-    if flat.numel() == 0:
+    present = [t for t in tensors if t is not None]
+    if not present:
         return torch.tensor(0.0)
-    return torch.linalg.norm(flat, ord=2)
+    square_sum = torch.stack([t.detach().float().square().sum() for t in present]).sum()
+    return square_sum.sqrt()
 
 
 def compute_rms(tensors: list[torch.Tensor | None]) -> torch.Tensor:
-    flat = torch.cat([t.reshape(-1) for t in tensors if t is not None])
-    if flat.numel() == 0:
+    present = [t for t in tensors if t is not None]
+    if not present:
         return torch.tensor(0.0)
-    return torch.linalg.norm(flat, ord=2) / (flat.numel() ** 0.5)
+    square_sum = torch.stack([t.detach().float().square().sum() for t in present]).sum()
+    count = sum(t.numel() for t in present)
+    return (square_sum / count).sqrt()
 
 
 def tensorstats(tensor: torch.Tensor, prefix: str) -> dict[str, torch.Tensor]:

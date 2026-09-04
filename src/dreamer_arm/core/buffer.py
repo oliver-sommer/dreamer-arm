@@ -277,6 +277,12 @@ class ReplayBuffer:
             return 0
         return int(shape.numel())
 
+    @property
+    def capacity(self) -> int:
+        """Maximum number of transitions represented by the storage."""
+
+        return int(self._buffer.storage.max_size)
+
     def _move_to_device(self, td: TensorDict) -> TensorDict:
         src = td.device
         if src is None:

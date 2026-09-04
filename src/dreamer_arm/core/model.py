@@ -241,18 +241,18 @@ class Dreamer(nn.Module):
             diagnostics["visual_action_sensitivity"] = (visual_action - baseline).abs().mean(dim=-1)
         return diagnostics
 
-    def update(self, replay_buffer: Any) -> dict[str, torch.Tensor]:
+    def update(self, replay_buffer: Any, *, diagnostics: bool = False) -> dict[str, torch.Tensor]:
         """Run one complete world-model and actor-critic update."""
 
         self.ac.update_slow_target()
-        return self._update(replay_buffer, world_model_only=False)
+        return self._update(replay_buffer, world_model_only=False, diagnostics=diagnostics)
 
     def update_world_model(self, replay_buffer: Any) -> dict[str, torch.Tensor]:
         """Run one world-model-only burn-in update without touching actor/critic."""
 
-        return self._update(replay_buffer, world_model_only=True)
+        return self._update(replay_buffer, world_model_only=True, diagnostics=False)
 
-    def _update(self, replay_buffer: Any, *, world_model_only: bool) -> dict[str, torch.Tensor]:
+    def _update(self, replay_buffer: Any, *, world_model_only: bool, diagnostics: bool) -> dict[str, torch.Tensor]:
         data, index, initial = replay_buffer.sample(self.replay_cache_keys)
         p_data = self._preprocess(dict(data))
 
@@ -260,7 +260,8 @@ class Dreamer(nn.Module):
             grad_fn = self._cal_wm_grad if world_model_only else self._cal_grad
             state, mets = grad_fn(p_data, initial)
 
-        mets.update(self._optim.step())
+        mets.update(self._data_metrics(p_data))
+        mets.update(self._optim.step(diagnostics=diagnostics))
 
         # Don't persist latent initial states from a skipped (non-finite) step:
         # they may be NaN and would re-poison every future sample of these
@@ -269,6 +270,37 @@ class Dreamer(nn.Module):
             cache = {k: state[k].detach() for k in self.replay_cache_keys}
             replay_buffer.update_initial_state(index, cache)
         return mets
+
+    @torch.no_grad()
+    def _data_metrics(self, data: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Summarise the sampled replay batch without per-task key fan-out."""
+
+        reward = to_f32(data["reward"])
+        metrics = {
+            "data/reward_mean": reward.mean(),
+            "data/reward_std": reward.std(),
+            "data/terminal_rate": to_f32(data["is_terminal"]).mean(),
+        }
+        if "success" in data:
+            metrics["data/success_rate"] = to_f32(data["success"]).mean()
+        if "ctrl_clamp" in data:
+            metrics["data/controller_clamp_rate"] = to_f32(data["ctrl_clamp"]).mean()
+        task_id = data.get("task_id")
+        if task_id is not None and task_id.shape[-1] > 1:
+            fractions = to_f32(task_id).reshape(-1, task_id.shape[-1]).mean(dim=0)
+            metrics["data/task_coverage"] = (fractions > 0).float().sum()
+            metrics["data/task_fraction_min"] = fractions.min()
+            metrics["data/task_fraction_max"] = fractions.max()
+        else:
+            one = torch.ones((), device=reward.device)
+            metrics.update(
+                {
+                    "data/task_coverage": one,
+                    "data/task_fraction_min": one,
+                    "data/task_fraction_max": one,
+                }
+            )
+        return metrics
 
     def _cal_wm_grad(
         self, data: dict[str, torch.Tensor], initial: dict[str, torch.Tensor]
@@ -280,6 +312,7 @@ class Dreamer(nn.Module):
         )
         self._optim.backward(total_loss)
         metrics.update({f"loss/{name}": value.detach() for name, value in losses.items()})
+        metrics["loss/wm_total"] = total_loss.detach()
         metrics["opt/loss"] = total_loss.detach()
         return state, metrics
 
@@ -298,6 +331,10 @@ class Dreamer(nn.Module):
         if t_valid != data["action"].shape[1]:
             data = {k: v[:, -t_valid:] for k, v in data.items()}
 
+        wm_total = sum(
+            (value * self._loss_scales.get(name, 1.0) for name, value in losses.items()),
+            start=torch.zeros((), device=self.device),
+        )
         ac_losses, ac_metrics = self.ac.loss(feat, data, self.frozen_wm, state)
         losses.update(ac_losses)
         metrics.update(ac_metrics)
@@ -309,6 +346,7 @@ class Dreamer(nn.Module):
         self._optim.backward(total_loss)
 
         metrics.update({f"loss/{k}": v.detach() for k, v in losses.items()})
+        metrics["loss/wm_total"] = wm_total.detach()
         metrics["opt/loss"] = total_loss.detach()
         return state, metrics
 

@@ -92,6 +92,9 @@ trainer:
   replay_ratio: ${envs.sim.replay_ratio}
 
   update_log_every: 1000
+  # More expensive gradient statistics and bounded distributions. Core scalar
+  # metrics still report at update_log_every.
+  diagnostic_log_every: 5000
   # Wall-clock console liveness line (seconds; 0 disables).  `update_log_every`
   # is a step cadence, so on a slow world model the first step-line can be 20+
   # minutes out.

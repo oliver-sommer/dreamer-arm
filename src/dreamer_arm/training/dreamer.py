@@ -110,6 +110,7 @@ def _run(cfg: DictConfig) -> None:
         robust_eval_every=int(cfg.trainer.robust_eval_every),
         robust_eval_episode_num=int(cfg.trainer.robust_eval_episode_num),
         update_log_every=int(cfg.trainer.update_log_every),
+        diagnostic_log_every=int(cfg.trainer.diagnostic_log_every),
         checkpoint_every=int(cfg.trainer.checkpoint_every),
         checkpoint_dir=str(cfg.logdir),
         checkpoint_keep_every=int(cfg.trainer.checkpoint_keep_every),
